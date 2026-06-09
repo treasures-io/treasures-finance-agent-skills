@@ -1,0 +1,1437 @@
+openapi: 3.1.0
+info:
+  title: Treasures Finance — B2B Public API
+  version: v1
+  license:
+    name: Proprietary
+  description: |
+    Public B2B API for tokenized stock discovery, quoting and trade execution, USDC
+    bridging across Solana and Ethereum, and portfolio + trade history reads.
+
+    **Wire format.** All token amounts, USDC amounts, shares, prices and bps-derived
+    decimals are JSON **strings** to avoid float drift. Integer fields
+    (`expires_at`, `*_bps`, `quote_index`, timestamps in seconds) are JSON numbers.
+
+    **Auth.** Only `POST /quote/buy`, `POST /quote/sell` and `POST /bridge/quote`
+    require `ownership_proof` (wallet-key signature over a canonical challenge —
+    see `OwnershipProof`). `POST /trade/submit` is gated by the per-leg signed
+    payload itself; everything else is unauthenticated.
+
+    **Rate limits.** Per-IP and per-(IP, wallet) sliding windows backed by Redis.
+    Upstream 429s propagate as `502 provider_unavailable`.
+servers:
+  - url: TBD
+    description: Staging
+  - url: TBD
+    description: Production
+
+security: []
+
+tags:
+  - name: Stocks
+    description: Catalog and live price discovery.
+  - name: Quote
+    description: Quote issuance and aggregate status polling.
+  - name: Trade
+    description: Atomic submission of signed quote legs.
+  - name: Bridge
+    description: Cross-chain USDC bridging.
+  - name: Portfolio
+    description: Wallet-scoped holdings, reconciled vs on-chain.
+  - name: Trades
+    description: Wallet-scoped trade history.
+
+paths:
+  /stocks:
+    get:
+      operationId: listStocks
+      tags: [Stocks]
+      summary: List active tradable stocks (catalog + live enrichment)
+      description: |
+        Catalog with tradfi snapshot and onchain aggregate.
+        Cached server-side for 30 s.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StocksListResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /stocks/tickers:
+    get:
+      operationId: listStockTickers
+      tags: [Stocks]
+      summary: List active tickers (no price enrichment)
+      description: Catalog rows only. Cached server-side for 5 min — cheap to poll.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StocksTickersResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /stocks/prices:
+    get:
+      operationId: getStockPrices
+      tags: [Stocks]
+      summary: Live per-protocol prices for requested tickers
+      parameters:
+        - name: tickers
+          in: query
+          required: true
+          description: |
+            Comma-separated list, 1–50 tickers. Each item matches `^[A-Z0-9.-]{1,10}$`
+            **case-insensitively** — server normalizes to uppercase before lookup.
+          schema:
+            type: string
+            example: AAPL,NVDA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockPricesResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+
+  /quote/buy:
+    post:
+      operationId: quoteBuy
+      tags: [Quote]
+      summary: Quote USDC → stock token (up to 2 legs, one per chain, better first)
+      description: |
+        Requires `ownership_proof` for each wallet provided. Returns up to two
+        signable quote legs (one per chain). Cache the returned `quote_id`;
+        every signed leg is submitted together at `/trade/submit`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteBuyRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteBuyResponse"
+        "400":
+          description: Invalid request body, slippage out of range, unknown ticker, or zero amount.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401":
+          description: Ownership-proof failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipProofError"
+        "410":
+          description: Quote stale (upstream price moved past expiry mid-build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: quote_stale }
+        "422":
+          description: No fillable routes returned by the planner.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoRoutesError"
+        "403": { $ref: "#/components/responses/AddressBlocked" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+
+  /quote/sell:
+    post:
+      operationId: quoteSell
+      tags: [Quote]
+      summary: Quote stock holdings → USDC (all legs needed; all-or-nothing submit)
+      description: |
+        Plans the optimal sequence of swap legs across the user's current holdings.
+        Every returned leg must be signed and submitted together at `/trade/submit`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteSellRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteSellResponse"
+        "400":
+          description: Invalid request body, slippage out of range, unknown ticker, or zero amount.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401":
+          description: Ownership-proof failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipProofError"
+        "410":
+          description: Quote stale (upstream price moved past expiry mid-build).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: quote_stale }
+        "422":
+          description: |
+            No fillable routes returned by the planner, or insufficient holdings
+            for the requested share amount.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/NoRoutesError"
+                  - $ref: "#/components/schemas/SimpleError"
+              examples:
+                no_routes: { value: { error: no_routes } }
+                holdings_insufficient:
+                  { value: { error: holdings_insufficient } }
+                holdings_unknown: { value: { error: holdings_unknown } }
+        "403": { $ref: "#/components/responses/AddressBlocked" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+
+  /quote/{quote_id}/status:
+    get:
+      operationId: getQuoteStatus
+      tags: [Quote]
+      summary: Aggregate + per-leg status for a previously issued quote
+      description: |
+        Public read-only — no `ownership_proof`. Ethereum in-flight rows are
+        lazy-flipped against the upstream venue on read; Solana `broadcast_unknown` rows stay
+        in-flight until operator action. In-progress aggregates cached 10 s.
+      parameters:
+        - name: quote_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteStatusResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "404":
+          description: Unknown `quote_id` (expired cache, never issued, or no rows persisted).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: quote_not_found }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /trade/submit:
+    post:
+      operationId: submitTrade
+      tags: [Trade]
+      summary: Submit signed quote legs atomically
+      description: |
+        Idempotent on `(quote_id, quote_index)`. The per-leg signed payload IS the
+        authorization proof — no `ownership_proof` required here. Re-quote (`410
+        quote_stale`) if the cached snapshot expired between issue and submit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TradeSubmitRequest"
+      responses:
+        "200":
+          description: |
+            Partial-broadcast tolerated: legs that landed appear under `results`,
+            legs that hit an invariant break appear under `failed_legs` with a
+            generic `internal_error` code so the agent can reconcile on-chain.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradeSubmitResponse"
+        "400":
+          description: Malformed body, incomplete submit, or `quote_index` not in snapshot.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/SimpleErrorWithMessage"
+              examples:
+                incomplete_submit:
+                  {
+                    value:
+                      {
+                        error: incomplete_submit,
+                        message: "missing leg(s) for quote_id ...",
+                      },
+                  }
+                quote_index_mismatch:
+                  {
+                    value:
+                      {
+                        error: quote_index_mismatch,
+                        message: "unknown quote_index ...",
+                      },
+                  }
+        "404":
+          description: Unknown or expired `quote_id`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: quote_not_found }
+        "409":
+          description: A leg under `(quote_id, quote_index)` was already submitted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegAlreadySubmittedError"
+        "410":
+          description: Snapshot expired between issue and submit — re-quote.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: quote_stale }
+        "403": { $ref: "#/components/responses/AddressBlocked" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+
+  /bridge/quote:
+    post:
+      operationId: quoteBridge
+      tags: [Bridge]
+      summary: Quote a cross-chain USDC bridge
+      description: |
+        Returns a Treasures-issued `bridge_quote_id` plus a signable payload the
+        agent must broadcast themselves. Both `sol_wallet` and `eth_wallet` (and
+        their matching `ownership_proof` signatures) are mandatory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BridgeQuoteRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeQuoteResponse"
+        "400":
+          description: |
+            Bad request, same-chain bridge, unsupported route, or slippage out of range.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+                  - $ref: "#/components/schemas/SimpleError"
+              examples:
+                same_chain_bridge: { value: { error: same_chain_bridge } }
+                unsupported_route: { value: { error: unsupported_route } }
+        "401":
+          description: Ownership-proof failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipProofError"
+        "422":
+          description: Upstream reported insufficient liquidity for the route.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: insufficient_liquidity }
+        "403": { $ref: "#/components/responses/AddressBlocked" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+
+  /bridge/{bridge_quote_id}/status:
+    get:
+      operationId: getBridgeStatus
+      tags: [Bridge]
+      summary: Status of a previously issued bridge quote
+      description: |
+        Required because the agent has no other way to discover the destination
+        tx hash — the upstream bridge's source tx hash alone cannot be used to
+        look up fill status.
+      parameters:
+        - name: bridge_quote_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^brq_[A-Za-z0-9_-]{21}$"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeStatusResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "404":
+          description: Unknown `bridge_quote_id`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: bridge_quote_not_found }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+
+  /portfolio:
+    get:
+      operationId: getPortfolio
+      tags: [Portfolio]
+      summary: Reconciled holdings + USDC balances for the given wallets
+      description: At least one of `sol_wallet` / `eth_wallet` is required.
+      parameters:
+        - $ref: "#/components/parameters/SolWalletQuery"
+        - $ref: "#/components/parameters/EvmWalletQuery"
+        - $ref: "#/components/parameters/SourceQuery"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /trades:
+    get:
+      operationId: listTrades
+      tags: [Trades]
+      summary: Swap-only trade history for the given wallets
+      description: |
+        Returns trades plus a `next_offset` cursor when more pages exist.
+        Synthesizes external rows on detected drift (source = `external`).
+      parameters:
+        - $ref: "#/components/parameters/SolWalletQuery"
+        - $ref: "#/components/parameters/EvmWalletQuery"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 5000
+            default: 0
+        - $ref: "#/components/parameters/SourceQuery"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradesResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+components:
+  parameters:
+    SolWalletQuery:
+      name: sol_wallet
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/SolAddress"
+    SourceQuery:
+      name: source
+      in: query
+      required: false
+      description: >-
+        Column toggle (not a row filter). `all` (default) leaves the internal-lot P&L
+        columns null; `internal` populates them from a replay of completed internal
+        trades only. Realized P&L follows Hyperliquid `closedPnl` semantics.
+      schema:
+        type: string
+        enum: [all, internal]
+        default: all
+    EvmWalletQuery:
+      name: eth_wallet
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/EvmAddress"
+
+  responses:
+    InvalidRequest:
+      description: Malformed query, body, or path parameter.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InvalidRequestError"
+    RateLimited:
+      description: Per-IP or per-(IP, wallet) sliding window exceeded. `Retry-After` header carries delta-seconds.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: "Too many requests" }
+    ProviderUnavailable:
+      description: Upstream provider failed or rate-limited us.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: provider_unavailable }
+    AddressBlocked:
+      description: |
+        A wallet on the request was flagged by sanctions screening. Permanent —
+        do not retry with the same wallet.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: address_blocked }
+    ScreeningUnavailable:
+      description: |
+        Sanctions screening could not be completed and the request was rejected
+        (fail-closed). Transient — back off and retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: screening_unavailable }
+
+  schemas:
+    # ------------ Primitives ----------------------------------------------
+    SolAddress:
+      type: string
+      description: Solana base58 address.
+      pattern: "^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+      example: 9aJ6jUyG7zG3yfPbsi5tFFqA1cnp7zCfL6pYfqyZP4qE
+
+    EvmAddress:
+      type: string
+      description: Lowercased EVM address (server normalizes on parse).
+      pattern: "^0x[a-fA-F0-9]{40}$"
+      example: "0x742d35cc6634c0532925a3b844bc454e4438f44e"
+
+    DecimalString:
+      type: string
+      description: Decimal number as a string to preserve full precision.
+
+    UsdcHumanAmount:
+      type: string
+      description: USDC amount in human units, > 0, up to 6 fractional digits.
+      pattern: '^(?:[1-9]\d*|0)(?:\.\d{1,6})?$'
+      example: "100.50"
+
+    SharesHumanAmount:
+      type: string
+      description: Share amount, > 0, up to 18 fractional digits.
+      pattern: '^(?:[1-9]\d*|0)(?:\.\d{1,18})?$'
+      example: "1.5"
+
+    Ticker:
+      type: string
+      pattern: "^[A-Z][A-Z0-9.]{0,9}$"
+      example: AAPL
+
+    Chain:
+      type: string
+      enum: [sol, eth]
+
+    Protocol:
+      type: string
+      enum: [ondo, xstocks]
+
+    SlippageBps:
+      type: integer
+      minimum: 0
+      maximum: 10000
+      description: |
+        Maximum tolerated slippage in basis points. Each route validates against
+        its own `[MIN, MAX]` window — out-of-range returns `400 invalid_slippage`
+        with the active bounds.
+
+    # ------------ Errors --------------------------------------------------
+    SimpleError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+      additionalProperties: false
+
+    SimpleErrorWithMessage:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string }
+        message: { type: string }
+      additionalProperties: false
+
+    InvalidRequestError:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string, enum: [invalid_request] }
+        message: { type: string }
+      additionalProperties: false
+
+    InvalidSlippageError:
+      type: object
+      required: [error, allowed_min_bps, allowed_max_bps]
+      properties:
+        error: { type: string, enum: [invalid_slippage] }
+        allowed_min_bps: { type: integer }
+        allowed_max_bps: { type: integer }
+      additionalProperties: false
+
+    OwnershipProofError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum:
+            - ownership_proof_invalid
+            - ownership_proof_sol_invalid
+            - ownership_proof_eth_invalid
+            - ownership_proof_skewed
+      additionalProperties: false
+
+    NoRoutesError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, enum: [no_routes] }
+        reason:
+          type: string
+          enum: [slippage_exceeded, amount_too_small]
+          description: |
+            Present only when a strict majority of dropped cells share the same
+            actionable reason; otherwise omitted.
+      additionalProperties: false
+
+    LegAlreadySubmittedError:
+      type: object
+      required: [error, tx_hash, order_hash]
+      properties:
+        error: { type: string, enum: [leg_already_submitted] }
+        message: { type: string }
+        tx_hash: { type: [string, "null"] }
+        order_hash: { type: [string, "null"] }
+      additionalProperties: false
+
+    # ------------ Ownership proof ----------------------------------------
+    OwnershipProof:
+      type: object
+      required: [issued_at]
+      properties:
+        sol_signature:
+          type: string
+          description: |
+            Base64 raw Ed25519 signature over the canonical challenge. Required
+            when `sol_wallet` is present in the same request.
+          minLength: 1
+          maxLength: 150
+        eth_signature:
+          type: string
+          description: |
+            `0x`-prefixed 65-byte EIP-191 `personal_sign` signature. Required when
+            `eth_wallet` is present in the same request.
+          minLength: 1
+          maxLength: 150
+        issued_at:
+          type: integer
+          description: |
+            Unix seconds. Server accepts up to **300 s past / 30 s future** —
+            outside that window → `401 ownership_proof_skewed`.
+      additionalProperties: false
+
+    # ------------ Stocks --------------------------------------------------
+    StockProtocolListing:
+      type: object
+      required: [sol_address, eth_address, share_multiplier, token_ticker]
+      properties:
+        sol_address: { type: [string, "null"] }
+        eth_address: { type: [string, "null"] }
+        share_multiplier: { type: [string, "null"] }
+        token_ticker:
+          type: [string, "null"]
+          description: Issuer's wrapped-token symbol (`<TICKER>on` Ondo, `<TICKER>x` xStocks). Null when not listed.
+
+    TradfiBlock:
+      type: object
+      required:
+        [current_price_usd, change_24h_pct, market_cap_usd, pe_ttm, as_of]
+      properties:
+        current_price_usd: { $ref: "#/components/schemas/DecimalString" }
+        change_24h_pct: { $ref: "#/components/schemas/DecimalString" }
+        market_cap_usd: { $ref: "#/components/schemas/DecimalString" }
+        pe_ttm:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        as_of:
+          type: integer
+          description: Exchange-side last-tick timestamp (unix seconds).
+
+    StockOnchainAggregate:
+      type: object
+      required: [avg_share_price_usd, premium_vs_tradfi_pct, volume_24h_usd]
+      properties:
+        avg_share_price_usd:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        premium_vs_tradfi_pct:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        volume_24h_usd: { $ref: "#/components/schemas/DecimalString" }
+
+    StockOnchainProtocolLeg:
+      type: object
+      required: [share_price_usd, premium_vs_tradfi_pct, volume_24h_usd]
+      properties:
+        share_price_usd:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        premium_vs_tradfi_pct:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        volume_24h_usd: { $ref: "#/components/schemas/DecimalString" }
+
+    StockOnchainPerProtocol:
+      type: object
+      required: [ondo, xstocks]
+      properties:
+        ondo:
+          oneOf:
+            - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
+            - { type: "null" }
+        xstocks:
+          oneOf:
+            - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
+            - { type: "null" }
+
+    StockTickerItem:
+      type: object
+      required: [ticker, name, available_chains, ondo, xstocks]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        name: { type: string }
+        available_chains:
+          type: array
+          items: { $ref: "#/components/schemas/Chain" }
+        ondo: { $ref: "#/components/schemas/StockProtocolListing" }
+        xstocks: { $ref: "#/components/schemas/StockProtocolListing" }
+
+    StockListItem:
+      allOf:
+        - $ref: "#/components/schemas/StockTickerItem"
+        - type: object
+          required: [tradfi, onchain]
+          properties:
+            tradfi:
+              oneOf:
+                - { $ref: "#/components/schemas/TradfiBlock" }
+                - { type: "null" }
+            onchain:
+              oneOf:
+                - { $ref: "#/components/schemas/StockOnchainAggregate" }
+                - { type: "null" }
+
+    StockPriceItem:
+      type: object
+      required: [ticker, tradfi, onchain]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        tradfi:
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiBlock" }
+            - { type: "null" }
+        onchain: { $ref: "#/components/schemas/StockOnchainPerProtocol" }
+
+    StocksListResponse:
+      type: object
+      required: [stocks]
+      properties:
+        stocks:
+          type: array
+          items: { $ref: "#/components/schemas/StockListItem" }
+
+    StocksTickersResponse:
+      type: object
+      required: [tickers]
+      properties:
+        tickers:
+          type: array
+          items: { $ref: "#/components/schemas/StockTickerItem" }
+
+    StockPricesResponse:
+      type: object
+      required: [prices]
+      properties:
+        prices:
+          type: array
+          items: { $ref: "#/components/schemas/StockPriceItem" }
+
+    # ------------ Quote payloads -----------------------------------------
+    SignablePayload:
+      type: object
+      required: [type]
+      discriminator:
+        propertyName: type
+        mapping:
+          solana_versioned_tx: "#/components/schemas/SignableSolanaTx"
+          evm_eip712_typed_data: "#/components/schemas/SignableEvmTypedData"
+      oneOf:
+        - $ref: "#/components/schemas/SignableSolanaTx"
+        - $ref: "#/components/schemas/SignableEvmTypedData"
+
+    SignableSolanaTx:
+      type: object
+      required: [type, tx_base64]
+      properties:
+        type: { type: string, enum: [solana_versioned_tx] }
+        tx_base64:
+          type: string
+          description: Base64 unsigned Solana `VersionedTransaction`.
+      additionalProperties: false
+
+    SignableEvmTypedData:
+      type: object
+      required: [type, typed_data]
+      properties:
+        type: { type: string, enum: [evm_eip712_typed_data] }
+        typed_data:
+          type: object
+          description: EIP-712 typed-data object for the gasless EVM order; sign with `eth_signTypedData_v4`.
+          additionalProperties: true
+      additionalProperties: false
+
+    TradfiReference:
+      type: object
+      required: [price_usd, market_status, as_of]
+      properties:
+        price_usd: { $ref: "#/components/schemas/DecimalString" }
+        market_status: { type: string, enum: [open, closed] }
+        as_of: { type: integer, description: Unix seconds. }
+
+    CostBreakdownBps:
+      type: object
+      required: [treasures_fee_bps, dex_swap_fee_bps, estimated_slippage_bps]
+      properties:
+        treasures_fee_bps: { type: integer }
+        dex_swap_fee_bps: { type: integer }
+        estimated_slippage_bps: { type: integer }
+        slippage_vs_tradfi_bps:
+          type: integer
+          description: Present only when `tradfi_reference` is non-null.
+      additionalProperties: false
+
+    QuoteBuyLeg:
+      type: object
+      required:
+        - quote_index
+        - chain
+        - protocol
+        - price_usdc_per_share
+        - estimated_output_shares
+        - estimated_output_tokens
+        - cost_breakdown_bps
+        - signable_payloads
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        chain: { $ref: "#/components/schemas/Chain" }
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        price_usdc_per_share: { $ref: "#/components/schemas/DecimalString" }
+        estimated_output_shares: { $ref: "#/components/schemas/DecimalString" }
+        estimated_output_tokens: { $ref: "#/components/schemas/DecimalString" }
+        cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
+        signable_payloads:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/SignablePayload" }
+
+    QuoteSellLeg:
+      type: object
+      required:
+        - quote_index
+        - chain
+        - protocol
+        - shares_consumed
+        - tokens_consumed
+        - estimated_output_usdc
+        - price_usdc_per_share
+        - cost_breakdown_bps
+        - signable_payloads
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        chain: { $ref: "#/components/schemas/Chain" }
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        shares_consumed: { $ref: "#/components/schemas/DecimalString" }
+        tokens_consumed: { $ref: "#/components/schemas/DecimalString" }
+        estimated_output_usdc: { $ref: "#/components/schemas/DecimalString" }
+        price_usdc_per_share: { $ref: "#/components/schemas/DecimalString" }
+        cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
+        signable_payloads:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/SignablePayload" }
+
+    QuoteBuyRequest:
+      type: object
+      required: [ticker, amount_usdc, max_slippage_bps, ownership_proof]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        amount_usdc: { $ref: "#/components/schemas/UsdcHumanAmount" }
+        chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - { type: "null" }
+        protocol:
+          oneOf:
+            - { $ref: "#/components/schemas/Protocol" }
+            - { type: "null" }
+        max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        sol_wallet:
+          $ref: "#/components/schemas/SolAddress"
+        eth_wallet:
+          $ref: "#/components/schemas/EvmAddress"
+        ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
+      additionalProperties: false
+      description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
+
+    QuoteSellRequest:
+      type: object
+      required: [ticker, amount_shares, max_slippage_bps, ownership_proof]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        amount_shares: { $ref: "#/components/schemas/SharesHumanAmount" }
+        chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - { type: "null" }
+        protocol:
+          oneOf:
+            - { $ref: "#/components/schemas/Protocol" }
+            - { type: "null" }
+        max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        sol_wallet:
+          $ref: "#/components/schemas/SolAddress"
+        eth_wallet:
+          $ref: "#/components/schemas/EvmAddress"
+        ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
+      additionalProperties: false
+      description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
+
+    QuoteBuyResponse:
+      type: object
+      required: [quote_id, side, ticker, expires_at, tradfi_reference, quotes]
+      properties:
+        quote_id: { type: string }
+        side: { type: string, enum: [buy] }
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        expires_at:
+          type: integer
+          description: Unix seconds. Re-quote after this time.
+        tradfi_reference:
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiReference" }
+            - { type: "null" }
+        quotes:
+          type: array
+          items: { $ref: "#/components/schemas/QuoteBuyLeg" }
+
+    QuoteSellResponse:
+      type: object
+      required:
+        [quote_id, side, ticker, expires_at, tradfi_reference, quotes, totals]
+      properties:
+        quote_id: { type: string }
+        side: { type: string, enum: [sell] }
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        expires_at: { type: integer }
+        tradfi_reference:
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiReference" }
+            - { type: "null" }
+        quotes:
+          type: array
+          items: { $ref: "#/components/schemas/QuoteSellLeg" }
+        totals:
+          type: object
+          required: [shares_total, usdc_total_estimated]
+          properties:
+            shares_total: { $ref: "#/components/schemas/DecimalString" }
+            usdc_total_estimated: { $ref: "#/components/schemas/DecimalString" }
+
+    # ------------ Quote status --------------------------------------------
+    PublicLegStatus:
+      type: string
+      enum: [pending, completed, failed, broadcast_failed]
+
+    AggregateStatus:
+      type: string
+      enum: [in_progress, completed, partial_failed, all_failed]
+
+    PublicLeg:
+      type: object
+      required:
+        - quote_index
+        - trade_id
+        - ticker
+        - chain
+        - protocol
+        - side
+        - tx_hash
+        - order_hash
+        - status
+        - error_code
+        - filled_shares
+        - filled_tokens
+        - filled_usdc
+        - last_synced_at
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        trade_id: { type: string }
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        chain: { $ref: "#/components/schemas/Chain" }
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        side: { type: string, enum: [buy, sell] }
+        tx_hash: { type: [string, "null"] }
+        order_hash: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/PublicLegStatus" }
+        error_code: { type: [string, "null"] }
+        filled_shares: { $ref: "#/components/schemas/DecimalString" }
+        filled_tokens: { $ref: "#/components/schemas/DecimalString" }
+        filled_usdc: { $ref: "#/components/schemas/DecimalString" }
+        last_synced_at: { type: integer }
+
+    QuoteStatusResponse:
+      type: object
+      required: [quote_id, aggregate_status, is_cached, legs]
+      properties:
+        quote_id: { type: string }
+        aggregate_status: { $ref: "#/components/schemas/AggregateStatus" }
+        is_cached:
+          type: boolean
+          description: True when served from the 10 s in-progress cache; false on DB-fresh reads and all terminal aggregates.
+        legs:
+          type: array
+          items: { $ref: "#/components/schemas/PublicLeg" }
+
+    # ------------ Trade submit --------------------------------------------
+    SignedSolanaPayload:
+      type: object
+      required: [type, signed_tx_base64]
+      properties:
+        type: { type: string, enum: [solana_versioned_tx] }
+        signed_tx_base64:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: Base64 fully-signed Solana `VersionedTransaction`.
+      additionalProperties: false
+
+    SignedEvmPayload:
+      type: object
+      required: [type, signature]
+      properties:
+        type: { type: string, enum: [evm_eip712_signature] }
+        signature:
+          type: string
+          minLength: 1
+          maxLength: 150
+          description: "0x-prefixed EIP-712 EOA signature (132 chars)."
+      additionalProperties: false
+
+    SignedPayload:
+      oneOf:
+        - $ref: "#/components/schemas/SignedSolanaPayload"
+        - $ref: "#/components/schemas/SignedEvmPayload"
+      discriminator:
+        propertyName: type
+        mapping:
+          solana_versioned_tx: "#/components/schemas/SignedSolanaPayload"
+          evm_eip712_signature: "#/components/schemas/SignedEvmPayload"
+
+    SignedLeg:
+      type: object
+      required: [quote_index, signed_payloads]
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        signed_payloads:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/SignedPayload" }
+      additionalProperties: false
+
+    TradeSubmitRequest:
+      type: object
+      required: [quote_id, signed]
+      properties:
+        quote_id: { type: string, minLength: 1 }
+        signed:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/SignedLeg" }
+      additionalProperties: false
+
+    LegResult:
+      type: object
+      required: [quote_index, trade_id, status, tx_hash, order_hash, error_code]
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        trade_id: { type: string }
+        status:
+          type: string
+          enum:
+            [broadcast, broadcast_unknown, completed, failed, broadcast_failed]
+        tx_hash: { type: [string, "null"] }
+        order_hash: { type: [string, "null"] }
+        error_code: { type: [string, "null"] }
+
+    FailedLeg:
+      type: object
+      required: [quote_index, error_code]
+      properties:
+        quote_index: { type: integer, minimum: 0 }
+        error_code: { type: string, enum: [internal_error] }
+
+    TradeSubmitResponse:
+      type: object
+      required: [results, failed_legs]
+      properties:
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/LegResult" }
+        failed_legs:
+          type: array
+          description: Empty on the full-success path; populated only when a partial broadcast hit an invariant break.
+          items: { $ref: "#/components/schemas/FailedLeg" }
+
+    # ------------ Bridge --------------------------------------------------
+    BridgeChain:
+      type: string
+      enum: [sol, eth]
+
+    BridgeQuoteRequest:
+      type: object
+      required:
+        - from_chain
+        - to_chain
+        - amount_usdc
+        - max_slippage_bps
+        - sol_wallet
+        - eth_wallet
+        - ownership_proof
+      properties:
+        from_chain: { $ref: "#/components/schemas/BridgeChain" }
+        to_chain: { $ref: "#/components/schemas/BridgeChain" }
+        amount_usdc:
+          allOf:
+            - $ref: "#/components/schemas/UsdcHumanAmount"
+            - description: Capped at the server-configured `BRIDGE_MAX_AMOUNT_USDC`.
+        max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
+        eth_wallet: { $ref: "#/components/schemas/EvmAddress" }
+        ownership_proof:
+          allOf:
+            - $ref: "#/components/schemas/OwnershipProof"
+            - description: Both `sol_signature` and `eth_signature` are mandatory on this endpoint.
+      additionalProperties: false
+
+    BridgeCostBreakdownBps:
+      type: object
+      required: [swap_slippage_bps, gas_fee_bps, bridge_fee_bps, total_bps]
+      properties:
+        swap_slippage_bps: { type: integer }
+        gas_fee_bps: { type: integer }
+        bridge_fee_bps: { type: integer }
+        total_bps: { type: integer }
+
+    BridgeCostBreakdownUsdc:
+      type: object
+      required: [swap_slippage_usdc, gas_fee_usdc, bridge_fee_usdc, total_usdc]
+      properties:
+        swap_slippage_usdc: { $ref: "#/components/schemas/DecimalString" }
+        gas_fee_usdc: { $ref: "#/components/schemas/DecimalString" }
+        bridge_fee_usdc: { $ref: "#/components/schemas/DecimalString" }
+        total_usdc: { $ref: "#/components/schemas/DecimalString" }
+
+    BridgeSignableEvmPayload:
+      type: object
+      required: [type, from, tx_base64, tx_hex, approval_spender]
+      properties:
+        type: { type: string, enum: [evm_eip1559_tx] }
+        from: { $ref: "#/components/schemas/EvmAddress" }
+        tx_base64: { type: string }
+        tx_hex: { type: string }
+        approval_spender:
+          oneOf:
+            - { $ref: "#/components/schemas/EvmAddress" }
+            - { type: "null" }
+          description: |
+            ERC-20 spender to approve USDC to before broadcasting. Null when the
+            calldata needs no allowance.
+
+    BridgeSignableSolanaPayload:
+      type: object
+      required: [type, tx_base64, blockhash, last_valid_block_height]
+      properties:
+        type: { type: string, enum: [solana_versioned_tx] }
+        tx_base64: { type: string }
+        blockhash: { type: string }
+        last_valid_block_height: { type: integer }
+
+    BridgeSignablePayload:
+      oneOf:
+        - $ref: "#/components/schemas/BridgeSignableEvmPayload"
+        - $ref: "#/components/schemas/BridgeSignableSolanaPayload"
+      discriminator:
+        propertyName: type
+        mapping:
+          evm_eip1559_tx: "#/components/schemas/BridgeSignableEvmPayload"
+          solana_versioned_tx: "#/components/schemas/BridgeSignableSolanaPayload"
+
+    BridgeQuoteResponse:
+      type: object
+      required:
+        - bridge_quote_id
+        - expires_at
+        - amount_in_usdc
+        - estimated_amount_out_usdc
+        - max_slippage_bps
+        - cost_breakdown_bps
+        - cost_breakdown_usdc
+        - signable_payload
+      properties:
+        bridge_quote_id:
+          type: string
+          pattern: "^brq_[A-Za-z0-9_-]{21}$"
+        expires_at: { type: integer }
+        amount_in_usdc: { $ref: "#/components/schemas/UsdcHumanAmount" }
+        estimated_amount_out_usdc:
+          { $ref: "#/components/schemas/DecimalString" }
+        max_slippage_bps: { type: integer }
+        cost_breakdown_bps:
+          { $ref: "#/components/schemas/BridgeCostBreakdownBps" }
+        cost_breakdown_usdc:
+          { $ref: "#/components/schemas/BridgeCostBreakdownUsdc" }
+        signable_payload: { $ref: "#/components/schemas/BridgeSignablePayload" }
+
+    BridgeStatusResponse:
+      type: object
+      required:
+        [
+          bridge_quote_id,
+          status,
+          source_tx_hash,
+          destination_tx_hash,
+          updated_at,
+        ]
+      properties:
+        bridge_quote_id: { type: string }
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        source_tx_hash: { type: [string, "null"] }
+        destination_tx_hash: { type: [string, "null"] }
+        updated_at: { type: integer }
+
+    # ------------ Portfolio ----------------------------------------------
+    PortfolioPosition:
+      type: object
+      required:
+        - ticker
+        - token_ticker
+        - chain
+        - protocol
+        - token_address
+        - tokens
+        - shares
+        - usd_per_token
+        - usd_per_share
+        - usd_value
+        - shares_internal_only
+        - avg_entry_price_per_share
+        - unrealized_pnl
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        token_ticker: { type: string }
+        chain: { $ref: "#/components/schemas/Chain" }
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        token_address: { type: string }
+        tokens: { $ref: "#/components/schemas/DecimalString" }
+        shares:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        usd_per_token:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        usd_per_share:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        usd_value:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        shares_internal_only:
+          description: >-
+            Equity shares acquired via Treasures and still held (internal lot).
+            Populated only with `source=internal`; null in `all` mode and when the
+            cell has no share multiplier.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        avg_entry_price_per_share:
+          description: >-
+            Weighted-average cost basis per share of the internal lot. Populated only
+            with `source=internal`; null otherwise.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        unrealized_pnl:
+          description: >-
+            internal_tokens × usd_per_token − internal cost. Populated only with
+            `source=internal` and when a spot price exists; null otherwise.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+
+    PortfolioResponse:
+      type: object
+      required: [positions, usdc, as_of, is_cached]
+      properties:
+        positions:
+          type: array
+          items: { $ref: "#/components/schemas/PortfolioPosition" }
+        usdc:
+          type: object
+          required: [sol, eth]
+          properties:
+            sol: { $ref: "#/components/schemas/DecimalString" }
+            eth: { $ref: "#/components/schemas/DecimalString" }
+        as_of: { type: integer, description: Unix seconds. }
+        is_cached: { type: boolean }
+
+    # ------------ Trades --------------------------------------------------
+    TradeEntry:
+      type: object
+      required:
+        - trade_id
+        - source
+        - side
+        - ticker
+        - token_ticker
+        - chain
+        - protocol
+        - tx_hash
+        - order_hash
+        - tokens
+        - shares
+        - usdc_amount
+        - usd_per_share
+        - avg_entry_price_per_share
+        - realized_pnl
+        - submitted_at
+        - status
+      properties:
+        trade_id: { type: string }
+        source: { type: string, enum: [internal, external] }
+        side:
+          oneOf:
+            - { type: string, enum: [buy, sell] }
+            - { type: "null" }
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        token_ticker: { type: string }
+        chain: { $ref: "#/components/schemas/Chain" }
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        tx_hash: { type: [string, "null"] }
+        order_hash: { type: [string, "null"] }
+        tokens: { $ref: "#/components/schemas/DecimalString" }
+        shares: { $ref: "#/components/schemas/DecimalString" }
+        usdc_amount:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        usd_per_share:
+          description: >-
+            This row's settled execution price (usdc_amount / shares). Populated only with
+            `source=internal` on completed rows; null in `all` mode, on non-completed
+            (in-flight/failed/external) rows, and when usdc_amount is null.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        avg_entry_price_per_share:
+          description: >-
+            Running internal weighted-average cost basis per share at this row.
+            Populated only with `source=internal`; null on non-internal rows.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        realized_pnl:
+          description: >-
+            Realized P&L for a closing internal sell — (px − avg_entry) × closed
+            shares, gross of fees (Hyperliquid closedPnl parity). Populated only with
+            `source=internal`; null on buys, oversell-uncovered, and non-internal rows.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        submitted_at: { type: integer }
+        status:
+          type: string
+          enum: [completed, broadcast, failed, external]
+
+    TradesResponse:
+      type: object
+      required: [trades, next_offset]
+      properties:
+        trades:
+          type: array
+          items: { $ref: "#/components/schemas/TradeEntry" }
+        next_offset:
+          oneOf:
+            - { type: integer }
+            - { type: "null" }
+          description: Pass back as `offset` to fetch the next page; `null` when there are no more rows.
