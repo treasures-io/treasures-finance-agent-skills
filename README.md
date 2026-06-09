@@ -52,32 +52,6 @@ This repo also doubles as a [Claude Code plugin marketplace](https://code.claude
 
 Manage anytime with `/plugin`; pull updates with `/plugin marketplace update`. Add `--scope project` to the install to share it with everyone on a project.
 
-## Using a skill
-
-Once installed, you don't invoke skills by hand — your agent reads each skill's `description` and pulls in the right one automatically when your request matches. Just describe the task, e.g.:
-
-> "Quote a buy of 2 AAPL tokenized shares on Solana for this wallet and walk me through submitting it."
-
-The agent will load `treasures-b2b-api`, follow the endpoint flow, and open the relevant reference (auth, trading, bridging, data, errors) for the step it's on.
-
-## Repository layout
-
-```
-.
-├── .claude-plugin/           # Claude Code plugin/marketplace manifests (Option C)
-│   ├── marketplace.json
-│   └── plugin.json
-└── skills/
-    └── treasures-b2b-api/
-        ├── SKILL.md          # entry doc: map + footguns + endpoint index
-        └── references/       # loaded on demand, per task
-            ├── auth.md        # ownership-proof signing (incl. embedded wallets)
-            ├── trading.md     # quoting/submitting buys & sells, approvals
-            ├── bridging.md    # USDC bridge across Solana/Ethereum
-            ├── data.md        # /stocks, /portfolio, /trades reads
-            └── errors.md      # error matrix, rate limits, simulation
-```
-
 ## License
 
 [MIT](LICENSE)
