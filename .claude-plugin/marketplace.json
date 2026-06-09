@@ -1,0 +1,19 @@
+{
+  "name": "treasures-finance-agent-skills",
+  "owner": {
+    "name": "treasures-io"
+  },
+  "description": "Official Claude Code skills for building AI agents on the Treasures finance APIs.",
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "treasures-finance-agent-skills",
+      "source": "./",
+      "description": "Agent skill for the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair.",
+      "version": "1.0.0",
+      "author": {
+        "name": "treasures-io"
+      }
+    }
+  ]
+}
