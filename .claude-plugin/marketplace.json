@@ -9,7 +9,7 @@
     {
       "name": "treasures-finance-agent-skills",
       "source": "./",
-      "description": "Agent skill for the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair.",
+      "description": "Agent skills for the Treasures finance APIs: the public B2B API (discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, read portfolio + trade history) and delegated wallets (onboard, quote, async buys/sells, balances, API keys).",
       "version": "1.0.0",
       "author": {
         "name": "treasures-io"
