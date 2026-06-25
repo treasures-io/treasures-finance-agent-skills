@@ -2,7 +2,8 @@
 name: treasures-wallet
 description: >
   Operate a Treasures delegated wallet over the HTTP API: onboard (provision a wallet + mint a
-  scoped API key), get quotes, execute buys/sells (async, server-custodied — the agent NEVER signs),
+  scoped API key), get quotes, execute buys/sells (async — the wallet is non-custodial; the agent
+  NEVER signs, Treasures signs as a delegated signer scoped strictly to RWA trades),
   read balances/portfolio/trade-history, and manage API keys. Trigger whenever an agent needs to
   trade tokenized equities (xStocks / Ondo) vs USDC on a Treasures wallet, check a Treasures wallet
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
@@ -23,8 +24,10 @@ tags:
 
 # Treasures Wallet
 
-Drive a Treasures **delegated** wallet over HTTP. Treasures custodies the swap signer and executes
-on-chain; the agent only submits **intents** with a scoped API key. ⇒ No web3 libs, no keys, no RPC.
+Drive a Treasures **delegated** wallet over HTTP. The wallet is **non-custodial** — it stays the
+user's. Treasures holds the **swap signer** as a delegated signer, **scoped strictly to trading
+tokenized real-world assets**, and executes on-chain; the agent only submits **intents** with a
+scoped API key. ⇒ No web3 libs, no keys, no RPC.
 
 ## When to use
 
@@ -39,7 +42,8 @@ agent to hold a private key — the whole point of this design is that it doesn'
 
 ## Mental model (read this — most of it is non-obvious)
 
-- **Delegated custody. The agent never signs.** It POSTs intents; Treasures holds the swap signer
+- **Delegated signing, not custody. The agent never signs.** The wallet is non-custodial; the agent
+  POSTs intents and Treasures holds the **swap signer** — authorized only for tokenized-RWA trades —
   and executes. The skill needs only HTTPS + the API key.
 - **TWO base paths** (this is the #1 gotcha), both off the host `https://api.treasures.io`:
   - **`API = {host}/api`** — wallet plane + onboarding (`/api/wallets/...`, `/api/onboarding-sessions/...`).

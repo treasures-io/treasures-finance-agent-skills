@@ -9,7 +9,7 @@ A skill is a folder of plain-Markdown instructions (`SKILL.md`) that a coding ag
 | Skill | What it does |
 | ----- | ------------ |
 | [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
-| [`treasures-wallet`](skills/treasures-wallet/SKILL.md) | Operate a Treasures delegated wallet over HTTP: onboard (provision a wallet + mint a scoped API key), quote, execute async buys/sells (server-custodied — the agent never signs), read balances/portfolio/trade history, and manage API keys. Trades tokenized equities (xStocks / Ondo) vs USDC on Solana or Ethereum with only HTTPS + an API key — no web3 libraries, keys, or RPC. |
+| [`treasures-wallet`](skills/treasures-wallet/SKILL.md) | Operate a Treasures delegated wallet over HTTP: onboard (provision a wallet + mint a scoped API key), quote, execute async buys/sells (non-custodial — the agent never signs; Treasures signs as a delegated signer scoped strictly to RWA trades), read balances/portfolio/trade history, and manage API keys. Trades tokenized equities (xStocks / Ondo) vs USDC on Solana or Ethereum with only HTTPS + an API key — no web3 libraries, keys, or RPC. |
 
 ## Install
 
