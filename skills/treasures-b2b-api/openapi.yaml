@@ -20,9 +20,7 @@ info:
     **Rate limits.** Per-IP and per-(IP, wallet) sliding windows backed by Redis.
     Upstream 429s propagate as `502 provider_unavailable`.
 servers:
-  - url: TBD
-    description: Staging
-  - url: TBD
+  - url: https://api.treasures.io
     description: Production
 
 security: []

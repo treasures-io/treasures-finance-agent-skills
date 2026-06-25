@@ -19,7 +19,7 @@ tags:
 
 Guide for AI agents (and any non-human caller) using the Treasures public B2B API to discover tokenized stocks, quote + execute trades, bridge USDC across chains, and read portfolio + trade history on behalf of a single end-user wallet pair.
 
-- **Base URL:** `TBD`
+- **Base URL:** `https://api.treasures.io`
 - **Network:** staging trades against **Ethereum mainnet + Solana mainnet-beta** (real funds, not a testnet) — point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
 - **Content type:** `application/json`
 - **Wire format:** all token amounts, USDC, shares, prices, and bps-derived decimals are **strings** (avoid JS float drift). Integer fields (`expires_at`, `*_bps`, `quote_index`) are JSON numbers. Never round-trip a money value through JS `number`.
