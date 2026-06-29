@@ -46,7 +46,7 @@ agent to hold a private key — the whole point of this design is that it doesn'
   POSTs intents and Treasures holds the **swap signer** — authorized only for tokenized-RWA trades —
   and executes. The skill needs only HTTPS + the API key.
 - **TWO base paths** (this is the #1 gotcha), both off the host `https://api.treasures.io`:
-  - **`API = {host}/api`** — wallet plane + onboarding (`/api/wallets/...`, `/api/onboarding-sessions/...`).
+  - **`API = {host}/api/v1`** — wallet plane + onboarding (`/api/v1/wallets/...`, `/api/v1/onboarding-sessions/...`).
   - **`READS = {host}/public/v1`** — address-scoped reads only (`/public/v1/trades`, `/public/v1/portfolio`).
 - **Two identifier types:**
   - `wallet_id` (`wlt_…`) → wallet-scoped endpoints (`API/wallets/:id/...`).
@@ -80,8 +80,8 @@ agent to hold a private key — the whole point of this design is that it doesn'
 | `wallet_id` | `wlt_XD825…` | onboarding poll (`response.wallet.wallet_id`) |
 | `sol_address`, `eth_address` | `3HW73Fk…`, `0xaF51…` | onboarding poll (`response.wallet.addresses.{solana,evm}`); cache. Fallback if you only have a `wallet_id`: `GET API/wallets/:id` → `addresses` |
 
-Derived: `API = https://api.treasures.io/api`, `READS = https://api.treasures.io/public/v1`
-(generally `API = ${host}/api`, `READS = ${host}/public/v1`).
+Derived: `API = https://api.treasures.io/api/v1`, `READS = https://api.treasures.io/public/v1`
+(generally `API = ${host}/api/v1`, `READS = ${host}/public/v1`).
 
 ## Credential store — named profiles (multi-wallet)
 
@@ -281,7 +281,7 @@ const USDC_DECIMALS = 6;
 // `apiKey`, `walletId` come from config; never log apiKey.
 // `host` defaults to the Treasures API; override via TREASURES_HOST if set.
 const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
-const API = `${host}/api`, READS = `${host}/public/v1`;
+const API = `${host}/api/v1`, READS = `${host}/public/v1`;
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
   const res = await fetch(url, init);

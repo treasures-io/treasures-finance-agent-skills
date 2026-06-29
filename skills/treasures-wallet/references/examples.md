@@ -1,12 +1,12 @@
 # Validated examples
 
-Real calls against the current `/api` + `/public/v1` paths (mainnet, this session). Replace `$KEY`
+Real calls against the current `/api/v1` + `/public/v1` paths (mainnet, this session). Replace `$KEY`
 (`twk_…`, keep secret) and `$WID` (`wlt_…`). `HOST` is `https://api.treasures.io`;
-`API=$HOST/api`, `READS=$HOST/public/v1`.
+`API=$HOST/api/v1`, `READS=$HOST/public/v1`.
 
 ```bash
 HOST=${HOST:-https://api.treasures.io}
-KEY=twk_…; WID=wlt_XD825…; API=$HOST/api; READS=$HOST/public/v1
+KEY=twk_…; WID=wlt_XD825…; API=$HOST/api/v1; READS=$HOST/public/v1
 SOL=3HW73Fk…; ETH=0xaF51…   # from GET $API/wallets/$WID → addresses
 ```
 
