@@ -47,4 +47,4 @@ body). To get a *new* scoped key headlessly, run another onboarding session.
 Owner errors: 401 `unauthorized`, 403 `not_wallet_owner`, 404 `wallet_not_found`, 400 invalid scopes/caps.
 
 Source: `src/services/wallet/api-key-types.ts` (scopes/caps), `key-caps.ts` (enforcement),
-`api-keys.ts` (format/verify), `src/api/routes/wallets.ts` (routes).
+`api-keys.ts` (format/verify), `src/api/routes/api/v1/wallets.ts` (routes).
