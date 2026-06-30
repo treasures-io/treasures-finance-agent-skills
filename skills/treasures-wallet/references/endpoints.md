@@ -1,7 +1,7 @@
 # Endpoint reference
 
 All paths relative to `host` (`https://api.treasures.io`).
-**Two base paths:** `API = {host}/api`, `READS = {host}/public/v1`.
+**Two base paths:** `API = {host}/api/v1`, `READS = {host}/public/v1`.
 Auth column: `key:quote`/`key:trade` = `X-API-Key` with that scope; `owner` = Privy access token
 (`Authorization: Bearer`) + identity token (`Privy-Id-Token`); `device` = Bearer `device_secret`;
 `none` = public, IP-rate-limited.
@@ -77,5 +77,5 @@ See [`onboarding.md`](onboarding.md). Mint (`none`) · consent `GET /:requestId`
 | `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side; MFA gate for USDC > $1000) | unsigned tx |
 | `POST API/wallets/:id/mfa/enroll` | sync MFA-enrolled flag from Privy | `{mfa_enrolled}` |
 
-Source of truth: `src/api/routes/wallets.ts`, `src/api/routes/onboarding-sessions.ts`,
+Source of truth: `src/api/routes/api/v1/wallets.ts`, `src/api/routes/api/v1/onboarding-sessions.ts`,
 `src/api/routes/public/v1/{trades,portfolio}.ts`; mounts in `src/api/index.ts`.

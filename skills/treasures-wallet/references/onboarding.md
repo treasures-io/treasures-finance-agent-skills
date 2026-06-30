@@ -25,7 +25,7 @@ agent: POST /onboarding-sessions/poll (loop, Bearer device_secret) → {status:"
 5. **Never call `/complete` yourself** — it needs the human's Privy access+identity token (their browser),
    which the agent does not have. A `/complete` attempt by the agent will 401.
 
-## Endpoints (all under `API = {host}/api`)
+## Endpoints (all under `API = {host}/api/v1`)
 
 ### `POST API/onboarding-sessions` — mint · auth `none` (agent)
 Body (`.strict`, optional): `{ "api_key": { "scopes"?: ["trade"|"quote"], "caps"?: {…} } }` — or `{}`
@@ -75,4 +75,4 @@ Fund the wallet with **USDC** (the trade quote currency) + a little **native gas
 on the first trade of a token; the Fusion fill itself is gasless). `GET /wallets/:id/balances` →
 `needs_funding`.
 
-Source: `src/api/routes/onboarding-sessions.ts`, `src/services/wallet/onboarding-session.ts`.
+Source: `src/api/routes/api/v1/onboarding-sessions.ts`, `src/services/wallet/onboarding-session.ts`.
