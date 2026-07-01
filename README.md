@@ -53,6 +53,14 @@ This repo also doubles as a [Claude Code plugin marketplace](https://code.claude
 
 Manage anytime with `/plugin`; pull updates with `/plugin marketplace update`. Add `--scope project` to the install to share it with everyone on a project.
 
+## Versioning & staleness
+
+Each skill declares a `metadata.version`, and the API enforces it on an **opt-in**
+basis: a skill that sends its version gets a deprecation warning while it's aging and
+a hard stop (before any trade) once it's past sunset — without affecting generic,
+non-skill API clients. Full spec:
+[`docs/skill-version-compatibility.md`](docs/skill-version-compatibility.md).
+
 ## License
 
 [MIT](LICENSE)

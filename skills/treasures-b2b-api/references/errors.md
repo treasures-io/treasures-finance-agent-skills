@@ -25,6 +25,7 @@ Top-level HTTP `error` codes. (Per-leg `error_code` values live inside `/quote/{
 | 422 | `holdings_unknown` | On-chain balance read failed (RPC/indexer blip) | Transient — **policy B**, then re-quote with a `chain`/`protocol` filter to skip the unreadable cell. Failing across both chains = degradation; surface to user |
 | 422 | `insufficient_liquidity` | Bridge route has no quote at this size | Transient — retry / smaller size |
 | 422 | `no_routes` | (`/quote/*` only) all candidate legs unavailable; body may carry `reason: "slippage_exceeded" \| "amount_too_small"` | Permanent — act per `reason`, or relax slippage / change chain / protocol |
+| 426 | `skill_version_unsupported` | Skill version (`X-Treasures-Skill-Version`) is below the server's `X-Min-Skill-Version` floor; fails closed before any fund move. Body: `{error, min_skill_version, api_revision, upgrade}` | Permanent — STOP, do not trade/retry; relay `upgrade` to the user. See <https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/docs/skill-version-compatibility.md> |
 | 429 | `Too many requests` | Per-IP or per-(IP, wallet) limit. Body is the literal string `Too many requests` (not an enum) | Transient — honor `Retry-After` |
 | 502 | `provider_unavailable` | Upstream 5xx/429/network (quote venue, bridge, price feed, or RPC) | Transient — **policy B** |
 | 503 | `screening_unavailable` | Sanctions screening couldn't complete; request fails closed | Transient — **policy B** |
