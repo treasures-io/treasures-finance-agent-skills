@@ -104,10 +104,53 @@ Signing code, all-or-nothing per-proof rules, embedded-wallet troubleshooting, a
 
 | HTTP      | `error`                                                                       | Action                                                        |
 | --------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| 426       | `skill_version_unsupported`                                                   | STOP — skill too old for the current API; do **not** trade or retry. Relay the response's `upgrade` command (see Version & compatibility) |
 | 403       | `address_blocked`                                                             | Wallet tied to a sanctioned entity — do not retry that wallet |
 | 410 / 404 | `quote_stale` / `quote_not_found`                                             | Re-quote                                                      |
 | 422       | `holdings_unknown` / 502 `provider_unavailable` / 503 `screening_unavailable` | Transient — backoff policy B, cap 5 attempts                  |
 | 429       | `Too many requests`                                                           | Honor `Retry-After` (delta-seconds)                           |
+
+## Version & compatibility
+
+Sending your skill version opts you into a version gate: deprecation warnings while it
+ages, then a hard stop once stale. Route **every** call through one helper that attaches it:
+
+```ts
+const SKILL_VERSION = '1.0.0'; // = SKILL.md metadata.version
+
+// Route EVERY Treasures API call through this — don't call fetch() directly. It attaches the
+// skill version and applies the gate to every response: 426 hard-stops, deprecation warns.
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Treasures-Skill': 'treasures-b2b-api',
+      'X-Treasures-Skill-Version': SKILL_VERSION,
+      ...init.headers,
+    },
+  });
+  if (res.status === 426) {                                 // blocking — skill too old
+    const body = await res.json().catch(() => ({}));        // {error, min_skill_version, api_revision, upgrade}
+    throw { status: 426, ...body };                         // STOP: relay body.upgrade, do NOT retry or trade
+  }
+  const sunset = res.headers.get('Sunset'), warning = res.headers.get('Warning');   // non-blocking — aging skill (finish, then warn user)
+  if (res.headers.get('Deprecation') || sunset || warning)
+    console.warn(`skill deprecated — sunset ${sunset ?? '?'}; update: ${res.headers.get('Link') ?? 'see SKILL.md'}${warning ? ` — ${warning}` : ''}`);
+  return res;
+}
+```
+
+- **`Deprecation` / `Sunset` / `Warning` response headers → non-blocking.** Finish the
+  current operation, then tell the user this skill is deprecated, the `Sunset` date,
+  and to update (use the `Link` URL).
+- **`426 skill_version_unsupported` → blocking.** The server fails closed **before**
+  any fund move. Do **not** submit or retry — surface the response's `upgrade` command
+  and stop.
+- **Standard-versioning signals → treat as possible staleness.** A `Sunset` on the
+  versioned path, an unexpected `410`/`404` on a documented endpoint, or a new
+  `400 invalid_request` on a body that used to validate → stop and check for a skill
+  update; don't blindly retry.
 
 ## Endpoint index
 
