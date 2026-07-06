@@ -146,7 +146,9 @@ eth_signature (EIP-191 personal_sign): "0xb9e2724af6d5016fb0141c384d63dbe7ead922
 
 | HTTP | `error` | Cause / fix |
 | --- | --- | --- |
-| 401 | `ownership_proof_sol_invalid` | `sol_signature` missing or fails Ed25519 verify — re-sign (base64 **not** base58; exact bytes incl. trailing `\n`) |
-| 401 | `ownership_proof_eth_invalid` | `eth_signature` missing or EIP-191 recovery ≠ `eth_wallet` — re-sign |
+| 401 | `ownership_proof_sol_invalid` | `sol_signature` present but fails Ed25519 verify — re-sign (base64 **not** base58; exact bytes incl. trailing `\n`) |
+| 401 | `ownership_proof_eth_invalid` | `eth_signature` present but EIP-191 recovery ≠ `eth_wallet` — re-sign |
 | 401 | `ownership_proof_skewed` | `issued_at` outside `[now − 300s, now + 30s]` — re-sign with current time |
 | 401 | `ownership_proof_invalid` | Neither wallet supplied (defensive; route schema usually rejects as `400 invalid_request` first) |
+
+> **Missing vs invalid.** The 401s above fire when a signature is **present but wrong**. A signature *omitted* for a wallet you did supply is caught earlier by the route schema → `400 invalid_request` (`ownership_proof.sol_signature is required when sol_wallet is provided`), not a 401. Rule of thumb: **400 = you forgot to send it; 401 = you sent a bad one.**

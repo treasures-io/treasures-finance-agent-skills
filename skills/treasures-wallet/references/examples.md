@@ -10,6 +10,10 @@ KEY=twk_…; WID=wlt_XD825…; API=$HOST/api/v1; READS=$HOST/public/v1
 SOL=3HW73Fk…; ETH=0xaF51…   # from GET $API/wallets/$WID → addresses
 ```
 
+> **Version gate:** these `curl` examples omit the `X-Treasures-Skill` / `X-Treasures-Skill-Version`
+> headers for brevity, so they run **ungated** (the gate is opt-in). Production calls send them on every
+> request — the `tFetch` helper in `SKILL.md` does this automatically (see Behaviors #7).
+
 ## Resolve addresses + balances (no key)
 ```bash
 curl -s "$API/wallets/$WID"           # → { addresses:{evm,solana}, signers, policies, ... }

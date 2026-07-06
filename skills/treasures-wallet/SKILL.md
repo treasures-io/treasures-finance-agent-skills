@@ -272,6 +272,13 @@ greedy algorithm:
 6. **Gas / funding:** Solana needs SOL (fees + one-time Token-2022 ATA rent per new asset); the first
    Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the Fusion fill is
    gasless). Surface `needs_funding` from `/balances`.
+7. **Version gate — never trade on a stale skill.** `tFetch` sends the skill version headers and calls
+   `surfaceDeprecation`, which only **logs** the deprecation headers — you must relay them to the user.
+   React to the server's signals: `Deprecation`/`Sunset`/`Warning` → **non-blocking** (finish, then tell
+   the user to update via the `Link` URL + `Sunset` date); `426 skill_version_unsupported` → **blocking**
+   (do **not** trade or retry — surface the response's `upgrade` command and stop); a versioned-path
+   `Sunset`, an unexpected `410`/`404`, or a new `400 invalid_request` on a previously valid call →
+   possible staleness (stop and check for a skill update, don't blindly retry).
 
 ## Reusable helpers (TypeScript; adapt to your runtime — `big.js` for decimals)
 
@@ -282,11 +289,26 @@ const USDC_DECIMALS = 6;
 // `host` defaults to the Treasures API; override via TREASURES_HOST if set.
 const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
+const SKILL = 'treasures-wallet';
+const SKILL_VERSION = '1.0.0'; // keep in sync with SKILL.md metadata.version — the server gates on it
+
+// Non-blocking: the server flags an aging skill via response headers on a normal 2xx (the 426
+// hard-stop is thrown below). Override to route to the user — the agent MUST relay it (Behaviors #7).
+function surfaceDeprecation(h: Headers): void {
+  const sunset = h.get('Sunset'), warning = h.get('Warning');
+  if (!h.get('Deprecation') && !sunset && !warning) return;
+  console.warn(`[${SKILL}] deprecated — sunset ${sunset ?? '?'}; update: ${h.get('Link') ?? 'see SKILL.md'}${warning ? ` — ${warning}` : ''}`);
+}
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, {
+    ...init,
+    // Identify the skill version on every call so the API can gate stale skills (426).
+    headers: { 'X-Treasures-Skill': SKILL, 'X-Treasures-Skill-Version': SKILL_VERSION, ...init.headers },
+  });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw { status: res.status, ...body };   // {status, error, cap?, reason?}
+  if (!res.ok) throw { status: res.status, ...body };  // {status, error, cap?, reason?}; 426 = skill too old → STOP, relay body.upgrade (Behaviors #7)
+  surfaceDeprecation(res.headers);  // non-blocking: aging skill → warn + relay, then continue
   return body;
 }
 const apiGet = (path: string, q: Record<string, string|number> = {}) =>
@@ -379,6 +401,7 @@ async function sellGreedy(asset: string, targetShares: string, slippageBps: numb
 | 410 | `already_claimed` | onboarding key already claimed (single-use) |
 | 422 | `asset_not_whitelisted` | ticker not in catalog / not routable on the pinned cell |
 | 422 | `quote_unavailable` / `quote_failed` | genuine no-route, thin-liquidity no-fill, **or a sell bigger than any single cell holds** → split client-side / bounded retry |
+| 426 | `{error:"skill_version_unsupported", min_skill_version, upgrade}` | skill too old for the current API — **STOP, do not trade/retry**; relay `upgrade` (see Behaviors #7) |
 | **503** | `routing_unavailable` / `grant_check_unavailable` | **transient → retry w/ backoff (fresh key)** |
 | 202 → `failed`/`rejected` | `reject_reason` | no funds moved → retry (fresh key) for transient reasons |
 
