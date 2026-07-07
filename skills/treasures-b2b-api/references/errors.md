@@ -21,18 +21,19 @@ Top-level HTTP `error` codes. (Per-leg `error_code` values live inside `/quote/{
 | 404 | `bridge_quote_not_found` | `bridge_quote_id` unknown | Permanent — re-quote |
 | 409 | `leg_already_submitted` | `(quote_id, quote_index)` already broadcast with a different payload | Permanent — read returned `tx_hash` |
 | 410 | `quote_stale` | `expires_at` passed | Permanent — re-quote |
+| 415 | *(`error` is a message, not a code)* | Request body sent with a **non-JSON** `Content-Type` — a *missing* header is accepted (body is parsed as JSON regardless); a *wrong* one (e.g. `text/plain`) is rejected before schema validation. Body: `{ "error": "Unsupported Media Type; expected application/json" }` | Permanent — set `Content-Type: application/json` |
 | 422 | `holdings_insufficient` | Sell shares exceed on-chain holdings | Permanent — reduce `amount_shares` |
 | 422 | `holdings_unknown` | On-chain balance read failed (RPC/indexer blip) | Transient — **policy B**, then re-quote with a `chain`/`protocol` filter to skip the unreadable cell. Failing across both chains = degradation; surface to user |
 | 422 | `insufficient_liquidity` | Bridge route has no quote at this size | Transient — retry / smaller size |
 | 422 | `no_routes` | (`/quote/*` only) all candidate legs unavailable; body may carry `reason: "slippage_exceeded" \| "amount_too_small"` | Permanent — act per `reason`, or relax slippage / change chain / protocol |
-| 426 | `skill_version_unsupported` | Skill version (`X-Treasures-Skill-Version`) is below the server's `X-Min-Skill-Version` floor; fails closed before any fund move. Body: `{error, min_skill_version, api_revision, upgrade}` | Permanent — STOP, do not trade/retry; relay `upgrade` to the user. See <https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/docs/skill-version-compatibility.md> |
+| 426 | `skill_version_unsupported` | `X-Treasures-Skill-Version` below the server's `X-Min-Skill-Version` floor; fails closed **before** any fund move. **Inert today** (floor = `1.0.0`); activates on a future breaking change. Body: `{error, min_skill_version, api_revision, upgrade}` | Permanent — STOP, do not trade/retry; relay `upgrade` to the user. See [skill-version-compatibility](https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/docs/skill-version-compatibility.md) |
 | 429 | `Too many requests` | Per-IP or per-(IP, wallet) limit. Body is the literal string `Too many requests` (not an enum) | Transient — honor `Retry-After` |
 | 502 | `provider_unavailable` | Upstream 5xx/429/network (quote venue, bridge, price feed, or RPC) | Transient — **policy B** |
 | 503 | `screening_unavailable` | Sanctions screening couldn't complete; request fails closed | Transient — **policy B** |
 
 ## Rate limits
 
-Per-IP and per-(IP, wallet) buckets, 60s windows:
+Per-IP and per-(IP, wallet) buckets, 60s windows. **The numbers below are conservative floors** — the server's real per-endpoint ceilings are equal or higher — **but every caller is additionally capped by a global 300 requests/min per IP across _all_ endpoints** (see below), which is the binding limit for high-frequency polling. Pace to the 300/min aggregate, not the per-endpoint row:
 
 | Endpoint group | Per-IP / min | Per-wallet / min |
 | --- | --- | --- |
@@ -44,6 +45,8 @@ Per-IP and per-(IP, wallet) buckets, 60s windows:
 | `/bridge/{id}/status` | 180 | — |
 | `/stocks/tickers`, `/stocks/prices` | 60 each (separate buckets) | — |
 | `/portfolio`, `/trades` | 60 | 60 |
+
+**Global ceiling.** A blanket **300 requests / minute per IP** applies across *all* endpoints combined (every route except health), on top of the per-endpoint buckets above. High-frequency polling (`/status` at 1 Hz across many quotes, plus `/portfolio` / `/trades`) is bounded by this aggregate, not the per-endpoint number — keep your **total** request rate under 300/min/IP, or spread across IPs.
 
 429 returns `{ "error": "Too many requests" }` + a `Retry-After` header in **delta-seconds** (integer, e.g. `12` — never an HTTP-date). Sleep exactly that long; don't retry sooner.
 
@@ -59,7 +62,7 @@ Optional but strongly advised. Dry-run every signed tx against the live RPC firs
 | `evm_eip1559_tx` (signed, real nonce) | `/bridge/quote` | `publicClient.call({...})` (viem `eth_call`) |
 | ERC-20 `approve()` you built | first-time approvals | same — `publicClient.call(...)` against the token |
 
-> `evm_eip712_typed_data` from `/quote/*` is an **off-chain order signature, not an on-chain tx** — nothing to simulate. Trust the quote and poll `/quote/{id}/status`.
+> `evm_eip712_typed_data` from `/quote/*` (both `eth` **and** `robinhood`) is an **off-chain order signature, not an on-chain tx** — nothing to simulate. Trust the quote and poll `/quote/{id}/status`.
 
 ```ts
 // Solana
@@ -95,18 +98,19 @@ Treasures does not subsidize gas. Any operation your key broadcasts needs native
 | Eth ERC-20 `approve()` | **ETH** | one-time per (token, spender); mainnet gas, no subsidy |
 | Eth `/bridge/quote` broadcast | **ETH** | you submit the deposit tx; reverts (e.g. missing allowance) also cost gas |
 | Eth buy/sell | **gasless** | the execution venue pays settlement gas; ETH needed only for the prior approval |
+| Robinhood (`chain:"robinhood"`) buy/sell | **gasless** | same sign-only model as Eth — the settlement network pays gas; you broadcast nothing and need no 4663 native float |
 | Solana `/bridge/quote` broadcast | **SOL** | you broadcast the signed tx; user pays network fee |
 
-Rough floats (mainnet, conservative — tune to live gas): Solana ≥ **0.02 SOL** (dozens of trades + a bridge), Ethereum ≥ **0.01 ETH** (a handful of approvals + one bridge; raise during congestion). Zero balance → Solana: leg `failed`/`provider_error`; Eth: wallet RPC rejects (`insufficient funds for gas`), no on-chain effect — fund, then proceed. **This API does not expose native balances** — `/portfolio` returns only USDC + token positions, so check the native float yourself via your own RPC (`getBalance` on Solana, `eth_getBalance` on Ethereum) before broadcasting.
+Rough floats (mainnet, conservative — tune to live gas): Solana ≥ **0.02 SOL** (dozens of trades + a bridge), Ethereum ≥ **0.01 ETH** (a handful of approvals + one bridge; raise during congestion). The Robinhood venue needs **no** native float (gasless) — only USDG on 4663 to buy, or Stock Tokens to sell. Zero balance → Solana: leg `failed`/`provider_error`; Eth: wallet RPC rejects an approval/bridge broadcast (`insufficient funds for gas`), no on-chain effect — fund, then proceed. **This API does not expose native balances** — `/portfolio` returns only USDC/USDG + token positions, so check the native float yourself via your own RPC (`getBalance` on Solana, `eth_getBalance` on Ethereum) before broadcasting.
 
 ## Gotchas & contract notes
 
-- **All request bodies are `.strict()`.** Unknown/misspelled fields → `400 invalid_request`. Don't add unknown `null` placeholders, leftover B2C fields (`user_id`), or future-reserved fields. (Fields documented as nullable — e.g. `chain`/`protocol`, where `null` means "best/either" — do accept `null`; the rule targets *undocumented* fields only.) Applies to `/quote/buy`, `/quote/sell`, `/trade/submit`, `/bridge/quote`.
+- **All request bodies are `.strict()`.** Unknown/misspelled fields → `400 invalid_request`. Don't add unknown `null` placeholders, leftover B2C fields (`user_id`), or future-reserved fields. (Fields documented as nullable — e.g. `chain`/`protocol`, where `null` means "best/either" — do accept `null`; the rule targets *undocumented* fields only.) Applies to the POST bodies of `/quote/buy`, `/quote/sell`, `/trade/submit`, `/bridge/quote` — **and** to GET query strings on `/portfolio`, `/trades`, `/stocks/tickers`, `/stocks/prices` (an unknown query param → `400 invalid_request`).
 - **Decimals.** USDC = 6, shares = up to 18. Always send/parse as strings; never via JS `number` (server uses Big.js / Postgres `numeric` end-to-end).
 - **Tickers.** Canonical IEX/Nasdaq dot-notation everywhere: `BRK.A`, `BF.B` — never `BRK-A`/`BF-B`. Quote-body regex `/^[A-Z][A-Z0-9.]{0,9}$/` (uppercase, starts with a letter, hyphen rejected). The laxer `/stocks/prices` regex `/^[A-Z0-9.-]{1,10}$/i` works only because that endpoint normalizes to dot-notation first — always send dot-notation; don't depend on normalization elsewhere.
 - **`tradfi_reference` may be `null`** (tradfi-feed outage) — never block on it; use `quotes[i].price_usdc_per_share` for execution decisions.
 - **Privacy.** Treasures hides which upstream provider executed a leg. Don't expect or parse provider-specific fields — they aren't there.
-- **`source: "external"` trades have null `usdc_amount`** — token-balance drift from reconciliation; `tokens` is signed (positive = inflow, negative = outflow).
+- **`source: "external"` trades have null `usdc_amount`** — token-balance drift from reconciliation; `tokens` **and** `shares` are both signed (positive = inflow, negative = outflow), and `side` is always `null` (the reconciler never classifies drift as buy/sell).
 - **`expires_at` is unix seconds, not millis.**
 - **The `chain` field is functional, not cosmetic** — each chain has a different signing scheme; sign with the wallet whose key matches the leg's `chain`.
 - **No `/quote/buy` USDC balance pre-check.** Sell does pre-check share holdings.

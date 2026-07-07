@@ -2,7 +2,7 @@
 name: treasures-b2b-api
 description: Use to build an AI agent on the Treasures public B2B API — discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling.
 metadata:
-  version: "1.0.0"
+  version: "1.2.0"
 tags:
   - treasures
   - b2b-api
@@ -19,9 +19,9 @@ tags:
 
 Guide for AI agents (and any non-human caller) using the Treasures public B2B API to discover tokenized stocks, quote + execute trades, bridge USDC across chains, and read portfolio + trade history on behalf of a single end-user wallet pair.
 
-- **Base URL:** `https://api.treasures.io`
-- **Network:** staging trades against **Ethereum mainnet + Solana mainnet-beta** (real funds, not a testnet) — point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
-- **Content type:** `application/json`
+- **Base URL:** `https://api.treasures.io/public/v1`
+- **Network:** trades execute against **Ethereum mainnet + Solana mainnet-beta — real funds, not a testnet**. Point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
+- **Required headers:** set `Content-Type: application/json` on every request carrying a body — a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.2.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions — plus `Deprecation`/`Sunset` warning headers during the grace window — instead of a silent break. Omitting the version header opts out of that early warning.
 - **Wire format:** all token amounts, USDC, shares, prices, and bps-derived decimals are **strings** (avoid JS float drift). Integer fields (`expires_at`, `*_bps`, `quote_index`) are JSON numbers. Never round-trip a money value through JS `number`.
 
 This entry doc is the map + the footguns. **It is not enough on its own to execute a trade** — full schemas, signing code, and error tables live in the references below. **Load the reference for the task before you act; you don't need to read them all.**
@@ -75,6 +75,8 @@ Set `allowance = max-uint256` once. Approve code + the `approval_spender` null/n
 
 **5. Solana ownership proof is base64, NOT base58.** Privy/Turnkey quickstarts show base58 (`bs58.encode`) — that's the #1 cause of `ownership_proof_sol_invalid`. See [`references/auth.md`](references/auth.md#embedded-wallets).
 
+**6. `chain:"robinhood"` is chain-pinned, priced in USDG, and liquid-names-only.** The opt-in Robinhood Chain venue (Robinhood Stock Tokens, chain id **4663**, priced in **USDG**) now uses the **same sign-only, gasless model as `eth`**: `/quote/buy` **or `/quote/sell`** with `chain:"robinhood"` returns one `evm_eip712_typed_data` order — sign it (`eth_signTypedData_v4`) and submit `{ type:"evm_eip712_signature", signature }`. You **broadcast nothing and pay no gas** — no 4663 RPC and no native float needed. Three things to know: (a) amounts are **USDG** — read `base_asset` + `amount_base`, not the `_usdc`-named fields; (b) only the **liquid** marquee names (AAPL/TSLA/NVDA/AMD) fill — others return `422 no_routes` even though they list on `/stocks/tickers`; (c) you still must fund the input on 4663 (USDG to buy, Stock Tokens to sell) and **submit** each trade for it to enter `/trades` — Robinhood positions are read live and have no external-row reconciler, so an unsubmitted trade shows on `/portfolio` (live balance) but never in `/trades`. Buy and sell are both supported (chain-pinned; a sell is sized against your on-chain 4663 balance). Full flow: [`references/trading.md`](references/trading.md#robinhood).
+
 ## Auth essentials
 
 Three endpoints require an `ownership_proof`: `POST /quote/buy`, `POST /quote/sell`, and `POST /bridge/quote` (**both** `sol_signature` + `eth_signature` mandatory on bridge — it spans both chains). Everything else is unauthenticated; `/trade/submit` is gated by the per-leg signed payload itself.
@@ -110,13 +112,26 @@ Signing code, all-or-nothing per-proof rules, embedded-wallet troubleshooting, a
 | 422       | `holdings_unknown` / 502 `provider_unavailable` / 503 `screening_unavailable` | Transient — backoff policy B, cap 5 attempts                  |
 | 429       | `Too many requests`                                                           | Honor `Retry-After` (delta-seconds)                           |
 
+## Endpoint index
+
+| Endpoint                                         | Auth                                | Method |
+| ------------------------------------------------ | ----------------------------------- | ------ |
+| `/stocks/tickers` · `/stocks/prices?tickers=…`   | none                                | GET    |
+| `/quote/buy` · `/quote/sell`                     | `ownership_proof`                   | POST   |
+| `/quote/{quote_id}/status`                       | none                                | GET    |
+| `/trade/submit`                                  | signed payload (per leg)            | POST   |
+| `/bridge/quote`                                  | `ownership_proof` (both signatures) | POST   |
+| `/bridge/{bridge_quote_id}/status`               | none                                | GET    |
+| `/portfolio?sol_wallet=&eth_wallet=&source=`     | none                                | GET    |
+| `/trades?sol_wallet=&eth_wallet=&limit=&offset=&source=` | none                        | GET    |
+
 ## Version & compatibility
 
 Sending your skill version opts you into a version gate: deprecation warnings while it
 ages, then a hard stop once stale. Route **every** call through one helper that attaches it:
 
 ```ts
-const SKILL_VERSION = '1.0.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.2.0'; // = SKILL.md metadata.version
 
 // Route EVERY Treasures API call through this — don't call fetch() directly. It attaches the
 // skill version and applies the gate to every response: 426 hard-stops, deprecation warns.
@@ -151,16 +166,3 @@ async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> 
   versioned path, an unexpected `410`/`404` on a documented endpoint, or a new
   `400 invalid_request` on a body that used to validate → stop and check for a skill
   update; don't blindly retry.
-
-## Endpoint index
-
-| Endpoint                                         | Auth                                | Method |
-| ------------------------------------------------ | ----------------------------------- | ------ |
-| `/stocks/tickers` · `/stocks/prices?tickers=…`   | none                                | GET    |
-| `/quote/buy` · `/quote/sell`                     | `ownership_proof`                   | POST   |
-| `/quote/{quote_id}/status`                       | none                                | GET    |
-| `/trade/submit`                                  | signed payload (per leg)            | POST   |
-| `/bridge/quote`                                  | `ownership_proof` (both signatures) | POST   |
-| `/bridge/{bridge_quote_id}/status`               | none                                | GET    |
-| `/portfolio?sol_wallet=&eth_wallet=&source=`     | none                                | GET    |
-| `/trades?sol_wallet=&eth_wallet=&limit=&offset=&source=` | none                        | GET    |

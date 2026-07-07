@@ -20,7 +20,7 @@ info:
     **Rate limits.** Per-IP and per-(IP, wallet) sliding windows backed by Redis.
     Upstream 429s propagate as `502 provider_unavailable`.
 servers:
-  - url: https://api.treasures.io
+  - url: https://api.treasures.io/public/v1
     description: Production
 
 security: []
@@ -109,6 +109,8 @@ paths:
         Requires `ownership_proof` for each wallet provided. Returns up to two
         signable quote legs (one per chain). Cache the returned `quote_id`;
         every signed leg is submitted together at `/trade/submit`.
+        Set `quote_only: true` for a non-executable price preview (the wallet need
+        not be funded; `quote_id`, `expires_at`, and `signable_payloads` are omitted).
       requestBody:
         required: true
         content:
@@ -149,6 +151,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NoRoutesError"
+              examples:
+                no_routes: { value: { error: no_routes } }
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
@@ -412,7 +416,7 @@ paths:
     get:
       operationId: getPortfolio
       tags: [Portfolio]
-      summary: Reconciled holdings + USDC balances for the given wallets
+      summary: Reconciled holdings + USDC / USDG balances for the given wallets
       description: At least one of `sol_wallet` / `eth_wallet` is required.
       parameters:
         - $ref: "#/components/parameters/SolWalletQuery"
@@ -568,11 +572,11 @@ components:
 
     Chain:
       type: string
-      enum: [sol, eth]
+      enum: [sol, eth, robinhood]
 
     Protocol:
       type: string
-      enum: [ondo, xstocks]
+      enum: [ondo, xstocks, robinhood]
 
     SlippageBps:
       type: integer
@@ -690,6 +694,19 @@ components:
           type: [string, "null"]
           description: Issuer's wrapped-token symbol (`<TICKER>on` Ondo, `<TICKER>x` xStocks). Null when not listed.
 
+    RobinhoodListing:
+      type: object
+      description: >
+        Robinhood Chain (4663) venue listing. Single-chain, so one `address`
+        instead of the sol/eth pair; token decimals stay internal.
+      required: [address, share_multiplier, token_ticker]
+      properties:
+        address: { type: [string, "null"] }
+        share_multiplier: { type: [string, "null"] }
+        token_ticker:
+          type: [string, "null"]
+          description: Bare stock symbol (Robinhood Stock Tokens carry no on/x suffix). Null when not listed.
+
     TradfiBlock:
       type: object
       required:
@@ -736,7 +753,7 @@ components:
 
     StockOnchainPerProtocol:
       type: object
-      required: [ondo, xstocks]
+      required: [ondo, xstocks, robinhood]
       properties:
         ondo:
           oneOf:
@@ -746,10 +763,14 @@ components:
           oneOf:
             - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
             - { type: "null" }
+        robinhood:
+          oneOf:
+            - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
+            - { type: "null" }
 
     StockTickerItem:
       type: object
-      required: [ticker, name, available_chains, ondo, xstocks]
+      required: [ticker, name, available_chains, ondo, xstocks, robinhood]
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         name: { type: string }
@@ -758,6 +779,7 @@ components:
           items: { $ref: "#/components/schemas/Chain" }
         ondo: { $ref: "#/components/schemas/StockProtocolListing" }
         xstocks: { $ref: "#/components/schemas/StockProtocolListing" }
+        robinhood: { $ref: "#/components/schemas/RobinhoodListing" }
 
     StockListItem:
       allOf:
@@ -834,6 +856,12 @@ components:
 
     SignableEvmTypedData:
       type: object
+      description: >-
+        EIP-712 typed data for a gasless EVM Fusion order — carried by **both** the eth
+        (Ethereum mainnet) and robinhood (Robinhood Chain / 4663) legs, which share the same
+        sign-only model. Exactly one payload per leg; sign it with `eth_signTypedData_v4` and
+        return the signature to `/trade/submit`. A 1inch resolver settles the signed order
+        on-chain, so the caller broadcasts nothing and pays no native gas.
       required: [type, typed_data]
       properties:
         type: { type: string, enum: [evm_eip712_typed_data] }
@@ -853,10 +881,15 @@ components:
 
     CostBreakdownBps:
       type: object
+      description: >-
+        Fee + slippage breakdown in basis points, informational. These fees are already
+        deducted from `estimated_output_*` (the net deliverable) and reflected in
+        `price_usdc_per_share`. The deduction is provider-dependent — do NOT reconstruct a
+        gross amount as `estimated_output / (1 − fees)`; use `estimated_output_*` as-is.
       required: [treasures_fee_bps, dex_swap_fee_bps, estimated_slippage_bps]
       properties:
-        treasures_fee_bps: { type: integer }
-        dex_swap_fee_bps: { type: integer }
+        treasures_fee_bps: { type: integer, description: Treasures' integrator fee. }
+        dex_swap_fee_bps: { type: integer, description: Provider protocol + swap/execution fee. }
         estimated_slippage_bps: { type: integer }
         slippage_vs_tradfi_bps:
           type: integer
@@ -873,7 +906,6 @@ components:
         - estimated_output_shares
         - estimated_output_tokens
         - cost_breakdown_bps
-        - signable_payloads
       properties:
         quote_index: { type: integer, minimum: 0 }
         chain: { $ref: "#/components/schemas/Chain" }
@@ -881,10 +913,21 @@ components:
         price_usdc_per_share: { $ref: "#/components/schemas/DecimalString" }
         estimated_output_shares: { $ref: "#/components/schemas/DecimalString" }
         estimated_output_tokens: { $ref: "#/components/schemas/DecimalString" }
+        base_asset:
+          type: string
+          enum: [usdc, usdg]
+          description: >-
+            Base currency the caller spends — `usdc` on sol/eth legs, `usdg` on robinhood legs.
+            Disambiguates the `_usdc`-named fields (`price_usdc_per_share`, `amount_usdc`) when
+            the base is USDG, which shares USDC's 6-decimal scale.
+        amount_base:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: Base amount spent, human-decimal — the base-asset alias of `amount_usdc`.
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
         signable_payloads:
           type: array
           minItems: 1
+          description: Omitted on `quote_only` previews — the leg is non-executable.
           items: { $ref: "#/components/schemas/SignablePayload" }
 
     QuoteSellLeg:
@@ -907,6 +950,18 @@ components:
         tokens_consumed: { $ref: "#/components/schemas/DecimalString" }
         estimated_output_usdc: { $ref: "#/components/schemas/DecimalString" }
         price_usdc_per_share: { $ref: "#/components/schemas/DecimalString" }
+        base_asset:
+          type: string
+          enum: [usdc, usdg]
+          description: >-
+            Base currency the caller receives — `usdc` on sol/eth legs, `usdg` on robinhood legs.
+            Disambiguates the `_usdc`-named fields (`price_usdc_per_share`, `estimated_output_usdc`)
+            when the base is USDG, which shares USDC's 6-decimal scale.
+        amount_base:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: >-
+            Base amount received, human-decimal — the base-asset alias of `estimated_output_usdc`
+            (equal value, base-denominated).
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
         signable_payloads:
           type: array
@@ -933,6 +988,16 @@ components:
         eth_wallet:
           $ref: "#/components/schemas/EvmAddress"
         ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
+        quote_only:
+          type: boolean
+          default: false
+          description: |
+            Price-only preview. When `true`, the quote is priced for a wallet that
+            need not hold the funds, but the result is non-executable: `quote_id`,
+            `expires_at`, and every leg's `signable_payloads` are omitted, nothing is
+            persisted, and there is no `/quote/{quote_id}/status` to poll or anything
+            to submit. `ownership_proof` is still required. Buy-only — sending it to
+            `/quote/sell` is rejected as an unknown field.
       additionalProperties: false
       description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
 
@@ -961,14 +1026,16 @@ components:
 
     QuoteBuyResponse:
       type: object
-      required: [quote_id, side, ticker, expires_at, tradfi_reference, quotes]
+      required: [side, ticker, tradfi_reference, quotes]
       properties:
-        quote_id: { type: string }
+        quote_id:
+          type: string
+          description: Omitted on `quote_only` previews (no executable quote to submit).
         side: { type: string, enum: [buy] }
         ticker: { $ref: "#/components/schemas/Ticker" }
         expires_at:
           type: integer
-          description: Unix seconds. Re-quote after this time.
+          description: Unix seconds. Re-quote after this time. Omitted on `quote_only` previews.
         tradfi_reference:
           oneOf:
             - { $ref: "#/components/schemas/TradfiReference" }
@@ -1070,6 +1137,11 @@ components:
 
     SignedEvmPayload:
       type: object
+      description: >-
+        Signed gasless EVM Fusion order — the caller's EIP-712 signature over the quote leg's
+        typed data. Used by **both** the eth (mainnet) and robinhood (Robinhood Chain / 4663)
+        legs. The server relays the signed order to the venue's resolver network (mainnet for
+        eth, the 4663 relayer for robinhood); the caller never broadcasts an on-chain tx.
       required: [type, signature]
       properties:
         type: { type: string, enum: [evm_eip712_signature] }
@@ -1339,7 +1411,7 @@ components:
 
     PortfolioResponse:
       type: object
-      required: [positions, usdc, as_of, is_cached]
+      required: [positions, usdc, usdg, as_of, is_cached]
       properties:
         positions:
           type: array
@@ -1350,6 +1422,16 @@ components:
           properties:
             sol: { $ref: "#/components/schemas/DecimalString" }
             eth: { $ref: "#/components/schemas/DecimalString" }
+        usdg:
+          type: object
+          description: >-
+            Base-currency cash on Robinhood Chain (4663) — the venue's USDG, the 4663
+            analog of `usdc`. Read live off the caller's own 4663 EOA (keyed on
+            `eth_wallet`), so it is never covered by `is_cached`. `"0"` when no
+            `eth_wallet` is supplied, the Robinhood venue is dormant, or the 4663 read fails.
+          required: [robinhood]
+          properties:
+            robinhood: { $ref: "#/components/schemas/DecimalString" }
         as_of: { type: integer, description: Unix seconds. }
         is_cached: { type: boolean }
 
