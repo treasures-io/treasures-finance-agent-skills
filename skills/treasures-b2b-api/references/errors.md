@@ -24,7 +24,6 @@ Top-level HTTP `error` codes. (Per-leg `error_code` values live inside `/quote/{
 | 415 | *(`error` is a message, not a code)* | Request body sent with a **non-JSON** `Content-Type` — a *missing* header is accepted (body is parsed as JSON regardless); a *wrong* one (e.g. `text/plain`) is rejected before schema validation. Body: `{ "error": "Unsupported Media Type; expected application/json" }` | Permanent — set `Content-Type: application/json` |
 | 422 | `holdings_insufficient` | Sell shares exceed on-chain holdings | Permanent — reduce `amount_shares` |
 | 422 | `holdings_unknown` | On-chain balance read failed (RPC/indexer blip) | Transient — **policy B**, then re-quote with a `chain`/`protocol` filter to skip the unreadable cell. Failing across both chains = degradation; surface to user |
-| 422 | `insufficient_base_balance` | (`/quote/*`, chain `robinhood` only) executable swap pre-build failed — the wallet holds too little of the **input** asset on 4663 to fund the trade: a **buy** needs USDG; a **sell** needs the Stock Token (if on-chain balance drifted below the sized exit) | Permanent — fund the input asset on Robinhood Chain (4663), then re-quote |
 | 422 | `insufficient_liquidity` | Bridge route has no quote at this size | Transient — retry / smaller size |
 | 422 | `no_routes` | (`/quote/*` only) all candidate legs unavailable; body may carry `reason: "slippage_exceeded" \| "amount_too_small"` | Permanent — act per `reason`, or relax slippage / change chain / protocol |
 | 426 | `skill_version_unsupported` | `X-Treasures-Skill-Version` below the server's `X-Min-Skill-Version` floor; fails closed **before** any fund move. **Inert today** (floor = `1.0.0`); activates on a future breaking change. Body: `{error, min_skill_version, api_revision, upgrade}` | Permanent — STOP, do not trade/retry; relay `upgrade` to the user. See [skill-version-compatibility](https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/docs/skill-version-compatibility.md) |
@@ -61,10 +60,9 @@ Optional but strongly advised. Dry-run every signed tx against the live RPC firs
 | --- | --- | --- |
 | `solana_versioned_tx` (signed) | `/quote/*`, `/bridge/quote` | `connection.simulateTransaction(tx)` (@solana/web3.js) |
 | `evm_eip1559_tx` (signed, real nonce) | `/bridge/quote` | `publicClient.call({...})` (viem `eth_call`) |
-| `evm_legacy_tx` (signed, real nonce) | `/quote/*` chain `robinhood` | same — `publicClient.call(...)` on a client pointed at your **4663** RPC (define a custom viem chain for 4663, not `mainnet`; sim both the approve and the swap) |
 | ERC-20 `approve()` you built | first-time approvals | same — `publicClient.call(...)` against the token |
 
-> `evm_eip712_typed_data` from `/quote/*` is an **off-chain order signature, not an on-chain tx** — nothing to simulate. Trust the quote and poll `/quote/{id}/status`.
+> `evm_eip712_typed_data` from `/quote/*` (both `eth` **and** `robinhood`) is an **off-chain order signature, not an on-chain tx** — nothing to simulate. Trust the quote and poll `/quote/{id}/status`.
 
 ```ts
 // Solana
@@ -100,10 +98,10 @@ Treasures does not subsidize gas. Any operation your key broadcasts needs native
 | Eth ERC-20 `approve()` | **ETH** | one-time per (token, spender); mainnet gas, no subsidy |
 | Eth `/bridge/quote` broadcast | **ETH** | you submit the deposit tx; reverts (e.g. missing allowance) also cost gas |
 | Eth buy/sell | **gasless** | the execution venue pays settlement gas; ETH needed only for the prior approval |
+| Robinhood (`chain:"robinhood"`) buy/sell | **gasless** | same sign-only model as Eth — the settlement network pays gas; you broadcast nothing and need no 4663 native float |
 | Solana `/bridge/quote` broadcast | **SOL** | you broadcast the signed tx; user pays network fee |
-| Robinhood (`chain:"robinhood"`) approve + swap | **ETH on 4663** | you broadcast both txs yourself on chain 4663; native ETH *there* — a separate float from mainnet ETH |
 
-Rough floats (mainnet, conservative — tune to live gas): Solana ≥ **0.02 SOL** (dozens of trades + a bridge), Ethereum ≥ **0.01 ETH** (a handful of approvals + one bridge; raise during congestion), plus — if you use the Robinhood venue — a **separate ETH float on chain 4663** (covers the approve + swap you broadcast there). Zero balance → Solana: leg `failed`/`provider_error`; Eth / 4663: wallet RPC rejects (`insufficient funds for gas`), no on-chain effect — fund, then proceed. **This API does not expose native balances** — `/portfolio` returns only USDC + token positions, so check the native float yourself via your own RPC (`getBalance` on Solana, `eth_getBalance` on Ethereum, `eth_getBalance` on your 4663 RPC for Robinhood) before broadcasting.
+Rough floats (mainnet, conservative — tune to live gas): Solana ≥ **0.02 SOL** (dozens of trades + a bridge), Ethereum ≥ **0.01 ETH** (a handful of approvals + one bridge; raise during congestion). The Robinhood venue needs **no** native float (gasless) — only USDG on 4663 to buy, or Stock Tokens to sell. Zero balance → Solana: leg `failed`/`provider_error`; Eth: wallet RPC rejects an approval/bridge broadcast (`insufficient funds for gas`), no on-chain effect — fund, then proceed. **This API does not expose native balances** — `/portfolio` returns only USDC/USDG + token positions, so check the native float yourself via your own RPC (`getBalance` on Solana, `eth_getBalance` on Ethereum) before broadcasting.
 
 ## Gotchas & contract notes
 
