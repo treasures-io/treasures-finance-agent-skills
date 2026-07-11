@@ -146,19 +146,13 @@ paths:
                 $ref: "#/components/schemas/SimpleError"
               example: { error: quote_stale }
         "422":
-          description: |
-            No fillable routes returned by the planner, or (chain `robinhood`)
-            the wallet holds insufficient base-asset (USDG on 4663) to fund the trade.
+          description: No fillable routes returned by the planner.
           content:
             application/json:
               schema:
-                anyOf:
-                  - $ref: "#/components/schemas/NoRoutesError"
-                  - $ref: "#/components/schemas/InsufficientBaseBalanceError"
+                $ref: "#/components/schemas/NoRoutesError"
               examples:
                 no_routes: { value: { error: no_routes } }
-                insufficient_base_balance:
-                  { value: { error: insufficient_base_balance } }
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
@@ -208,24 +202,19 @@ paths:
               example: { error: quote_stale }
         "422":
           description: |
-            No fillable routes returned by the planner, insufficient holdings for
-            the requested share amount, or (chain `robinhood`) the wallet holds
-            too little of the input asset on 4663 to fund the trade — USDG on a
-            buy, or the Stock Token on a sell.
+            No fillable routes returned by the planner, or insufficient holdings
+            for the requested share amount.
           content:
             application/json:
               schema:
                 anyOf:
                   - $ref: "#/components/schemas/NoRoutesError"
-                  - $ref: "#/components/schemas/InsufficientBaseBalanceError"
                   - $ref: "#/components/schemas/SimpleError"
               examples:
                 no_routes: { value: { error: no_routes } }
                 holdings_insufficient:
                   { value: { error: holdings_insufficient } }
                 holdings_unknown: { value: { error: holdings_unknown } }
-                insufficient_base_balance:
-                  { value: { error: insufficient_base_balance } }
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
@@ -657,19 +646,6 @@ components:
             actionable reason; otherwise omitted.
       additionalProperties: false
 
-    InsufficientBaseBalanceError:
-      type: object
-      required: [error]
-      properties:
-        error: { type: string, enum: [insufficient_base_balance] }
-        message: { type: string }
-      description: |
-        Chain `robinhood` only. The executable (non-`quote_only`) swap is pre-built
-        at quote time; the on-chain swap build rejects it when the wallet holds too little
-        of the input asset on 4663 — USDG on a buy, or the Stock Token on a sell —
-        to fund the trade. Fund the input asset on Robinhood Chain (4663), then re-quote.
-      additionalProperties: false
-
     LegAlreadySubmittedError:
       type: object
       required: [error, tx_hash, order_hash]
@@ -864,11 +840,9 @@ components:
         mapping:
           solana_versioned_tx: "#/components/schemas/SignableSolanaTx"
           evm_eip712_typed_data: "#/components/schemas/SignableEvmTypedData"
-          evm_legacy_tx: "#/components/schemas/SignableEvmLegacyTx"
       oneOf:
         - $ref: "#/components/schemas/SignableSolanaTx"
         - $ref: "#/components/schemas/SignableEvmTypedData"
-        - $ref: "#/components/schemas/SignableEvmLegacyTx"
 
     SignableSolanaTx:
       type: object
@@ -882,6 +856,12 @@ components:
 
     SignableEvmTypedData:
       type: object
+      description: >-
+        EIP-712 typed data for a gasless EVM Fusion order — carried by **both** the eth
+        (Ethereum mainnet) and robinhood (Robinhood Chain / 4663) legs, which share the same
+        sign-only model. Exactly one payload per leg; sign it with `eth_signTypedData_v4` and
+        return the signature to `/trade/submit`. A 1inch resolver settles the signed order
+        on-chain, so the caller broadcasts nothing and pays no native gas.
       required: [type, typed_data]
       properties:
         type: { type: string, enum: [evm_eip712_typed_data] }
@@ -889,33 +869,6 @@ components:
           type: object
           description: EIP-712 typed-data object for the gasless EVM order; sign with `eth_signTypedData_v4`.
           additionalProperties: true
-      additionalProperties: false
-
-    SignableEvmLegacyTx:
-      type: object
-      description: >-
-        Raw unsigned legacy (`gasPrice`, no EIP-1559) EVM transaction the caller signs and
-        broadcasts itself on the robinhood venue (Robinhood Chain / 4663). A leg's
-        `signable_payloads` array is ordered `[approve?, swap]` — sign and broadcast in order;
-        the optional ERC-20 approve must mine before the swap. Set the correct `nonce` against
-        `from` before signing (providers emit the tx with `nonce = 0`).
-      required: [type, from, tx_base64, tx_hex, approval_spender]
-      properties:
-        type: { type: string, enum: [evm_legacy_tx] }
-        from:
-          type: string
-          description: EVM EOA that must sign and broadcast the tx (the caller's own wallet).
-        tx_base64:
-          type: string
-          description: Base64 of the serialized unsigned legacy EVM transaction.
-        tx_hex:
-          type: string
-          description: 0x-hex serialized unsigned legacy EVM transaction.
-        approval_spender:
-          type: [string, "null"]
-          description: >-
-            Address the caller must have an ERC-20 allowance to before broadcasting this tx, or
-            `null` when the calldata needs no allowance (e.g. the approve tx itself).
       additionalProperties: false
 
     TradfiReference:
@@ -1184,6 +1137,11 @@ components:
 
     SignedEvmPayload:
       type: object
+      description: >-
+        Signed gasless EVM Fusion order — the caller's EIP-712 signature over the quote leg's
+        typed data. Used by **both** the eth (mainnet) and robinhood (Robinhood Chain / 4663)
+        legs. The server relays the signed order to the venue's resolver network (mainnet for
+        eth, the 4663 relayer for robinhood); the caller never broadcasts an on-chain tx.
       required: [type, signature]
       properties:
         type: { type: string, enum: [evm_eip712_signature] }
@@ -1194,32 +1152,15 @@ components:
           description: "0x-prefixed EIP-712 EOA signature (132 chars)."
       additionalProperties: false
 
-    SignedEvmBroadcastTx:
-      type: object
-      description: >-
-        robinhood venue (Robinhood Chain / 4663) submit payload. The caller has already broadcast
-        its own on-chain swap and reports the resulting transaction hash; the server records
-        it (no relay/broadcast) and settles it via the `/quote/{quote_id}/status` receipt poll.
-      required: [type, tx_hash]
-      properties:
-        type: { type: string, enum: [evm_broadcast_tx] }
-        tx_hash:
-          type: string
-          pattern: '^0x[0-9a-fA-F]{64}$'
-          description: 0x-prefixed 32-byte (64-hex-char) on-chain transaction hash the caller broadcast.
-      additionalProperties: false
-
     SignedPayload:
       oneOf:
         - $ref: "#/components/schemas/SignedSolanaPayload"
         - $ref: "#/components/schemas/SignedEvmPayload"
-        - $ref: "#/components/schemas/SignedEvmBroadcastTx"
       discriminator:
         propertyName: type
         mapping:
           solana_versioned_tx: "#/components/schemas/SignedSolanaPayload"
           evm_eip712_signature: "#/components/schemas/SignedEvmPayload"
-          evm_broadcast_tx: "#/components/schemas/SignedEvmBroadcastTx"
 
     SignedLeg:
       type: object
