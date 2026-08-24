@@ -14,9 +14,21 @@ policies:[{chain,scope,owner_quorum_id}], created_at }`. Use once to resolve + c
 `wallet_not_found`.
 
 ### `GET API/wallets/:id/balances` — auth `none`
-→ `{ native:{sol,eth}, stablecoins:[{chain,asset,amount}],
+→ `{ native:{sol,eth,robinhood,base}, stablecoins:[{chain,asset,amount}],
 positions:[{issuer,asset,chain,token_address,raw_token,shares,usd_per_token,usd_per_share,notional_usd}],
-needs_funding, as_of }`. `chain` ∈ `sol|eth`, `issuer` ∈ `ondo|xstocks`. On-chain truth.
+needs_funding, as_of }`. `chain` ∈ `sol|eth|robinhood|base`, `issuer` ∈ `ondo|xstocks|robinhood|coinbase`.
+`native.robinhood` (4663 Orbit L2) and `native.base` (8453 OP-Stack L2) are native ETH held by the
+same EOA as `native.eth` — raw amounts only, no USD (for gas valued in USD see the B2C portfolio
+reads, D-NativeInPortfolio).
+`needs_funding` is true only when **all four** are zero, so a 4663-only funded wallet is not
+"needs funding" — the flag is coarse by design; per-chain readiness is derivable from `native`.
+
+**Freshness:** positions/stablecoins and the `native` AMOUNTS are served from the reconciler's result
+cache (30s fresh, up to 300s stale-while-revalidate), so this is on-chain truth as of `as_of`, not as of
+the request. `needs_funding` is the exception and is never stale in the direction that matters: a
+would-be `true` is re-confirmed with a live on-chain read before being returned, so a wallet you just
+funded flips to `false` immediately rather than after the cache window. (`false` is served from cache —
+staleness cannot un-gas a wallet.)
 
 ### `GET API/wallets/:id/delegation` — auth `none`
 → `{ app_enabled, signers:[{role,app_enabled}] }`. Is delegated trading enabled.
@@ -29,11 +41,20 @@ Omit `chain`/`protocol` → auto-route (single best cell). →
 atomic strings; `chain`/`protocol` are the **resolved** cell. Errors: 400, 403 cap, 422
 `quote_unavailable`/`asset_not_whitelisted`, 503 `routing_unavailable`.
 
+A 422 `quote_unavailable` may carry an optional `reason` naming the finer cause. Two of them are
+**permanent** for the asset and must not be retried: `reference_unavailable` (no market price exists to
+price-check the venue against, so it isn't tradeable here) and `price_off_reference` (the on-chain price
+sits too far from the underlying — a cap that is not caller-tunable, so raising `slippage_bps` cannot
+clear it). Anything else — including a `quote_unavailable` with no `reason` — is a liquidity condition
+worth retrying later.
+
 ### `POST API/wallets/:id/trades` — auth `key:trade` (or `owner`)
-Headers: `Idempotency-Key` (required → 400 `missing_idempotency_key`), `Content-Type: application/json`.
+Headers: `Idempotency-Key` (required → 400 `missing_idempotency_key`; base64url/UUID charset `[A-Za-z0-9_-]`, ≤ 128 chars → 400 `invalid_idempotency_key`), `Content-Type: application/json`.
 Body (`.strict`): `{ chain?, protocol?, side, asset, size:{notional_usdc}|{shares}, slippage_bps }`.
 → **202** job (see job shape). Route-first: no-route/cap/unwhitelisted are **sync 4xx** (no job).
-Errors: 400, 401, 403 `key_cap_exceeded`/`policy_denied`, 404, 422, 503.
+Errors: 400, 401, 403 `key_cap_exceeded`/`policy_denied`, 404, 422, 503. The execute-time re-quote runs
+the same price-check as `GET /quotes`, so a 422 here carries the same optional `reason` — treat
+`reference_unavailable` and `price_off_reference` as permanent for the asset.
 
 ### `GET API/wallets/:id/trades/:job_id` — auth `key:trade` (or `owner`)
 Same credential as `POST /trades` — the poller is the trade's creator. → job. State machine
@@ -42,7 +63,7 @@ Same credential as `POST /trades` — the poller is the trade's creator. → job
 
 **Job shape:** `{ job_id, state, chain, protocol, side, asset, route_type, reject_reason, tx_sig,
 attempts, result, created_at, updated_at }`. At `confirmed`: `result = { amount_in, amount_out, tx_sig }`
-(atomic). EVM: `tx_sig` at `broadcast` = Fusion orderHash; `result.tx_sig` at `confirmed` = on-chain
+(atomic). EVM: `tx_sig` at `broadcast` = the order hash; `result.tx_sig` at `confirmed` = on-chain
 fill. `failed`/`rejected` ⇒ no funds moved.
 
 ## Reads plane — `READS/...` (auth `none`)
@@ -74,8 +95,7 @@ See [`onboarding.md`](onboarding.md). Mint (`none`) · consent `GET /:requestId`
 | `GET API/wallets/:id/delegation/grant-spec` | per-chain inputs for client-side Privy grant | `{specs:[{chain,address,signerId,policyIds}]}` |
 | `POST API/wallets/:id/delegation/enable` | enable delegated trading (409 if not granted) | `{app_enabled,signers}` |
 | `POST API/wallets/:id/delegation/disable` | disable | `{app_enabled,signers}` |
-| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side; MFA gate for USDC > $1000) | unsigned tx |
-| `POST API/wallets/:id/mfa/enroll` | sync MFA-enrolled flag from Privy | `{mfa_enrolled}` |
+| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); over the per-tx / rolling-24h cap → `422 withdraw_cap_exceeded` with `cap: per_tx\|daily` | unsigned tx |
 
 Source of truth: `src/api/routes/api/v1/wallets.ts`, `src/api/routes/api/v1/onboarding-sessions.ts`,
 `src/api/routes/public/v1/{trades,portfolio}.ts`; mounts in `src/api/index.ts`.
