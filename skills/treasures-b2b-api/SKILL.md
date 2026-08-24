@@ -1,14 +1,15 @@
 ---
 name: treasures-b2b-api
-description: Use to build an AI agent on the Treasures public B2B API — discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling.
+description: Use to build an AI agent on the Treasures public B2B API — discover tokenized stocks, quote/execute trades on Solana, Ethereum, Robinhood Chain and Base, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling.
 metadata:
-  version: "1.2.0"
+  version: "1.6.0"
 tags:
   - treasures
   - b2b-api
   - tokenized-stocks
   - solana
   - ethereum
+  - base
   - trading
   - bridge
   - usdc
@@ -20,8 +21,8 @@ tags:
 Guide for AI agents (and any non-human caller) using the Treasures public B2B API to discover tokenized stocks, quote + execute trades, bridge USDC across chains, and read portfolio + trade history on behalf of a single end-user wallet pair.
 
 - **Base URL:** `https://api.treasures.io/public/v1`
-- **Network:** trades execute against **Ethereum mainnet + Solana mainnet-beta — real funds, not a testnet**. Point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
-- **Required headers:** set `Content-Type: application/json` on every request carrying a body — a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.2.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions — plus `Deprecation`/`Sunset` warning headers during the grace window — instead of a silent break. Omitting the version header opts out of that early warning.
+- **Network:** trades execute against **Ethereum mainnet + Solana mainnet-beta — real funds, not a testnet**, plus two more venues: **Robinhood Chain (4663)** — now co-ranked in unpinned quotes, not just pinned — and **Base (8453)**. Point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
+- **Required headers:** set `Content-Type: application/json` on every request carrying a body — a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.6.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions — plus `Deprecation`/`Sunset` warning headers during the grace window — instead of a silent break. Omitting the version header opts out of that early warning.
 - **Wire format:** all token amounts, USDC, shares, prices, and bps-derived decimals are **strings** (avoid JS float drift). Integer fields (`expires_at`, `*_bps`, `quote_index`) are JSON numbers. Never round-trip a money value through JS `number`.
 
 This entry doc is the map + the footguns. **It is not enough on its own to execute a trade** — full schemas, signing code, and error tables live in the references below. **Load the reference for the task before you act; you don't need to read them all.**
@@ -35,7 +36,7 @@ This entry doc is the map + the footguns. **It is not enough on its own to execu
 | [`references/auth.md`](references/auth.md)         | building the `ownership_proof` (esp. on embedded/managed Solana wallets)                                    |
 | [`references/trading.md`](references/trading.md)   | quoting/submitting a buy or sell, signing trade legs, polling quote status, or setting first-time approvals |
 | [`references/bridging.md`](references/bridging.md) | bridging USDC between chains (incl. the `nonce=0` EVM trap)                                                 |
-| [`references/data.md`](references/data.md)         | reading `/stocks/*`, `/portfolio`, or `/trades`                                                             |
+| [`references/data.md`](references/data.md)         | reading `/stocks/*`, `/portfolio`, `/trades`, or `/settlements` (your own settled trades)                     |
 | [`references/errors.md`](references/errors.md)     | handling an error code, rate limits, or simulating a tx before broadcast                                    |
 
 ## TL;DR — happy path
@@ -63,19 +64,23 @@ These cause silent or first-time-only failures. Handle them up front.
 | ----------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | Eth buy (USDC → stock)  | USDC `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`               | settlement `0x111111125421ca6dc452d289314280a0f8842a65`                                 |
 | Eth sell (stock → USDC) | each protocol's stock token (per ticker — a sell may span both) | settlement (same)                                                                       |
+| Base buy (USDC → stock) | **Base-native** USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | settlement `0x111111125421ca6dc452d289314280a0f8842a65` — same address as Ethereum's, but allowances are **per-chain**: an Ethereum approval grants nothing on 8453 |
+| Base sell (stock → USDC)| the ticker's B20 token (`coinbase` block `address`)             | settlement (same)                                                                       |
 | `eth → sol` bridge      | USDC                                                            | `signable_payload.approval_spender` from the bridge quote (non-null on the normal flow) |
 
 Set `allowance = max-uint256` once. Approve code + the `approval_spender` null/non-null rule: [`references/trading.md`](references/trading.md#first-time-approvals).
 
-**2. Hold the input token on the chain you trade.** A buy spends **USDC on the chosen chain**; a sell spends the **stock token**. The server pre-checks _sell_ holdings (insufficient → `422 holdings_insufficient` at quote time) but does **NOT** pre-check _buy_ USDC — an underfunded buy passes `/quote/buy` **and** `/trade/submit`, then the on-chain swap fails at the end (`broadcast_failed` / `not_enough_balance_or_allowance`), wasting the whole flow. **Verify USDC before quoting**: read the wallet, or call `GET /portfolio` (`usdc.{sol, eth}`). Need USDC on the other chain? Bridge first.
+**2. Hold the input token on the chain you trade.** A buy spends **USDC on the chosen chain**; a sell spends the **stock token**. The server pre-checks _sell_ holdings (insufficient → `422 holdings_insufficient` at quote time) but does **NOT** pre-check _buy_ USDC — an underfunded buy passes `/quote/buy` **and** `/trade/submit`, then the on-chain swap fails at the end (`broadcast_failed` / `not_enough_balance_or_allowance`), wasting the whole flow. **Verify USDC before quoting**: read the wallet, or call `GET /portfolio` (`usdc.{sol, eth, base}`). Need USDC on the other chain? Bridge first.
 
-**3. Native gas: Treasures does not subsidize it.** Any operation your key broadcasts needs native balance on that chain. Eth buys/sells are gasless (the execution venue pays), but approvals + bridge broadcasts cost ETH; all Solana txs cost SOL. Keep ≥ **0.02 SOL** and ≥ **0.01 ETH** floats. Detail: [`references/errors.md`](references/errors.md#gas).
+**3. Native gas: Treasures does not subsidize it.** Any operation your key broadcasts needs native balance on that chain. Eth, Robinhood and Base buys/sells are all gasless (the settlement network pays), but approvals + bridge broadcasts cost native gas; all Solana txs cost SOL. Keep ≥ **0.02 SOL**, ≥ **0.01 ETH** on mainnet, and ≥ **0.001 ETH on Base** (approvals only). Robinhood needs no native float at all. Detail: [`references/errors.md`](references/errors.md#gas).
 
 **4. The EVM bridge tx ships with `nonce=0`.** You MUST inject the wallet's real nonce before signing or broadcast is rejected ("nonce too low"). Most common bridge footgun — see [`references/bridging.md`](references/bridging.md#evm-sign-broadcast).
 
 **5. Solana ownership proof is base64, NOT base58.** Privy/Turnkey quickstarts show base58 (`bs58.encode`) — that's the #1 cause of `ownership_proof_sol_invalid`. See [`references/auth.md`](references/auth.md#embedded-wallets).
 
-**6. `chain:"robinhood"` is chain-pinned, priced in USDG, and liquid-names-only.** The opt-in Robinhood Chain venue (Robinhood Stock Tokens, chain id **4663**, priced in **USDG**) now uses the **same sign-only, gasless model as `eth`**: `/quote/buy` **or `/quote/sell`** with `chain:"robinhood"` returns one `evm_eip712_typed_data` order — sign it (`eth_signTypedData_v4`) and submit `{ type:"evm_eip712_signature", signature }`. You **broadcast nothing and pay no gas** — no 4663 RPC and no native float needed. Three things to know: (a) amounts are **USDG** — read `base_asset` + `amount_base`, not the `_usdc`-named fields; (b) only the **liquid** marquee names (AAPL/TSLA/NVDA/AMD) fill — others return `422 no_routes` even though they list on `/stocks/tickers`; (c) you still must fund the input on 4663 (USDG to buy, Stock Tokens to sell) and **submit** each trade for it to enter `/trades` — Robinhood positions are read live and have no external-row reconciler, so an unsubmitted trade shows on `/portfolio` (live balance) but never in `/trades`. Buy and sell are both supported (chain-pinned; a sell is sized against your on-chain 4663 balance). Full flow: [`references/trading.md`](references/trading.md#robinhood).
+**6. `chain:"robinhood"` is auto-routed (no longer pin-only), priced in USDG, and liquid-names-only.** The Robinhood Chain venue (Robinhood Stock Tokens, chain id **4663**, priced in **USDG**) is **co-ranked in `chain:null` quotes** — an unpinned buy can return a USDG leg, and an unpinned sell greedy-fills robinhood positions with the rest, so **branch on each leg's `base_asset`, never on whether you sent `chain`**. It uses the **same sign-only, gasless model as `eth`**: `/quote/buy` **or `/quote/sell`** with `chain:"robinhood"` returns one `evm_eip712_typed_data` order — sign it (`eth_signTypedData_v4`) and submit `{ type:"evm_eip712_signature", signature }`. You **broadcast nothing and pay no gas** — no 4663 RPC and no native float needed. Three things to know: (a) amounts are **USDG** — read `base_asset` + `amount_base`, not the `_usdc`-named fields; (b) only the **liquid** marquee names (AAPL/TSLA/NVDA/AMD) fill — others return `422 no_routes` even though they list on `/stocks/tickers`; (c) you still must fund the input on 4663 (USDG to buy, Stock Tokens to sell) and **submit** each trade for it to enter `/trades` — there is no external-row reconciler here. Submitting also **opens the `/portfolio` position read**, which is gated on holding a 4663 ledger row for the wallet: until the wallet has submitted at least one 4663 trade its Stock Tokens do not appear in `positions` at all (no `partial` flag — nothing was read), though `usdg.robinhood` cash is never gated. After that first submitted trade the read is live, so a later unsubmitted balance does surface on `/portfolio` while still never reaching `/trades`. Buy and sell are both supported, pinned or unpinned (a sell is sized against your on-chain 4663 balance). Full flow: [`references/trading.md`](references/trading.md#robinhood).
+
+**7. `chain:"base"` is priced in Base-native USDC and listed only once a token is minted.** The Coinbase venue (**B20 tokenized equities**, Base, chain id **8453**) is co-ranked in unpinned quotes once a ticker is minted and priceable — rare today, so treat an unpinned base leg as possible, not expected. It uses the **same sign-only, gasless model as `eth`**: `/quote/buy` or `/quote/sell` with `chain:"base"` returns one `evm_eip712_typed_data` order — sign it (`eth_signTypedData_v4`) and submit `{ type:"evm_eip712_signature", signature }`. Four things to know: (a) `base_asset` is **`"usdc"`**, but it is **Base-native USDC** (`0x8335…2913`), a *different contract* from mainnet USDC — branch on the leg's `chain`, never on `base_asset` alone; (b) the venue is **supply-gated** — Coinbase deployed its tokens unminted, and a ticker appears on `base` only once real supply exists, so **read `available_chains` from `/stocks/tickers`** instead of assuming a ticker trades there; (c) you need a **one-time allowance on 8453** (see the table above) and therefore a **small ETH float on Base** to send that approval — the trade itself is gasless; (d) `/portfolio` **does** report Base — B20 positions (`chain:"base"`, `protocol:"coinbase"`) and your Base USDC cash under **`usdc.base`**, a sibling of `usdc.sol`/`usdc.eth` but a *different contract* from mainnet USDC. One catch: like Robinhood, **positions are gated on a submitted trade** — we read them only for a wallet we already hold a Base ledger row for, so tokens transferred in directly (or a trade you never submitted) stay invisible with **no** `partial` flag. Cash is never gated. So **submit** every trade: it is what puts the trade in `/trades` *and* what opens the position read. Full flow: [`references/trading.md`](references/trading.md#base).
 
 ## Auth essentials
 
@@ -124,6 +129,7 @@ Signing code, all-or-nothing per-proof rules, embedded-wallet troubleshooting, a
 | `/bridge/{bridge_quote_id}/status`               | none                                | GET    |
 | `/portfolio?sol_wallet=&eth_wallet=&source=`     | none                                | GET    |
 | `/trades?sol_wallet=&eth_wallet=&limit=&offset=&source=` | none                        | GET    |
+| `/settlements?limit=&cursor=&chain=&protocol=&ticker=&side=&token_out_address=&settled_from=&settled_to=` | `X-API-Key` (required) | GET |
 
 ## Version & compatibility
 
@@ -131,7 +137,7 @@ Sending your skill version opts you into a version gate: deprecation warnings wh
 ages, then a hard stop once stale. Route **every** call through one helper that attaches it:
 
 ```ts
-const SKILL_VERSION = '1.2.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.6.0'; // = SKILL.md metadata.version
 
 // Route EVERY Treasures API call through this — don't call fetch() directly. It attaches the
 // skill version and applies the gate to every response: 426 hard-stops, deprecation warns.

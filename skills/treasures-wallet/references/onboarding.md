@@ -72,7 +72,7 @@ Verify the wallet/owner out-of-band (e.g. against the expected owner) **before f
 ## Funding (after onboarding)
 Fund the wallet with **USDC** (the trade quote currency) + a little **native gas**: SOL on Solana
 (fees + one-time Token-2022 ATA rent per new asset), a little ETH on Ethereum (one-time ERC-20 approve
-on the first trade of a token; the Fusion fill itself is gasless). `GET /wallets/:id/balances` →
+on the first trade of a token; the fill itself is gasless). `GET /wallets/:id/balances` →
 `needs_funding`.
 
 Source: `src/api/routes/api/v1/onboarding-sessions.ts`, `src/services/wallet/onboarding-session.ts`.

@@ -2,14 +2,13 @@
 name: treasures-wallet
 description: >
   Operate a Treasures delegated wallet over the HTTP API: onboard (provision a wallet + mint a
-  scoped API key), get quotes, execute buys/sells (async — the wallet is non-custodial; the agent
-  NEVER signs, Treasures signs as a delegated signer scoped strictly to RWA trades),
+  scoped API key), get quotes, execute buys/sells (async, server-signed — the agent NEVER signs),
   read balances/portfolio/trade-history, and manage API keys. Trigger whenever an agent needs to
   trade tokenized equities (xStocks / Ondo) vs USDC on a Treasures wallet, check a Treasures wallet
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 tags:
   - treasures
   - delegated-wallet
@@ -24,10 +23,8 @@ tags:
 
 # Treasures Wallet
 
-Drive a Treasures **delegated** wallet over HTTP. The wallet is **non-custodial** — it stays the
-user's. Treasures holds the **swap signer** as a delegated signer, **scoped strictly to trading
-tokenized real-world assets**, and executes on-chain; the agent only submits **intents** with a
-scoped API key. ⇒ No web3 libs, no keys, no RPC.
+Drive a Treasures **delegated** wallet over HTTP. Treasures custodies the swap signer and executes
+on-chain; the agent only submits **intents** with a scoped API key. ⇒ No web3 libs, no keys, no RPC.
 
 ## When to use
 
@@ -42,8 +39,7 @@ agent to hold a private key — the whole point of this design is that it doesn'
 
 ## Mental model (read this — most of it is non-obvious)
 
-- **Delegated signing, not custody. The agent never signs.** The wallet is non-custodial; the agent
-  POSTs intents and Treasures holds the **swap signer** — authorized only for tokenized-RWA trades —
+- **Delegated custody. The agent never signs.** It POSTs intents; Treasures holds the swap signer
   and executes. The skill needs only HTTPS + the API key.
 - **TWO base paths** (this is the #1 gotcha), both off the host `https://api.treasures.io`:
   - **`API = {host}/api/v1`** — wallet plane + onboarding (`/api/v1/wallets/...`, `/api/v1/onboarding-sessions/...`).
@@ -173,8 +169,9 @@ route-first at submit.
 
 ## Buy — `POST API/wallets/:id/trades`
 
-Auth `X-API-Key` (scope `trade`). **Headers:** `Idempotency-Key: <uuid>` (**required** — 400 if
-missing), `Content-Type: application/json`. Body (`.strict()`):
+Auth `X-API-Key` (scope `trade`). **Headers:** `Idempotency-Key: <uuid>` (**required** — 400
+`missing_idempotency_key` if absent; base64url/UUID charset `[A-Za-z0-9_-]`, ≤ 128 chars → 400
+`invalid_idempotency_key` otherwise), `Content-Type: application/json`. Body (`.strict()`):
 
 ```json
 { "chain":"solana", "protocol":"ondo", "side":"buy",
@@ -185,11 +182,11 @@ missing), `Content-Type: application/json`. Body (`.strict()`):
 (**same `X-API-Key`, scope `trade`** — the poll is gated like the create). State machine:
 `routing → simulating → signing → broadcast → {confirmed | failed | rejected}`.
 - `confirmed` → `result = { amount_in, amount_out, tx_sig }` (atomic in/out). **EVM:** the `tx_sig`
-  shown at `broadcast` is the Fusion **orderHash**; `result.tx_sig` at `confirmed` is the real
+  shown at `broadcast` is the **order hash**; `result.tx_sig` at `confirmed` is the real
   **on-chain fill** hash.
 - `failed` / `rejected` → **no funds moved**; `reject_reason` says why.
 
-**Timing:** Solana confirms in **~2 s**; **EVM Fusion is ~20–40 s** (resolver-settled). Bound the poll
+**Timing:** Solana confirms in **~2 s**; **EVM is ~20–40 s** (resolver-settled). Bound the poll
 (~2 min) and treat a long-wedged `broadcast` as **unknown, not confirmed** — see Behaviors.
 
 **Buys route the FULL notional to ONE cell — do NOT split a buy.** This mirrors B2B `planBuy`, which
@@ -270,15 +267,8 @@ greedy algorithm:
 5. **Big-decimals + decimals.** Quote/job amounts are atomic; convert with the asset's decimals (USDC 6;
    reads expose `shares` vs `raw_token`). Never use floats.
 6. **Gas / funding:** Solana needs SOL (fees + one-time Token-2022 ATA rent per new asset); the first
-   Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the Fusion fill is
+   Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the fill itself is
    gasless). Surface `needs_funding` from `/balances`.
-7. **Version gate — never trade on a stale skill.** `tFetch` sends the skill version headers and calls
-   `surfaceDeprecation`, which only **logs** the deprecation headers — you must relay them to the user.
-   React to the server's signals: `Deprecation`/`Sunset`/`Warning` → **non-blocking** (finish, then tell
-   the user to update via the `Link` URL + `Sunset` date); `426 skill_version_unsupported` → **blocking**
-   (do **not** trade or retry — surface the response's `upgrade` command and stop); a versioned-path
-   `Sunset`, an unexpected `410`/`404`, or a new `400 invalid_request` on a previously valid call →
-   possible staleness (stop and check for a skill update, don't blindly retry).
 
 ## Reusable helpers (TypeScript; adapt to your runtime — `big.js` for decimals)
 
@@ -289,26 +279,11 @@ const USDC_DECIMALS = 6;
 // `host` defaults to the Treasures API; override via TREASURES_HOST if set.
 const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
-const SKILL = 'treasures-wallet';
-const SKILL_VERSION = '1.0.0'; // keep in sync with SKILL.md metadata.version — the server gates on it
-
-// Non-blocking: the server flags an aging skill via response headers on a normal 2xx (the 426
-// hard-stop is thrown below). Override to route to the user — the agent MUST relay it (Behaviors #7).
-function surfaceDeprecation(h: Headers): void {
-  const sunset = h.get('Sunset'), warning = h.get('Warning');
-  if (!h.get('Deprecation') && !sunset && !warning) return;
-  console.warn(`[${SKILL}] deprecated — sunset ${sunset ?? '?'}; update: ${h.get('Link') ?? 'see SKILL.md'}${warning ? ` — ${warning}` : ''}`);
-}
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
-  const res = await fetch(url, {
-    ...init,
-    // Identify the skill version on every call so the API can gate stale skills (426).
-    headers: { 'X-Treasures-Skill': SKILL, 'X-Treasures-Skill-Version': SKILL_VERSION, ...init.headers },
-  });
+  const res = await fetch(url, init);
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw { status: res.status, ...body };  // {status, error, cap?, reason?}; 426 = skill too old → STOP, relay body.upgrade (Behaviors #7)
-  surfaceDeprecation(res.headers);  // non-blocking: aging skill → warn + relay, then continue
+  if (!res.ok) throw { status: res.status, ...body };   // {status, error, cap?, reason?}
   return body;
 }
 const apiGet = (path: string, q: Record<string, string|number> = {}) =>
@@ -394,14 +369,13 @@ async function sellGreedy(asset: string, targetShares: string, slippageBps: numb
 
 | HTTP | body | action |
 |---|---|---|
-| 400 | `invalid_request_body` / `missing_idempotency_key` | malformed — fix, don't retry |
+| 400 | `invalid_request_body` / `missing_idempotency_key` / `invalid_idempotency_key` | malformed — fix, don't retry |
 | 401 | `invalid_api_key` / `invalid_session` | missing/bad key (or onboarding secret) |
 | 403 | `{error:"key_cap_exceeded", cap, reason}` | cap breach — surface, don't retry. Also `policy_denied` = delegation off |
 | 404 | `wallet_not_found` / `job_not_found` / `session_not_found` | bad id |
 | 410 | `already_claimed` | onboarding key already claimed (single-use) |
 | 422 | `asset_not_whitelisted` | ticker not in catalog / not routable on the pinned cell |
 | 422 | `quote_unavailable` / `quote_failed` | genuine no-route, thin-liquidity no-fill, **or a sell bigger than any single cell holds** → split client-side / bounded retry |
-| 426 | `{error:"skill_version_unsupported", min_skill_version, upgrade}` | skill too old for the current API — **STOP, do not trade/retry**; relay `upgrade` (see Behaviors #7) |
 | **503** | `routing_unavailable` / `grant_check_unavailable` | **transient → retry w/ backoff (fresh key)** |
 | 202 → `failed`/`rejected` | `reject_reason` | no funds moved → retry (fresh key) for transient reasons |
 

@@ -2,7 +2,7 @@
 
 Load when quoting/submitting trades or polling status. Pre-flight traps (approvals, gas, slippage, TTLs) and the buy-one/sell-all rule are summarized in [`../SKILL.md`](../SKILL.md); this file is the schemas, signing code, and status contracts.
 
-> **`tx_hash` vs `order_hash` (defined once, applies everywhere).** Exactly one is non-null at a time. **Solana legs** and **`completed` Eth / Robinhood** legs: `tx_hash` carries the on-chain hash, `order_hash = null`. **Eth or Robinhood in-flight** (both gasless): `tx_hash = null`, the gasless EVM order hash sits on `order_hash`; once it fills, `tx_hash` flips to the settlement hash and `order_hash → null`. External `/trades` rows: both null.
+> **`tx_hash` vs `order_hash` (defined once, applies everywhere).** Exactly one is non-null at a time. **Solana legs** and **`completed` Eth / Robinhood / Base** legs: `tx_hash` carries the on-chain hash, `order_hash = null`. **Any EVM venue in-flight** (Eth, Robinhood, Base — all gasless): `tx_hash = null`, the gasless EVM order hash sits on `order_hash`; once it fills, `tx_hash` flips to the settlement hash and `order_hash → null`. External `/trades` rows: both null.
 
 <a id="first-time-approvals"></a>
 ## First-time approvals (before first Eth trade or bridge)
@@ -40,19 +40,21 @@ const approveErc20Max = (token: `0x${string}`, spender: `0x${string}`) =>
 
 Quantity responses emit both raw `tokens` and equity-exposure `shares` side-by-side (`estimated_output_*`, `*_consumed`, `filled_*`, and `tokens`/`shares` on portfolio + trades). Use `shares` for "how much equity", `tokens` for "on-chain units". The server converts; you never need to. The per-protocol multiplier (Ondo ~0.5, xStocks 0.5–10 after corporate actions) is invisible to the contract — read `share_multiplier` from `/stocks/tickers` only if you need exact-amount `approve()` instead of max-uint256.
 
-**`base_asset` + `amount_base` are on _every_ quote leg** — the base currency and its human amount (spent on a buy, received on a sell): `usdc` on sol/eth, `usdg` on Robinhood. To detect the Robinhood venue, test `base_asset === "usdg"`; **do not** treat the field's mere presence as the signal (it's present on sol/eth legs too, as `"usdc"`).
+**`base_asset` + `amount_base` are on _every_ quote leg** — the base currency and its human amount (spent on a buy, received on a sell): `usdc` on sol/eth/base, `usdg` on Robinhood. To detect the Robinhood venue, test `base_asset === "usdg"`; **do not** treat the field's mere presence as the signal (it's present on the other legs too, as `"usdc"`).
+
+> ⚠️ **`base_asset:"usdc"` does not identify a contract.** Solana, Ethereum and Base each settle in *their own* USDC — same symbol, three different mints/contracts. Always pair `base_asset` with the leg's **`chain`** before you resolve an address, size an allowance, or aggregate balances.
 
 ## `POST /quote/buy`
 
-USDC → shares. Returns up to 2 quotes (one per chain), sorted by USDC-per-share (best first).
+USDC → shares. Returns up to one quote per chain the ticker lists — sol/eth, plus robinhood (and base, where minted) — sorted best-rate-first. Mixed-currency candidates are ranked on **comparable** cost (a USDG leg is marked up by what acquiring USDG costs), never on nominal per-share parity — so an unpinned request can return a **USDG-denominated robinhood leg** when it genuinely prices best. Always read each leg's `chain` + `base_asset` before interpreting amounts.
 
 ```jsonc
 // request
 {
   "ticker": "AAPL",
   "amount_usdc": "100",                  // exactIn, string, 6 decimals max
-  "chain": "sol" | "eth" | "robinhood" | null,  // null = best of sol/eth; "robinhood" = the chain-pinned Robinhood venue (see #robinhood)
-  "protocol": "ondo" | "xstocks" | "robinhood" | null, // null = either; "robinhood" only valid with chain:"robinhood"
+  "chain": "sol" | "eth" | "robinhood" | "base" | null,  // null = auto-route across every chain the ticker lists, robinhood/base included (see #robinhood, #base); pin to force one
+  "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | null, // null = either; "robinhood" only with chain:"robinhood", "coinbase" only with chain:"base"
   "max_slippage_bps": 50,                // 10 ≤ value ≤ 5000
   "sol_wallet": "...", "eth_wallet": "0x...",   // at least one
   "ownership_proof": { /* see auth.md */ },
@@ -65,7 +67,7 @@ USDC → shares. Returns up to 2 quotes (one per chain), sorted by USDC-per-shar
   "side": "buy",
   "ticker": "AAPL",
   "expires_at": 1730000040,              // unix seconds
-  "tradfi_reference": { "price_usd": "232.45", "market_status": "open", "as_of": 1730000000 } | null,  // market_status: opaque string — don't branch on specific values
+  "tradfi_reference": { "price_usd": "232.45", "market_status": "open", "as_of": 1730000000 },  // always present on a 200; market_status: opaque string — don't branch on specific values
   "quotes": [
     {
       "quote_index": 0,                  // stable handle referenced at /trade/submit
@@ -80,8 +82,8 @@ USDC → shares. Returns up to 2 quotes (one per chain), sorted by USDC-per-shar
         "treasures_fee_bps": 30,
         "dex_swap_fee_bps": 8,
         "estimated_slippage_bps": 12,
-        "slippage_vs_tradfi_bps": 75     // signed; positive = unfavorable. KEY IS ABSENT
-                                         // (not null) when tradfi_reference is null.
+        "slippage_vs_tradfi_bps": 75     // signed; positive = unfavorable. Always present on a 200
+                                         // (a quote with no reference is refused, not returned).
       },
       "signable_payloads": [{ "type": "solana_versioned_tx", "tx_base64": "..." }]
     },
@@ -110,8 +112,9 @@ A leg's `chain` determines the variant:
 | `sol` | `solana_versioned_tx` | `tx_base64` — unsigned `VersionedTransaction` | sign with Solana key → `{ type: "solana_versioned_tx", signed_tx_base64 }` |
 | `eth` | `evm_eip712_typed_data` | `typed_data` — full EIP-712 object | sign typed data (`eth_signTypedData_v4`) → `{ type: "evm_eip712_signature", signature: "0x..." }` |
 | `robinhood` | `evm_eip712_typed_data` (one per leg, chain 4663) | `typed_data` — full EIP-712 object (gasless order) | sign typed data (`eth_signTypedData_v4`) → `{ type: "evm_eip712_signature", signature: "0x..." }` — **same as `eth`** (see [Robinhood](#robinhood)) |
+| `base` | `evm_eip712_typed_data` (one per leg, chain 8453) | `typed_data` — full EIP-712 object (gasless order) | sign typed data (`eth_signTypedData_v4`) → `{ type: "evm_eip712_signature", signature: "0x..." }` — **same as `eth`** (see [Base](#base)) |
 
-> The `eth` and `robinhood` quote payloads are **both** `evm_eip712_typed_data` — off-chain order signatures you sign but **never broadcast**. The only EVM payload you broadcast yourself is the bridge payload (`evm_eip1559_tx`, an on-chain tx — see [`bridging.md`](bridging.md)).
+> The `eth`, `robinhood` and `base` quote payloads are **all** `evm_eip712_typed_data` — off-chain order signatures you sign but **never broadcast**. The only EVM payload you broadcast yourself is the bridge payload (`evm_eip1559_tx`, an on-chain tx — see [`bridging.md`](bridging.md)). The `typed_data.domain.chainId` tells you which network the order settles on (`1` / `4663` / `8453`) — sign it as given, never rewrite it.
 
 ```ts
 // Solana: deserialize, sign in place, re-serialize.
@@ -139,12 +142,12 @@ Both output shapes drop straight into `/trade/submit` as `signed[i].signed_paylo
 
 ## `POST /quote/sell`
 
-Shares → USDC. Server reads holdings across both chains × both protocols, then greedy-fills `amount_shares` from the best-priced pools. (A chain-pinned `chain:"robinhood"` sell is separate — sized against your 4663 balance, not this cross-chain fill; see [Robinhood](#robinhood).) **Same response shape as `/quote/buy`**, with these differences:
+Shares → USDC. Server reads holdings across every chain × protocol — sol/eth from indexed holdings, robinhood/base sized live against your own on-chain balance — then greedy-fills `amount_shares` from the best-priced pools. Robinhood (and base) positions **join the unpinned fill**: a `sell all` no longer needs a `chain:"robinhood"` pin to reach a robinhood position. Mixed-currency pools are ranked on comparable USD proceeds (net of what converting USDG back costs), never nominal parity. A `chain` filter still narrows the sell to that one venue (see [Robinhood](#robinhood) / [Base](#base)). **Same response shape as `/quote/buy`**, with these differences:
 
 - request: `amount_shares` (18 decimals max) replaces `amount_usdc`.
 - each quote carries `shares_consumed` + `tokens_consumed` + `estimated_output_usdc` instead of `estimated_output_*`.
 - response adds `"totals": { "shares_total": "0.5", "usdc_total_estimated": "117.10" }`.
-- `signable_payloads` shapes are identical (sol → `solana_versioned_tx`, eth / robinhood → `evm_eip712_typed_data`).
+- `signable_payloads` shapes are identical (sol → `solana_versioned_tx`, eth / robinhood / base → `evm_eip712_typed_data`).
 - all other buy fields carry over unchanged: `quote_index`, `chain`, `protocol`, `price_usdc_per_share`, `base_asset`, `amount_base`, `cost_breakdown_bps`, `tradfi_reference`. On a sell, `amount_base` equals `estimated_output_usdc` base-denominated (USDG on robinhood).
 
 **Sell submission rule.** Sell legs are **additive** — sign + submit **every** `quote_index` returned. Subset → `400 incomplete_submit`. To sell from one chain only, re-quote with a `chain` filter.
@@ -187,10 +190,11 @@ Atomic submission of signed payloads. No `ownership_proof` — the signed payloa
 | eth | `broadcast_unknown` | submit transport failed but order may be live | `pending` | poll; upstream resolves either way |
 | eth | `broadcast_failed` | upstream 4xx reject (bad allowance/sig) | `broadcast_failed` (terminal) | re-quote after fixing root cause |
 | robinhood | `broadcast` \| `broadcast_unknown` \| `broadcast_failed` | same gasless model as `eth` — the server relayed your signed order to the 4663 settlement network | `pending` until the order fills → `completed`/`failed` | poll `/status` (server also backfills; see [Robinhood](#robinhood)) |
+| base | `broadcast` \| `broadcast_unknown` \| `broadcast_failed` | same gasless model as `eth` — the server relayed your signed order to the 8453 settlement network | `pending` until the order fills → `completed`/`failed` | poll `/status` (server also backfills; see [Base](#base)) |
 
 `/status` legs **never** carry `broadcast`, `broadcast_unknown`, or `in_progress` (the latter is an `aggregate_status` value only). Only `broadcast_failed` survives untouched as a terminal failure.
 
-- **Idempotency.** `(quote_id, quote_index)` is the dedup key, cached **24h**. Same `(quote_id, quote_index)` + same signed payload → cached prior result (200, same `tx_hash`). Different payload for an already-broadcast leg → `409 leg_already_submitted` carrying the original handle — `tx_hash` for a landed sol / completed eth or robinhood leg, or `order_hash` for an eth or robinhood leg still in-flight (read whichever is non-null). Safe to retry on network glitch.
+- **Idempotency.** `(quote_id, quote_index)` is the dedup key, cached **24h**. Same `(quote_id, quote_index)` + same signed payload → cached prior result (200, same `tx_hash`). Different payload for an already-broadcast leg → `409 leg_already_submitted` carrying the original handle — `tx_hash` for a landed sol / completed EVM leg, or `order_hash` for an EVM leg still in-flight (read whichever is non-null). Safe to retry on network glitch.
 - **`error_code` at submit** (when a leg is `failed`/`broadcast_failed`): same per-leg enum as `/status` below. `failed_legs[]` uses `internal_error` only.
 - **Atomicity.** Validation (shape, signer recovery, payload-type) is all-or-nothing pre-broadcast → any leg fails to validate, none broadcast (`400 incomplete_submit` / specific error). After validation, broadcast is best-effort per leg: legs that landed stay irreversibly on-chain even if later ones fail. Re-quote any `failed_legs[]` indices on a fresh `quote_id`.
 
@@ -205,7 +209,7 @@ Aggregate + per-leg view. Poll ≤ 1 Hz (cached 10s server-side while any leg is
   "is_cached": false,
   "legs": [{
     "quote_index": 0, "trade_id": "trd_...", "ticker": "AAPL",
-    "chain": "sol" | "eth" | "robinhood", "protocol": "ondo" | "xstocks" | "robinhood", "side": "buy" | "sell",
+    "chain": "sol" | "eth" | "robinhood" | "base", "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase", "side": "buy" | "sell",
     "tx_hash": "...", "order_hash": null,   // see tx_hash/order_hash split at top of file
     "status": "pending" | "completed" | "failed" | "broadcast_failed",
     "error_code": null,
@@ -221,7 +225,7 @@ Per-leg `error_code` (when `status` is `failed`/`broadcast_failed`):
 | --- | --- | --- |
 | `invalid_signature` | Payload malformed or doesn't recover to the quote-bound wallet | re-sign with the correct wallet |
 | `quote_expired` | Cached quote / order / blockhash no longer valid | re-quote |
-| `not_enough_balance_or_allowance` | (Eth) wallet lacks token balance or allowance to settlement | set allowance ([approvals](#first-time-approvals)) or fund, then re-quote |
+| `not_enough_balance_or_allowance` | (any EVM venue) wallet lacks token balance, or allowance to that chain's settlement contract | set the allowance **on that chain** ([approvals](#first-time-approvals)) or fund, then re-quote |
 | `provider_error` | Other provider rejection | re-quote; retry on persistent failure |
 | `status_check_exhausted` | Eth order sat > 1h unresolved (operator handoff) | re-quote |
 
@@ -241,14 +245,14 @@ Stop polling once `aggregate_status` ∈ `{completed, partial_failed, all_failed
 <a id="robinhood"></a>
 ## Robinhood Chain (`chain:"robinhood"`) — sign-only, gasless, priced in USDG
 
-An opt-in venue that trades **Robinhood Stock Tokens** on **Robinhood Chain** (chain id **4663**), priced in **USDG**. **Execution is byte-identical to the [`eth` venue](#signable-payload-shapes):** the quote returns one `evm_eip712_typed_data` order — sign it with `eth_signTypedData_v4` (the same `signEvm` helper; strip `EIP712Domain`), submit `{ type:"evm_eip712_signature", signature }`, then poll `/status` (`order_hash` while in-flight → `tx_hash` on fill; the server also backfills stuck orders). **You broadcast nothing, pay no gas, and need no 4663 RPC.** (Short version: pre-flight trap #6 in [`../SKILL.md`](../SKILL.md).)
+A venue that trades **Robinhood Stock Tokens** on **Robinhood Chain** (chain id **4663**), priced in **USDG**. **Execution is byte-identical to the [`eth` venue](#signable-payload-shapes):** the quote returns one `evm_eip712_typed_data` order — sign it with `eth_signTypedData_v4` (the same `signEvm` helper; strip `EIP712Domain`), submit `{ type:"evm_eip712_signature", signature }`, then poll `/status` (`order_hash` while in-flight → `tx_hash` on fill; the server also backfills stuck orders). **You broadcast nothing, pay no gas, and need no 4663 RPC.** (Short version: pre-flight trap #6 in [`../SKILL.md`](../SKILL.md).)
 
 Only **four things differ from `eth`** — everything else carries over unchanged:
 
 1. **Priced in USDG, not USDC.** Read `base_asset:"usdg"` + `amount_base`; the `_usdc`-named fields (`amount_usdc`, `price_usdc_per_share`, `estimated_output_usdc`, …) all carry **USDG** here. Detect the venue with `base_asset === "usdg"` — never the field's mere presence (it's on sol/eth legs too, as `"usdc"`).
-2. **Chain-pinned.** You must pass `chain:"robinhood"` explicitly — it never appears in the `chain:null` best-of-sol/eth selection. Your `eth_wallet` (the same 0x EOA) is the signer on 4663.
+2. **Auto-routed — no longer pin-only.** A `chain:null` request co-ranks robinhood against sol/eth (on comparable cost, so a USDG leg never wins on a nominal artifact), and an unpinned sell greedy-fills robinhood positions alongside the rest. Pass `chain:"robinhood"` only to force the venue. **Consequence: code written when this venue was pin-only may receive a USDG leg it never expects — branch on `base_asset`, not on whether you sent `chain`.** Your `eth_wallet` (the same 0x EOA) is the signer on 4663.
 3. **Liquid names only.** Only the marquee tickers (AAPL/TSLA/NVDA/AMD) fill; other Robinhood tokens have no settlement liquidity and return `422 no_routes` even though they list on `/stocks/tickers`. Treat `no_routes` as "not fillable right now".
-4. **No external-row reconciler — you MUST submit to get a `/trades` row.** For `sol`/`eth`, tokens acquired outside Treasures reconcile in as a synthetic `external` row; Robinhood positions do **not** (holdings read live from your 4663 balance). A Robinhood trade you never submit is **absent from `/trades`** with **no cost basis**, though `/portfolio` still shows the live balance. Submitted trades get **on-chain-observed** cost basis + P&L (realized from the fill, same fidelity as `eth`).
+4. **No external-row reconciler — you MUST submit to get a `/trades` row.** For `sol`/`eth`, tokens acquired outside Treasures reconcile in as a synthetic `external` row; Robinhood positions do **not** (holdings read live from your 4663 balance). A Robinhood trade you never submit is **absent from `/trades`** with **no cost basis**, and — until the wallet has submitted at least one 4663 trade — **absent from `/portfolio` too**, since the position read is gated on that same ledger row (no `partial` flag; nothing was read). `usdg.robinhood` cash is never gated. After that first submitted trade the read is live, so a later unsubmitted balance does show. Submitted trades get **on-chain-observed** cost basis + P&L (realized from the fill, same fidelity as `eth`).
 
 **Funding is out of scope:** hold **USDG** on 4663 to buy, or **Stock Tokens** to sell — getting them onto 4663 (bridge/transfer) is out-of-band. Buy and sell are both supported; a sell trades Stock Token → USDG, sized against your on-chain 4663 balance.
 
@@ -267,6 +271,40 @@ The single quote leg (`chain`/`protocol` both `"robinhood"`):
   "expires_at": 1730000060,        // signing deadline — sign + submit before it
   "signable_payloads": [
     { "type": "evm_eip712_typed_data", "typed_data": { "domain": {}, "types": {}, "primaryType": "Order", "message": {} } }
+  ]
+}
+```
+
+<a id="base"></a>
+## Base (`chain:"base"`) — sign-only, gasless, priced in Base-native USDC
+
+A co-ranked venue that trades **Coinbase B20 tokenized equities** on **Base** (chain id **8453**), priced in **Base-native USDC**. **Execution is byte-identical to the [`eth` venue](#signable-payload-shapes):** the quote returns one `evm_eip712_typed_data` order — sign it with `eth_signTypedData_v4` (the same `signEvm` helper; strip `EIP712Domain`), submit `{ type:"evm_eip712_signature", signature }`, then poll `/status` (`order_hash` while in-flight → `tx_hash` on fill; the server also backfills stuck orders). **You broadcast no trade, pay no trade gas, and need no 8453 RPC to trade.** (Short version: pre-flight trap #7 in [`../SKILL.md`](../SKILL.md).)
+
+Five things differ from `eth` — everything else carries over unchanged:
+
+1. **`base_asset` is `"usdc"`, but not *that* USDC.** Base settles in **Base-native USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`** — a different contract from mainnet's `0xA0b8…eB48`. The `_usdc`-named fields are genuine USDC amounts, so no unit translation is needed (unlike Robinhood's USDG), but **resolve the contract from the leg's `chain`, never from `base_asset`**. Balances on the two chains are not fungible and do not aggregate.
+2. **Joins `chain:null` selection once minted + priceable.** Like robinhood, a base cell is co-ranked in the unpinned selection — but only for tickers with minted supply (point 3), and a listing that can't be priced drops out silently, so unpinned base legs are rare in practice today. Pass `chain:"base"` to force the venue. Your `eth_wallet` (the same 0x EOA) is the signer on 8453. A `protocol` pin is optional, but the only valid value is `"coinbase"`; any other → `422 no_routes`.
+3. **Supply-gated listings — trust `/stocks/tickers`, not a hardcoded list.** Coinbase deployed its B20 contracts **unminted**, and Treasures hides a cell until real supply exists. Until a ticker is minted it is absent from `available_chains`, its `coinbase` listing block carries `address: null`, and it contributes no price — a buy returns `422 no_routes`. The set grows as Coinbase mints, so **discover it per-ticker at runtime**. (Sells are never supply-gated: an existing holder can always exit.)
+4. **One-time allowance on 8453 — and a small ETH float to send it.** The order is filled by a settlement contract that pulls your input token, so the wallet needs an ERC-20 allowance **on Base**: USDC to buy, the B20 token to sell. The spender is `0x111111125421ca6dc452d289314280a0f8842a65` — textually the same address as Ethereum's, but **an Ethereum approval grants nothing on Base**; allowances are per-chain. Sending that `approve()` is an ordinary Base transaction, so keep a **small ETH float on 8453** (Base runs sub-gwei — a few dollars covers many approvals). Skipping it surfaces as `not_enough_balance_or_allowance`. The trade itself remains gasless.
+5. **On `/portfolio`, but position-gated — and no reconciler, so you MUST submit to get a `/trades` row.** `/portfolio` reports B20 positions (`chain:"base"`, `protocol:"coinbase"`) and your Base USDC cash under **`usdc.base`** — Base-native USDC, a *different contract* from mainnet USDC. One catch: positions are read only for a wallet we already hold a Base ledger row for, so tokens transferred in directly, or a trade you never submitted, are absent with **no** `partial` flag. Cash is never gated. Native ETH on 8453 is not reported — read that from your own RPC. A Base trade you never submit is absent from `/trades` and `/settlements` with no cost basis. Submitted trades do get on-chain-observed cost basis + P&L and appear in both.
+
+**Funding is out of scope:** hold **USDC on Base** to buy, or **B20 tokens** to sell. `/bridge/*` moves USDC between **Solana and Ethereum only** — it cannot reach 8453, so getting funds onto Base is out-of-band. Buy and sell are both supported; a sell trades B20 → USDC, sized against your on-chain 8453 balance.
+
+The single quote leg (`chain:"base"`, `protocol:"coinbase"`):
+
+```jsonc
+{
+  "quote_index": 0,
+  "chain": "base",
+  "protocol": "coinbase",
+  "base_asset": "usdc",            // Base-native USDC — resolve the contract from `chain`, not this
+  "amount_base": "100",            // USDC spent on 8453
+  "price_usdc_per_share": "325.98",
+  "estimated_output_shares": "0.3067", "estimated_output_tokens": "0.3067",
+  "cost_breakdown_bps": { "treasures_fee_bps": 10, "dex_swap_fee_bps": 30, "estimated_slippage_bps": 45 },
+  "expires_at": 1730000060,        // signing deadline — sign + submit before it
+  "signable_payloads": [
+    { "type": "evm_eip712_typed_data", "typed_data": { "domain": { "chainId": 8453 }, "types": {}, "primaryType": "Order", "message": {} } }
   ]
 }
 ```

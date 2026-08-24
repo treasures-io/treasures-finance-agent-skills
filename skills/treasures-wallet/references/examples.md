@@ -1,6 +1,6 @@
 # Validated examples
 
-Real calls against the current `/api/v1` + `/public/v1` paths (mainnet, this session). Replace `$KEY`
+Real calls against the current `/api` + `/public/v1` paths (mainnet, this session). Replace `$KEY`
 (`twk_…`, keep secret) and `$WID` (`wlt_…`). `HOST` is `https://api.treasures.io`;
 `API=$HOST/api/v1`, `READS=$HOST/public/v1`.
 
@@ -9,10 +9,6 @@ HOST=${HOST:-https://api.treasures.io}
 KEY=twk_…; WID=wlt_XD825…; API=$HOST/api/v1; READS=$HOST/public/v1
 SOL=3HW73Fk…; ETH=0xaF51…   # from GET $API/wallets/$WID → addresses
 ```
-
-> **Version gate:** these `curl` examples omit the `X-Treasures-Skill` / `X-Treasures-Skill-Version`
-> headers for brevity, so they run **ungated** (the gate is opt-in). Production calls send them on every
-> request — the `tFetch` helper in `SKILL.md` does this automatically (see Behaviors #7).
 
 ## Resolve addresses + balances (no key)
 ```bash
@@ -60,7 +56,7 @@ for cell in "solana ondo 0.0956" "ethereum xstocks 0.0444"; do
     -d "{\"chain\":\"$1\",\"protocol\":\"$2\",\"side\":\"sell\",\"asset\":\"NVDA\",\"size\":{\"shares\":\"$3\"},\"slippage_bps\":100}"
   # poll each job_id to confirmed before the next leg
 done
-# Result this session: 0.14 sold for ~$28.86 (sol ~2s, eth Fusion ~27s), 2 internal rows written.
+# Result this session: 0.14 sold for ~$28.86 (sol ~2s, eth ~27s), 2 internal rows written.
 ```
 
 ## Reads (no key)

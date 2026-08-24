@@ -2,6 +2,8 @@
 
 Load when moving USDC between Solana and Ethereum. Treasures fronts an intent-based bridge: it issues the quote and a privacy-safe status proxy; **the agent signs and broadcasts the bridge tx themselves.** Both wallets + both signatures are mandatory on the quote (a bridge spans both chains).
 
+> **Solana ↔ Ethereum only.** `from_chain`/`to_chain` accept `sol` and `eth` — the chain-pinned venues are not reachable here. Funding **Robinhood Chain** (USDG on 4663) or **Base** (USDC on 8453) is out-of-band; use your own transfer or bridge, then trade with `chain:"robinhood"` / `chain:"base"`.
+
 ## `POST /bridge/quote`
 
 ```jsonc
