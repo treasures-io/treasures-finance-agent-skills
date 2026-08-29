@@ -128,7 +128,7 @@ Any leg may carry three optional advisory fields describing **that leg's own ven
 
 - **Absent ≠ null.** All three keys are omitted, never sent as `null`. An absent `tradability` means the venue is **unmeasured or unwarned** — never "healthy, value null". `warn_reason` can also be absent beside a *present* `tradability`: that warning predates the reason field, so read it as "reason not recorded", never "no reason".
 - **Sell legs publish side-neutral reasons only.** `/quote/sell` legs carry the same three fields, but only when the reason is `low_volume` or `no_price_feed`. A venue warned for `no_fill_window` or `settlement_failure` — both buy-sided — emits **nothing at all** on a sell, and so does a warning whose reason was never recorded. Nothing here ever marks a holding unsellable.
-- **The value is not stable over a venue's lifetime.** A `low_volume` warning flips to `settlement_failure` once a real order dies there. Re-read it per quote; don't cache it.
+- **The value is not stable over a venue's lifetime.** A `low_volume` warning flips to `settlement_failure` once a real order dies there. Take it from the leg you are about to submit — that copy is always current, so no pre-quote `/stocks/tickers` read is needed.
 - Same fields, venue-by-venue and per ticker before you quote: [`data.md`](data.md#tradability-warnings). A whole-quote refusal is a different tier — see `422 no_routes` in [`errors.md`](errors.md).
 
 ### Signable payload shapes
@@ -173,7 +173,6 @@ Both output shapes drop straight into `/trade/submit` as `signed[i].signed_paylo
 Shares → USDC. Server reads holdings across every chain × protocol — sol/eth from indexed holdings, robinhood/base sized live against your own on-chain balance — then greedy-fills `amount_shares` from the best-priced pools. Robinhood (and base) positions **join the unpinned fill**: a `sell all` no longer needs a `chain:"robinhood"` pin to reach a robinhood position. Mixed-currency pools are ranked on comparable USD proceeds (net of what converting USDG back costs), never nominal parity. A pinned `chain` still narrows the sell to **that one venue**; an array narrows it to **those venues** (see [Robinhood](#robinhood) / [Base](#base)). **Same response shape as `/quote/buy`**, with these differences:
 
 - request: `amount_shares` (18 decimals max) replaces `amount_usdc`.
-- `chain` accepts the same one-chain / array / null shapes as `/quote/buy`.
 - each quote carries `shares_consumed` + `tokens_consumed` + `estimated_output_usdc` instead of `estimated_output_*`.
 - response adds `"totals": { "shares_total": "0.5", "usdc_total_estimated": "117.10" }`.
 - `signable_payloads` shapes are identical (sol → `solana_versioned_tx`, eth / robinhood / base → `evm_eip712_typed_data`).

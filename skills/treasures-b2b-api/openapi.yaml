@@ -799,12 +799,13 @@ components:
       description: >
         The subset of `WarnReason` that bears on an exit as much as an entry, and the only values a
         sell surface publishes. The buy-sided reasons (`no_fill_window`, `settlement_failure`) are
-        measured against buys, so a sell leg carrying one would warn about someone else's trade; a
-        cell warned only for those publishes nothing here.
+        measured against buys, so a sell leg carrying one would warn about someone else's trade. A
+        cell warned only for those — or warned before reasons were recorded — publishes nothing
+        here, and the whole trio is withheld with it.
     ThinSince:
       type: string
       format: date-time
-      description: When the warning above was first raised. Present exactly when `tradability` is.
+      description: When this cell's warning was first raised. Present exactly when its `tradability` is.
     # ------------ Primitives ----------------------------------------------
     SolAddress:
       type: string
@@ -842,6 +843,21 @@ components:
     Chain:
       type: string
       enum: [sol, eth, robinhood, base]
+
+    ChainSelector:
+      oneOf:
+        - { $ref: "#/components/schemas/Chain" }
+        - type: array
+          items: { $ref: "#/components/schemas/Chain" }
+          minItems: 1
+          uniqueItems: true
+        - { type: "null" }
+      description: >-
+        Routing scope for a quote. One chain pins routing to it. An array auto-routes within
+        those chains only — one leg per member at most, `["x"]` is identical to `"x"`, a member
+        the ticker has no cell on is dropped, and an empty intersection is `422 no_routes`.
+        null/omitted = every chain the ticker lists. Bounded by the `Chain` enum plus
+        `uniqueItems`, so it needs no separate maximum.
 
     Protocol:
       type: string
@@ -953,8 +969,9 @@ components:
             slippage-tunable: resubmit when the session reopens. Sessions are
             per-listing, and some listings close **per chain** rather than as a
             whole — so a `chain`-pinned request can be refused while another chain
-            still serves the ticker. Retry unpinned, or on another chain from
-            `available_chains`, before waiting out the session.
+            still serves the ticker. Retry unpinned, on another chain from
+            `available_chains`, or with a `chain` array naming the chains that are
+            open, before waiting out the session.
 
             `reference_unavailable` is distinct: no reference market price could
             be obtained for the asset at all, so the cap above could not be
@@ -1023,27 +1040,23 @@ components:
         sol_tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
-            Per-cell probe warning for this protocol on Solana. `thin` — the cell fills, but not at
-            every size below `sol_min_trade_size_usd`. `untradable` — nothing filled at any size
-            across a full measurement window, and no minimum accompanies it. **Neither value
-            disables the cell**; quotes are still accepted for both. Absent means unmeasured or
-            unwarned — never healthy-with-value-null. Chain-suffixed because this block spans a
-            Solana and an Ethereum cell.
+            Per-cell probe warning for this protocol on Solana; `thin` measures against
+            `sol_min_trade_size_usd`. **Advisory, never a gate** — see `Tradability`.
+            Chain-suffixed because this block spans a Solana and an Ethereum cell.
         sol_warn_reason:
           $ref: '#/components/schemas/WarnReason'
-          description: >
-            Why the Solana cell is warned, strongest evidence first. Absent when unwarned, or when
-            the warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
-            warn that later kills a real order flips to `settlement_failure`.
+          description: Why the Solana cell is warned.
         sol_thin_since:
           $ref: '#/components/schemas/ThinSince'
           description: When the Solana warning was first raised. Present exactly when `sol_tradability` is.
         eth_tradability:
           $ref: '#/components/schemas/Tradability'
-          description: Per-cell probe warning for this protocol on Ethereum. See `sol_tradability`.
+          description: >
+            Per-cell probe warning for this protocol on Ethereum; `thin` measures against
+            `eth_min_trade_size_usd`. **Advisory, never a gate.** See `sol_tradability`.
         eth_warn_reason:
           $ref: '#/components/schemas/WarnReason'
-          description: Why the Ethereum cell is warned, strongest evidence first. See `sol_warn_reason`.
+          description: Why the Ethereum cell is warned.
         eth_thin_since:
           $ref: '#/components/schemas/ThinSince'
           description: When the Ethereum warning was first raised. Present exactly when `eth_tradability` is.
@@ -1068,18 +1081,11 @@ components:
         tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
-            Probe warning for this single-cell venue. `thin` — the cell fills, but not at every
-            size below `min_trade_size_usd`. `untradable` — nothing filled at any size across a
-            full measurement window, and no minimum accompanies it. **Neither value disables the
-            cell**; quotes are still accepted for both. Absent means unmeasured or unwarned —
-            never healthy-with-value-null. Bare rather than chain-suffixed: this block names
-            exactly one cell.
+            Probe warning for this single-cell venue; `thin` measures against
+            `min_trade_size_usd`. **Advisory, never a gate** — see `Tradability`. Bare rather
+            than chain-suffixed: this block names exactly one cell.
         warn_reason:
           $ref: '#/components/schemas/WarnReason'
-          description: >
-            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the
-            warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
-            warn that later kills a real order flips to `settlement_failure`.
         thin_since:
           $ref: '#/components/schemas/ThinSince'
         token_ticker:
@@ -1205,35 +1211,21 @@ components:
           $ref: '#/components/schemas/Tradability'
           description: |
             Ticker-level roll-up of the per-cell warnings below. Present only when
-            **every** measured cell for this ticker is warned — not when any one is.
-            A ticker with one healthy measured cell is healthy somewhere and carries
-            nothing, so a single dead venue can never label a live listing.
-
-            The word follows the cheapest floor, exactly as it does per cell. `thin`
-            — every measured cell is warned and `min_trade_size_usd` is published
-            alongside. `untradable` — every measured cell is warned and none filled
-            at any size, so no minimum accompanies it. Cells the probe has not
-            measured are not counted either way, so `untradable` is a statement about
+            **every measured cell** is warned — one healthy measured cell and the
+            ticker carries nothing, so a single dead venue can never label a live
+            listing. Unmeasured cells count neither way, so `untradable` describes
             the measured surface, not proof that no venue can fill.
 
-            **Neither value means the listing is disabled.** Quotes are still
-            accepted for both; this is guidance to show a user before they try,
-            not a gate.
+            The word follows the cheapest floor, exactly as it does per cell: `thin`
+            publishes `min_trade_size_usd` alongside, `untradable` publishes none.
+            **Neither value disables the listing** — quotes are still accepted for both.
         warn_reason:
           $ref: '#/components/schemas/WarnReason'
           description: |
-            Why the ticker is warned, strongest evidence first: a real order that
-            terminally expired, then the venue stating it holds no price for the
-            pair, then a full window of quiet auctions with no fill, then a
-            low-volume proxy.
-
-            Present only alongside `tradability`; absent when the warn predates
-            reason recording — that is "reason not recorded", never "no reason".
-            Rolled up as the **strongest** reason across the warned cells, not the
-            cheapest cell's, and not stable over a listing's lifetime: the value
-            changes when stronger evidence arrives. Read the per-cell
-            `sol_warn_reason` / `eth_warn_reason` / `warn_reason` on the venue
-            blocks below before committing to a cell.
+            Present only alongside `tradability`, and rolled up as the **strongest**
+            reason across the warned cells — not the cheapest cell's. Read the
+            per-cell `sol_warn_reason` / `eth_warn_reason` / `warn_reason` on the
+            venue blocks below before committing to a cell.
 
             There is no ticker-level `thin_since` — one stamp cannot date several
             cells' warnings; take it per cell.
@@ -1267,18 +1259,11 @@ components:
         tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
-            Probe warning for this single-cell venue. `thin` — the cell fills, but not at every
-            size below `min_trade_size_usd`. `untradable` — nothing filled at any size across a
-            full measurement window, and no minimum accompanies it. **Neither value disables the
-            cell**; quotes are still accepted for both. Absent means unmeasured or unwarned —
-            never healthy-with-value-null. Bare rather than chain-suffixed: this block names
-            exactly one cell.
+            Probe warning for this single-cell venue; `thin` measures against
+            `min_trade_size_usd`. **Advisory, never a gate** — see `Tradability`. Bare rather
+            than chain-suffixed: this block names exactly one cell.
         warn_reason:
           $ref: '#/components/schemas/WarnReason'
-          description: >
-            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the
-            warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
-            warn that later kills a real order flips to `settlement_failure`.
         thin_since:
           $ref: '#/components/schemas/ThinSince'
         token_ticker:
@@ -1457,17 +1442,10 @@ components:
           $ref: '#/components/schemas/Tradability'
           description: >
             Probe warning for **this leg's own cell** — an exact `(ticker, protocol, chain)` match,
-            not a ticker roll-up. `thin` — the cell fills, but not at every size below its measured
-            minimum. `untradable` — nothing filled at any size across a full measurement window.
-            **Advisory, never a block**: the leg is still planned, priced and submittable, and there
-            is no request param to exclude warned cells. Absent means unmeasured or unwarned — never
-            healthy-with-value-null.
+            not a ticker roll-up. The leg is still planned, priced and submittable, and there is no
+            request param to exclude warned cells.
         warn_reason:
           $ref: '#/components/schemas/WarnReason'
-          description: >
-            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the warn
-            predates reason recording. Not stable over a cell's lifetime — a `low_volume` warn that
-            later kills a real order flips to `settlement_failure`.
         thin_since:
           $ref: '#/components/schemas/ThinSince'
 
@@ -1511,20 +1489,12 @@ components:
         tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
-            Probe warning for **this leg's own cell**, filtered to the sell side. Same two words as
-            on a buy leg, but published only when `warn_reason` is side-neutral (see below), so a
-            sell leg carries all three keys or none. **Advisory, never a block** — nothing here
-            refuses an exit. No `min_trade_size_usd` accompanies a sell anywhere on the API: it is a
-            USD buy floor while a sell is denominated in shares.
+            Probe warning for **this leg's own cell**, filtered to the sell side — a sell leg
+            carries all three keys or none. **Advisory, never a block**: nothing here refuses an
+            exit. No `min_trade_size_usd` accompanies a sell anywhere on the API: it is a USD buy
+            floor while a sell is denominated in shares.
         warn_reason:
           $ref: '#/components/schemas/SideNeutralWarnReason'
-          description: >
-            Why the cell is warned. **Sell legs carry only the two side-neutral reasons**:
-            `low_volume` (a thin pool is a bad exit as surely as a bad entry) and `no_price_feed`
-            (no feed is no feed, either direction). The two buy-sided reasons — `no_fill_window`
-            (the measurement ladder quotes buys) and `settlement_failure` (recorded on buys only) —
-            say nothing about an exit and are suppressed along with the whole trio, as is a warn
-            whose reason was never recorded.
         thin_since:
           $ref: '#/components/schemas/ThinSince'
 
@@ -1534,20 +1504,7 @@ components:
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         amount_usdc: { $ref: "#/components/schemas/UsdcHumanAmount" }
-        chain:
-          oneOf:
-            - { $ref: "#/components/schemas/Chain" }
-            - type: array
-              items: { $ref: "#/components/schemas/Chain" }
-              minItems: 1
-              maxItems: 4
-              uniqueItems: true
-            - { type: "null" }
-          description: >-
-            One chain pins routing to it. An array (1–4, unique) auto-routes within those
-            chains only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
-            is dropped, and an empty intersection is 422 no_routes. null/omitted = every
-            chain the ticker lists.
+        chain: { $ref: "#/components/schemas/ChainSelector" }
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
@@ -1577,20 +1534,7 @@ components:
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         amount_shares: { $ref: "#/components/schemas/SharesHumanAmount" }
-        chain:
-          oneOf:
-            - { $ref: "#/components/schemas/Chain" }
-            - type: array
-              items: { $ref: "#/components/schemas/Chain" }
-              minItems: 1
-              maxItems: 4
-              uniqueItems: true
-            - { type: "null" }
-          description: >-
-            One chain pins routing to it. An array (1–4, unique) auto-routes within those
-            chains only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
-            is dropped, and an empty intersection is 422 no_routes. null/omitted = every
-            chain the ticker lists.
+        chain: { $ref: "#/components/schemas/ChainSelector" }
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
@@ -1996,18 +1940,11 @@ components:
           $ref: '#/components/schemas/Tradability'
           description: >-
             Probe warning for the exact `(ticker, protocol, chain)` cell this position names,
-            filtered to the sell side. Published only when `warn_reason` is side-neutral (see
-            below), so a position carries all three keys or none. **Advisory, never a block** —
-            it never marks a holding unsellable. `min_trade_size_usd` is never published on a
-            position: it is a USD buy floor while a sell is denominated in shares. Absent means
-            unmeasured, unwarned, or buy-sided — never healthy-with-value-null.
+            filtered to the sell side — a position carries all three keys or none, and it never
+            marks a holding unsellable. Absent also covers a buy-sided warn, not just an unwarned
+            cell.
         warn_reason:
           $ref: '#/components/schemas/SideNeutralWarnReason'
-          description: >-
-            Why the held cell is warned. **Positions carry only the two side-neutral reasons**:
-            `low_volume` and `no_price_feed`. The buy-sided reasons (`no_fill_window`,
-            `settlement_failure`) say nothing about an exit and suppress the whole trio, as does
-            a warn whose reason was never recorded.
         thin_since:
           $ref: '#/components/schemas/ThinSince'
 
