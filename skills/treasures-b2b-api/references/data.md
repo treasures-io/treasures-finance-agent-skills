@@ -24,6 +24,32 @@ A listing block with all its fields `null` means that protocol/venue doesn't lis
 
 **This endpoint is the authority on where a ticker trades — especially for `base`.** The Coinbase B20 contracts were deployed unminted, and Treasures hides a cell until real supply exists: an unminted ticker shows `coinbase.address: null`, omits `base` from `available_chains`, and returns `422 no_routes` if you quote it anyway. The listed set therefore **grows over time** as Coinbase mints. Re-read this endpoint (5-min cache) instead of hardcoding a venue list.
 
+<a id="tradability-warnings"></a>
+### Tradability warnings
+
+A background probe quotes a ladder of buy sizes against every listed venue — and watches whether real orders settle — then publishes what it found. Its verdicts ride `/stocks/tickers` (and the `/stocks` list, same fields) at **two grains at once** — per venue cell inside the listing blocks, and per ticker at the top level of the item:
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `min_trade_size_usd` | integer USD | The smallest size measured to actually fill. Advisory: a smaller order is still accepted and still sent to the venue. |
+| `tradability` | `"thin"` \| `"untradable"` | `thin` = fills, but not at every size. `untradable` = a full measurement window passed with no fill at any size. **Neither is a block** — both are still quotable and submittable. |
+| `warn_reason` | `"settlement_failure"` \| `"no_price_feed"` \| `"no_fill_window"` \| `"low_volume"` | Why the warning was raised. Per-reason action table: [`trading.md`](trading.md#tradability). |
+| `thin_since` | ISO-8601 string | When the warning was first raised. Cell grain only, and present exactly when that cell's `tradability` is. |
+
+Which keys appear where:
+
+| Grain | Where | Keys |
+| --- | --- | --- |
+| cell | `ondo`, `xstocks` blocks — each spans **two** cells (sol + eth) | chain-suffixed: `sol_min_trade_size_usd`, `sol_tradability`, `sol_warn_reason`, `sol_thin_since`, and the four `eth_*` twins |
+| cell | `robinhood`, `coinbase` blocks — one cell each | bare: `min_trade_size_usd`, `tradability`, `warn_reason`, `thin_since` |
+| ticker | top level of the item, beside `ticker`/`name` | `min_trade_size_usd`, `tradability`, `warn_reason` — **no `thin_since`** (one stamp cannot date several cells' warnings) |
+
+- **The ticker-level roll-up is deliberately asymmetric.** `min_trade_size_usd` is the **cheapest floor across cells** (a buy routes to whichever cell can serve it), and the word follows that floor — `thin` beside a floor, `untradable` without one. `tradability` is emitted only when **every measured cell is warned**, never when just one is: a ticker with one unwarned cell is healthy somewhere, and labelling the whole ticker would hide a live listing. `warn_reason` at this grain is the **strongest** reason across the warned cells, not the cheapest cell's. So read the per-cell keys, not the ticker keys, to decide which venue to trade.
+- **Absent ≠ null, everywhere these fields appear.** They are omitted rather than sent as `null`. An absent `min_trade_size_usd` means no minimum is known (fall back to $3), never that there is none — and an absent `tradability` means unmeasured or unwarned, never "healthy". `warn_reason` can be absent beside a *present* `tradability` too: that warning predates the reason field, so read it as "reason not recorded", never "no reason".
+- **`available_chains` is untouched by any of this.** It answers "where does this token exist", so a warned venue still appears there — and a holder's chain never vanishes from a sell flow.
+- **Not stable over a cell's lifetime.** A `low_volume` warning flips to `settlement_failure` once a real order dies on that cell. Re-read (5-min cache) rather than caching the value yourself.
+- The same three warning fields ride **every quote leg** ([`trading.md`](trading.md#tradability)) and **portfolio positions** (below).
+
 ## `GET /stocks/prices?tickers=AAPL,TSLA,MSFT`
 
 Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. Server enforces `/^[A-Z0-9.-]{1,10}$/i` per item, uppercased server-side.
@@ -78,6 +104,8 @@ Live reconciled USDC + tokenized-stock holdings for a wallet pair. Cached 30s pe
 **`partial` — the row list itself may be short.** The nullable columns below cover a cell we *read* but couldn't *price*. `partial` covers the other case: a cell we couldn't read at all (an RPC blip on the sol/eth side, or on either single-cell venue — Robinhood Chain 4663 or Base 8453). Such a cell is **dropped** from `positions` rather than reported as a zero — an unreliable balance must never look like a real one — so on `partial: true` the list omits holdings the wallet may have and **any total you sum from `usd_value` undercounts**. It is otherwise a normal `200`: retry rather than treat it as authoritative, and don't overwrite a good cached view with a partial one. `partial` can be `true` with `is_cached: true` (the 30s snapshot captured the failure); a retry inside that window returns the same partial answer, so back off past it. Cash is **not** covered — `usdc`/`usdg` independently fall back to `"0"` on a failed read, which is why you should never treat their `"0"` as proof of an empty balance either.
 
 `shares`, `usd_per_token`, `usd_per_share`, `usd_value` are each independently nullable — a position with a price-feed outage still surfaces with `tokens` populated so you can hold the row and re-render USD next poll. **Default any null to "unknown", never "0".** Tokens acquired outside Treasures reconcile in on the next read and emit a synthetic `external` row in `/trades`. **Exception — neither single-cell venue has an external-row reconciler:** you must **submit** each Robinhood-chain and Base trade via `/trade/submit` for it to appear in `/trades` at all — it enters as `broadcast` and reaches `completed` via the same status poll / backfill as `eth` (see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base)). An **unsubmitted** trade on either venue never appears in `/trades` and carries no cost basis; whether its balance shows on `/portfolio` is governed by the per-venue position gate below.
+
+**Positions can carry a tradability warning.** A position may include `tradability`, `warn_reason` and `thin_since` for its own `(ticker, protocol, chain)` cell — but only when the reason is **side-neutral** (`low_volume` or `no_price_feed`), since those two bear on an exit as much as on an entry. A cell warned for a buy-sided reason (`no_fill_window`, `settlement_failure`), or one whose reason was never recorded, emits **nothing** here. `min_trade_size_usd` is never published on a position: it is a USD **buy** floor and this is an exit surface. Advisory as everywhere else — it never marks a holding unsellable. Field meanings: [Tradability warnings](#tradability-warnings).
 
 The three `source=internal` columns are derived from **completed internal trades only** (see [Internal-only P&L](#internal-only-pl) below). Caveat: because off-platform transfers are ignored by the basis, `shares_internal_only` can exceed the on-chain balance after you move tokens out — treat it as "shares bought via Treasures and not yet sold via Treasures", not a custody figure.
 

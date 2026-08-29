@@ -46,14 +46,14 @@ Quantity responses emit both raw `tokens` and equity-exposure `shares` side-by-s
 
 ## `POST /quote/buy`
 
-USDC → shares. Returns up to one quote per chain the ticker lists — sol/eth, plus robinhood (and base, where minted) — sorted best-rate-first. Mixed-currency candidates are ranked on **comparable** cost (a USDG leg is marked up by what acquiring USDG costs), never on nominal per-share parity — so an unpinned request can return a **USDG-denominated robinhood leg** when it genuinely prices best. Always read each leg's `chain` + `base_asset` before interpreting amounts.
+USDC → shares. Returns up to one quote per chain the ticker lists (or per chain in your `chain` array, when you send one) — sol/eth, plus robinhood (and base, where minted) — sorted best-rate-first. Mixed-currency candidates are ranked on **comparable** cost (a USDG leg is marked up by what acquiring USDG costs), never on nominal per-share parity — so an unpinned request can return a **USDG-denominated robinhood leg** when it genuinely prices best. Always read each leg's `chain` + `base_asset` before interpreting amounts.
 
 ```jsonc
 // request
 {
   "ticker": "AAPL",
   "amount_usdc": "100",                  // exactIn, string, 6 decimals max
-  "chain": "sol" | "eth" | "robinhood" | "base" | null,  // null = auto-route across every chain the ticker lists, robinhood/base included (see #robinhood, #base); pin to force one
+  "chain": "sol" | "eth" | "robinhood" | "base" | ["sol", "eth"] | null,  // one chain = pin; an array (1–4, unique) = auto-route within those chains only (["x"] ≡ "x"); null = every chain the ticker lists, robinhood/base included (see #robinhood, #base)
   "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | null, // null = either; "robinhood" only with chain:"robinhood", "coinbase" only with chain:"base"
   "max_slippage_bps": 50,                // 10 ≤ value ≤ 5000
   "sol_wallet": "...", "eth_wallet": "0x...",   // at least one
@@ -85,7 +85,10 @@ USDC → shares. Returns up to one quote per chain the ticker lists — sol/eth,
         "slippage_vs_tradfi_bps": 75     // signed; positive = unfavorable. Always present on a 200
                                          // (a quote with no reference is refused, not returned).
       },
-      "signable_payloads": [{ "type": "solana_versioned_tx", "tx_base64": "..." }]
+      "signable_payloads": [{ "type": "solana_versioned_tx", "tx_base64": "..." }],
+      "tradability": "thin",             // optional: probe-tier warning for this leg's venue
+      "warn_reason": "low_volume",       // optional: why — see the action table below
+      "thin_since": "2026-08-24T16:30:00.025Z"
     },
     {
       "quote_index": 1, "chain": "eth", "protocol": "xstocks",
@@ -102,6 +105,31 @@ USDC → shares. Returns up to one quote per chain the ticker lists — sol/eth,
 **Buy submission rule.** Each `quote_index` is a **mutually-exclusive alternative** — sign + submit one index only. >1 leg → `400 quote_index_mismatch`. No chain preference → just take `quotes[0]` (best rate) or re-quote with the `chain` you want.
 
 **Price preview (`quote_only: true`).** Returns prices without an executable quote — for an estimate before committing. The wallet need **not** hold the funds, but you still pass `ownership_proof`. The response **omits** `quote_id`, `expires_at`, and every leg's `signable_payloads`; nothing is persisted, so there's no `/quote/{quote_id}/status` to poll and nothing to submit. Buy-only — sending `quote_only` to `/quote/sell` is rejected (`400 invalid_request`). Omit it (or set `false`) for a normal executable quote.
+
+<a id="tradability"></a>
+### Tradability warnings on quote legs
+
+Any leg may carry three optional advisory fields describing **that leg's own venue** (its `ticker` + `protocol` + `chain`), raised by a background probe that quotes a ladder of buy sizes against every listed venue and watches whether real orders settle:
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `tradability` | `"thin"` \| `"untradable"` | `thin` = the venue fills, but not at every size. `untradable` = a full measurement window passed with no fill at any size. |
+| `warn_reason` | `"settlement_failure"` \| `"no_price_feed"` \| `"no_fill_window"` \| `"low_volume"` | Why the warning was raised — act per the table below. |
+| `thin_since` | ISO-8601 string | When the warning was first raised. Present exactly when `tradability` is. |
+
+**Advisory, never a block.** A warned leg is still planned, still priced, and still submittable — no leg is dropped, no quote is refused, and there is no request param to exclude warned venues. `untradable` means "nothing filled across a full measurement window", **not** "disabled". Decide with the reason:
+
+| `warn_reason` | What it means | What to do |
+|---|---|---|
+| `settlement_failure` | A real order on this venue recently expired without settling — quotes here can look fine and still never fill | Prefer another `quote_index` / venue; if this is the only venue, warn the user before submitting |
+| `no_price_feed` | The venue holds no price for this pair at all | Do not submit to this venue at any size; pick another venue or skip the ticker |
+| `no_fill_window` | No probe size has filled here for weeks | Treat as likely-to-fail; prefer another venue |
+| `low_volume` | Measured on-chain trading volume is below a floor | Expect poor pricing on entry AND exit; keep sizes small or prefer another venue |
+
+- **Absent ≠ null.** All three keys are omitted, never sent as `null`. An absent `tradability` means the venue is **unmeasured or unwarned** — never "healthy, value null". `warn_reason` can also be absent beside a *present* `tradability`: that warning predates the reason field, so read it as "reason not recorded", never "no reason".
+- **Sell legs publish side-neutral reasons only.** `/quote/sell` legs carry the same three fields, but only when the reason is `low_volume` or `no_price_feed`. A venue warned for `no_fill_window` or `settlement_failure` — both buy-sided — emits **nothing at all** on a sell, and so does a warning whose reason was never recorded. Nothing here ever marks a holding unsellable.
+- **The value is not stable over a venue's lifetime.** A `low_volume` warning flips to `settlement_failure` once a real order dies there. Re-read it per quote; don't cache it.
+- Same fields, venue-by-venue and per ticker before you quote: [`data.md`](data.md#tradability-warnings). A whole-quote refusal is a different tier — see `422 no_routes` in [`errors.md`](errors.md).
 
 ### Signable payload shapes
 
@@ -142,15 +170,16 @@ Both output shapes drop straight into `/trade/submit` as `signed[i].signed_paylo
 
 ## `POST /quote/sell`
 
-Shares → USDC. Server reads holdings across every chain × protocol — sol/eth from indexed holdings, robinhood/base sized live against your own on-chain balance — then greedy-fills `amount_shares` from the best-priced pools. Robinhood (and base) positions **join the unpinned fill**: a `sell all` no longer needs a `chain:"robinhood"` pin to reach a robinhood position. Mixed-currency pools are ranked on comparable USD proceeds (net of what converting USDG back costs), never nominal parity. A `chain` filter still narrows the sell to that one venue (see [Robinhood](#robinhood) / [Base](#base)). **Same response shape as `/quote/buy`**, with these differences:
+Shares → USDC. Server reads holdings across every chain × protocol — sol/eth from indexed holdings, robinhood/base sized live against your own on-chain balance — then greedy-fills `amount_shares` from the best-priced pools. Robinhood (and base) positions **join the unpinned fill**: a `sell all` no longer needs a `chain:"robinhood"` pin to reach a robinhood position. Mixed-currency pools are ranked on comparable USD proceeds (net of what converting USDG back costs), never nominal parity. A pinned `chain` still narrows the sell to **that one venue**; an array narrows it to **those venues** (see [Robinhood](#robinhood) / [Base](#base)). **Same response shape as `/quote/buy`**, with these differences:
 
 - request: `amount_shares` (18 decimals max) replaces `amount_usdc`.
+- `chain` accepts the same one-chain / array / null shapes as `/quote/buy`.
 - each quote carries `shares_consumed` + `tokens_consumed` + `estimated_output_usdc` instead of `estimated_output_*`.
 - response adds `"totals": { "shares_total": "0.5", "usdc_total_estimated": "117.10" }`.
 - `signable_payloads` shapes are identical (sol → `solana_versioned_tx`, eth / robinhood / base → `evm_eip712_typed_data`).
 - all other buy fields carry over unchanged: `quote_index`, `chain`, `protocol`, `price_usdc_per_share`, `base_asset`, `amount_base`, `cost_breakdown_bps`, `tradfi_reference`. On a sell, `amount_base` equals `estimated_output_usdc` base-denominated (USDG on robinhood).
 
-**Sell submission rule.** Sell legs are **additive** — sign + submit **every** `quote_index` returned. Subset → `400 incomplete_submit`. To sell from one chain only, re-quote with a `chain` filter.
+**Sell submission rule.** Sell legs are **additive** — sign + submit **every** `quote_index` returned. Subset → `400 incomplete_submit`. To sell from one chain only, re-quote with `chain` pinned; to sell from a subset, send an array.
 
 ## `POST /trade/submit`
 
