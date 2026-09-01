@@ -8,7 +8,7 @@ description: >
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.0.1"
+  version: "1.3.0"
 tags:
   - treasures
   - delegated-wallet
@@ -63,9 +63,10 @@ agent to hold a private key — the whole point of this design is that it doesn'
 - **Trading is async + route-first.** `POST /trades` → **202 + job**, then **poll** to terminal.
   Routing runs *before* the 202, so no-route / cap breach / unwhitelisted come back **synchronously**
   as 4xx (no job row).
-- **Auto-routing is SINGLE-CELL.** Omit `chain`/`protocol` and Treasures picks the *one* best cell by
-  net deliverable across `{solana,ethereum} × {ondo,xstocks}`. It does **not** split one trade across
-  cells. (For sells larger than any single cell holds, see the **Sell playbook** — split client-side.)
+- **Auto-routing is single-cell for a BUY, multi-leg for a SELL.** Omit `chain`/`protocol` and a buy
+  resolves to the *one* best cell by net deliverable across `{solana,ethereum} × {ondo,xstocks}` — it
+  never splits. A sell fans out across every venue the wallet holds and returns N legs in one
+  response (see the **Sell playbook**). Pinning `chain`+`protocol` narrows either side to one cell.
 
 ## Config (the agent supplies)
 
@@ -151,7 +152,7 @@ Before any quote/trade, **resolve credentials via the Credential store above** (
 | Onboard / get a key | [Onboarding](references/onboarding.md) | `POST API/onboarding-sessions` → poll |
 | Price preview | Quote | `GET API/wallets/:id/quotes` (X-API-Key, scope `quote`) |
 | Buy | Trade | `POST API/wallets/:id/trades` (X-API-Key, scope `trade`) → poll |
-| Sell (esp. > one cell) | **Sell playbook** (below) | `GET API/wallets/:id/balances` → quote-rank → trade per cell |
+| Sell (any size) | **Sell playbook** (below) | one `POST API/wallets/:id/trades` → poll every `legs[].job_id` |
 | Balances / funding | Balances | `GET API/wallets/:id/balances` (no key) |
 | Trade history / P&L | History / Portfolio | `GET READS/trades`, `GET READS/portfolio` (no key) |
 | Manage keys (owner) | [API keys](references/api-keys.md) | owner Privy session — agent key can't |
@@ -162,10 +163,17 @@ examples: [`references/examples.md`](references/examples.md).
 ## Quote — `GET API/wallets/:id/quotes`
 
 Auth `X-API-Key` (scope `quote`). Query: `chain?`,`protocol?`,`side`,`asset`,(`notional_usdc` XOR
-`shares`),`slippage_bps` (≤ 500). Omit `chain`/`protocol` to auto-route (single best cell). 200 →
-`{chain,protocol,side,asset,max_amount_in,min_amount_out,route_type}` — **atomic strings** in the
-input/output asset; `chain`+`protocol` echo the **resolved** cell. Advisory only — the trade re-quotes
-route-first at submit.
+`shares`),`slippage_bps` (≤ 500). Omit `chain`/`protocol` to auto-route (single best cell). 200 on a
+**buy** → `{chain,protocol,side,asset,max_amount_in,min_amount_out,route_type}` — **atomic strings**
+in the input/output asset; `chain`+`protocol` echo the **resolved** cell. 200 on a **sell** →
+`{side,asset,route_type,legs:[{chain,protocol,shares_consumed,max_amount_in,min_amount_out}]}` — one
+entry per cell the sell draws from. Advisory only — the trade re-quotes route-first at submit.
+
+**Check `tradability`/`warn_reason` before submitting.** A buy carries them (plus `thin_since`) at the
+top level for the resolved cell; a sell carries them on each `legs[]` entry, side-neutral reasons only.
+A cell can price normally and still be warned (`settlement_failure` = quotes fine, settles never). Absent
+means unmeasured or unwarned — never `null`. Per-reason action table in
+[`references/endpoints.md`](references/endpoints.md#tradability).
 
 ## Buy — `POST API/wallets/:id/trades`
 
@@ -178,7 +186,9 @@ Auth `X-API-Key` (scope `trade`). **Headers:** `Idempotency-Key: <uuid>` (**requ
   "asset":"NVDA", "size":{"notional_usdc":"10"}, "slippage_bps":100 }
 ```
 
-`chain`/`protocol` optional (auto-route). → **202 + job**, then poll `GET API/wallets/:id/trades/:job_id`
+`chain`/`protocol` optional (auto-route). A **buy** → **202 + one flat job** (`job_id` at the top
+level); a **sell** → **202 + `{order_status, legs[]}`** (see the sell playbook — `job_id` is per leg).
+Branch on the `side` you sent, never on inspecting the body. Then poll `GET API/wallets/:id/trades/:job_id`
 (**same `X-API-Key`, scope `trade`** — the poll is gated like the create). State machine:
 `routing → simulating → signing → broadcast → {confirmed | failed | rejected}`.
 - `confirmed` → `result = { amount_in, amount_out, tx_sig }` (atomic in/out). **EVM:** the `tx_sig`
@@ -197,31 +207,38 @@ cross-chain USDC**: it needs the full notional on the resolved chain, or it fail
 (Only if you must deploy more USDC than sits on any single chain do you split client-side into per-chain
 buys — ranked by *most shares per dollar* — but that's a deliberate cross-chain-funding case, not the default.)
 
-## Sell playbook — single-cell, or client-side greedy split
+## Sell playbook — one call, N legs
 
-A sell is **one signed swap from one cell**: it routes only to a cell that holds **enough to cover the
-full size**. A sell larger than any single cell holds returns **`422 quote_unavailable`** — the server
-does **not** split across cells (the B2B planner does; the delegated path deliberately doesn't). To
-liquidate more than one cell holds, **the agent orchestrates the split** by reproducing the server's
-greedy algorithm:
+**The server splits a sell.** `POST /trades` with `side:"sell"` plans across every venue the wallet
+holds and executes N independent jobs, returning ONE `202`:
 
-1. **Read holdings** — `GET API/wallets/:id/balances`; for the asset, collect each `{chain,issuer,shares}`
-   position (map `sol→solana`, `eth→ethereum`; `issuer` is the `protocol`).
-2. **Quote each held cell** at `min(cell.shares, remaining_target)` (pin `chain`+`protocol`).
-3. **Rank by net USDC/share descending** = `min_amount_out (USDC, 6dp) / shares`. Highest rate sells first.
-4. **Greedy-allocate** the target across the ranked cells, capped by each cell's holdings. If the total
-   held is short of target, you can't fully fill — sell what's available or abort.
-5. **Execute one single-cell `POST /trades` per leg**, **sequentially** — confirm leg N before
-   committing leg N+1, so a mid-sequence failure stops cleanly and partial fills stay observable. Use a
-   **fresh `Idempotency-Key` per leg**.
+```json
+{ "order_status": "pending",
+  "legs": [ { "job_id": "job_s0", "chain": "sol", "protocol": "ondo",     "state": "broadcast",  ... },
+            { "job_id": "job_s1", "chain": "eth", "protocol": "xstocks", "state": "confirmed", ... } ] }
+```
 
-> **Validated example** (real mainnet, this wallet): holdings sol·ondo 0.0956, eth·xstocks 0.0472,
-> eth·ondo 0.0469. Selling **0.14** ranked **sol·ondo ($205.91/sh) > eth·xstocks ($197.94) > eth·ondo
-> ($192.31)** → greedy fill = leg1 sol·ondo 0.0956 (~2 s, ~$19.88) + leg2 eth·xstocks 0.0444 (~27 s,
-> $8.98) → **0.14 sold for ~$28.86**, both `confirmed`, two `source='internal'` rows written.
+- **`job_id` lives on each leg** — `legs[i].job_id`, never at the top level. This is the one place
+  the sell shape differs from a buy, and reading a top-level `job_id` here is the most common way to
+  mis-parse a sell.
+- **Poll every leg** to terminal. Legs settle at different speeds (Solana ~2 s, EVM ~20–40 s), so
+  the order is not finished when the first one lands. Poll them concurrently, not in sequence.
+- **`order_status`** rolls the legs up: `pending` while any leg is non-terminal, else `confirmed`
+  (all legs confirmed), `failed` (none), or `partially_filled` (some). It is a snapshot taken at
+  submit — re-derive it from the polled legs rather than trusting the 202's copy.
+- **`partially_filled` is a real outcome, not an error.** A leg that cannot re-quote lands as a
+  terminal `failed` job and stays visible; nothing is hidden. Sum `result.amount_out` over the
+  confirmed legs for what you actually received.
+- **One `Idempotency-Key` for the whole order**, not one per leg — the split happens server-side of
+  that key.
 
-**Dust:** selling exact share amounts leaves tiny remainders. To fully empty a cell, sell its reported
-`shares` value (or document a small tolerance).
+**Pinning still narrows to a single venue.** Send `chain`+`protocol` and the sell routes to that one
+cell; larger than it holds → **`422 quote_unavailable`** (`holdings_insufficient`). The response
+shape does not change — still `{order_status, legs}`, with a single entry. Pin only when you want
+that specific venue: the default fans out and fills more.
+
+**Dust:** selling exact share amounts leaves tiny remainders. To fully empty a position, sell its
+reported `shares` value (or document a small tolerance).
 
 ## Reads (no key)
 
@@ -233,7 +250,9 @@ greedy algorithm:
   agent's executed trades (carry `side`/`tx_hash`/`usdc_amount`); `external` rows are on-chain transfers
   Treasures didn't execute.
 - **Portfolio (P&L)** — `GET READS/portfolio?sol_wallet=&eth_wallet=&source=` → positions + `usd_value`;
-  `source=internal` adds `shares_internal_only`, `avg_entry_price_per_share`, `unrealized_pnl`.
+  `source=internal` adds `shares_internal_only`, `avg_entry_price_per_share`, `unrealized_pnl`. A
+  position may also carry `tradability`/`warn_reason`/`thin_since` for its own cell — side-neutral
+  reasons only (`low_volume`, `no_price_feed`, `no_settlements`); it never marks a holding unsellable.
 
 ## Onboarding & API keys (summary — detail in references)
 
@@ -269,6 +288,12 @@ greedy algorithm:
 6. **Gas / funding:** Solana needs SOL (fees + one-time Token-2022 ATA rent per new asset); the first
    Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the fill itself is
    gasless). Surface `needs_funding` from `/balances`.
+7. **Read the preview's `tradability`/`warn_reason` before every trade.** They are advisory — a warned
+   cell still quotes and still executes — so the agent decides: pin another `chain`+`protocol` on
+   `settlement_failure`/`no_fill_window`/`no_settlements`, skip the asset on `no_price_feed`, keep sizes
+   small on `low_volume`. `warn_reason` is an open vocabulary — treat an unlisted value as "warned,
+   reason unknown" rather than an error. Table in
+   [`references/endpoints.md`](references/endpoints.md#tradability).
 
 ## Reusable helpers (TypeScript; adapt to your runtime — `big.js` for decimals)
 
@@ -280,15 +305,44 @@ const USDC_DECIMALS = 6;
 const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
 
+const SKILL_NAME = 'treasures-wallet';
+const SKILL_VERSION = '1.3.0'; // = SKILL.md metadata.version
+
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, {
+    ...init,
+    // Sending the version opts into the gate: deprecation warnings while this skill ages, and a
+    // clean 426 with upgrade instructions once it is past sunset, instead of a silent break.
+    headers: { 'X-Treasures-Skill': SKILL_NAME,
+               'X-Treasures-Skill-Version': SKILL_VERSION, ...init.headers },
+  });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 426) throw { status: 426, ...body };  // STOP: relay body.upgrade, do NOT retry
+  if (res.headers.get('Deprecation'))                      // non-blocking — finish, then warn
+    console.warn(`skill deprecated — sunset ${res.headers.get('Sunset') ?? 'not yet set'}; ` +
+                 `${res.headers.get('Warning') ?? 'update the Treasures skills'}`);
+  notifyIfNewer(res);
   if (!res.ok) throw { status: res.status, ...body };   // {status, error, cap?, reason?}
   return body;
 }
-const apiGet = (path: string, q: Record<string, string|number> = {}) =>
-  tFetch(`${API}${path}?${new URLSearchParams(q as any)}`, { headers: { 'x-api-key': apiKey } });
 
+// `X-Treasures-Skill-Latest: treasures-b2b-api=…; treasures-wallet=…` rides every response from the
+// wallet endpoints, whether or not you send a skill header. Informational only — never block, retry
+// or alter a trade because of it. Warn once.
+let updateNotified = false;
+function notifyIfNewer(res: Response): void {
+  if (updateNotified) return;
+  const header = res.headers.get('X-Treasures-Skill-Latest');
+  const latest = header?.split(';')
+    .map((pair) => pair.trim().split('='))
+    .find(([skill]) => skill === SKILL_NAME)?.[1];
+  if (!latest || latest === SKILL_VERSION) return;
+  updateNotified = true;
+  console.warn(
+    `A newer ${SKILL_NAME} skill is available (${latest}; you have ${SKILL_VERSION}). ` +
+    `What's new: https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/CHANGELOG.md`
+  );
+}
 // Submit a trade intent. `idempotencyKey` MUST be fresh per attempt.
 const trade = (intent: object, idempotencyKey: string) =>
   tFetch(`${API}/wallets/${walletId}/trades`, {
@@ -324,44 +378,26 @@ async function withFreshKeyRetry<T>(run: (idk: string) => Promise<T>, tries = 3)
 
 const fromAtomic = (atomic: string, decimals: number) => new Big(atomic).div(new Big(10).pow(decimals));
 
-// Client-side greedy sell across cells. Sequential: confirm each leg before the next.
-const CHAIN_OUT: Record<string, string> = { sol: 'solana', eth: 'ethereum' };
-async function sellGreedy(asset: string, targetShares: string, slippageBps: number) {
-  const target = new Big(targetShares);
-  const bal = await tFetch(`${API}/wallets/${walletId}/balances`);            // no key
-  const cells = bal.positions.filter((p: any) => p.asset === asset).map((p: any) => ({
-    chain: CHAIN_OUT[p.chain], protocol: p.issuer, shares: new Big(p.shares),
-  }));
-  // rank by net USDC/share (quote each cell at the size it could contribute)
-  const ranked = (await Promise.all(cells.map(async (c: any) => {
-    const size = c.shares.lt(target) ? c.shares : target;
-    const q = await apiGet(`/wallets/${walletId}/quotes`, {
-      chain: c.chain, protocol: c.protocol, side: 'sell', asset,
-      shares: size.toString(), slippage_bps: slippageBps,
-    });
-    return { ...c, rate: fromAtomic(q.min_amount_out, USDC_DECIMALS).div(size) };
-  }))).sort((a, b) => b.rate.cmp(a.rate));
-  // greedy allocate
-  let remaining = target; const legs: any[] = [];
-  for (const c of ranked) {
-    if (remaining.lte(0)) break;
-    const take = c.shares.lt(remaining) ? c.shares : remaining;
-    legs.push({ chain: c.chain, protocol: c.protocol, shares: take });
-    remaining = remaining.minus(take);
-  }
-  if (remaining.gt(0)) throw new Error(`insufficient ${asset} holdings: short ${remaining}`);
-  // execute sequentially; stop on first non-confirmed leg
-  const results: any[] = [];
-  for (const leg of legs) {
-    const job = await withFreshKeyRetry((idk) => trade({
-      chain: leg.chain, protocol: leg.protocol, side: 'sell', asset,
-      size: { shares: leg.shares.toString() }, slippage_bps: slippageBps,
-    }, idk));
-    const final = await pollJobToTerminal(job.job_id);
-    results.push(final);
-    if (final.state !== 'confirmed') break;
-  }
-  return results;
+// A sell is ONE POST; the server splits it. Poll every leg — they settle at different speeds.
+async function sell(asset: string, shares: string, slippageBps: number) {
+  const order = await withFreshKeyRetry((idk) => trade({
+    side: 'sell', asset, size: { shares }, slippage_bps: slippageBps,
+  }, idk));
+  const legs = await Promise.all(
+    order.legs.map((leg: { job_id: string }) => pollJobToTerminal(leg.job_id))
+  );
+  const filled = legs.filter((leg: any) => leg.state === 'confirmed');
+  const received = filled.reduce(
+    (sum: Big, leg: any) => sum.plus(fromAtomic(leg.result.amount_out, USDC_DECIMALS)),
+    new Big(0)
+  );
+  return {
+    // Re-derived from the polled legs; the 202's order_status was a submit-time snapshot.
+    order_status: filled.length === legs.length ? 'confirmed'
+      : filled.length === 0 ? 'failed' : 'partially_filled',
+    usdc_received: received.toString(),
+    legs,
+  };
 }
 ```
 
@@ -375,7 +411,7 @@ async function sellGreedy(asset: string, targetShares: string, slippageBps: numb
 | 404 | `wallet_not_found` / `job_not_found` / `session_not_found` | bad id |
 | 410 | `already_claimed` | onboarding key already claimed (single-use) |
 | 422 | `asset_not_whitelisted` | ticker not in catalog / not routable on the pinned cell |
-| 422 | `quote_unavailable` / `quote_failed` | genuine no-route, thin-liquidity no-fill, **or a sell bigger than any single cell holds** → split client-side / bounded retry |
+| 422 | `quote_unavailable` / `quote_failed` | genuine no-route, thin-liquidity no-fill, **or a PINNED sell bigger than that one cell holds** (drop the pin and let it fan out) → bounded retry |
 | **503** | `routing_unavailable` / `grant_check_unavailable` | **transient → retry w/ backoff (fresh key)** |
 | 202 → `failed`/`rejected` | `reject_reason` | no funds moved → retry (fresh key) for transient reasons |
 

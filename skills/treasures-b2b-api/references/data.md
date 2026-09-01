@@ -24,6 +24,47 @@ A listing block with all its fields `null` means that protocol/venue doesn't lis
 
 **This endpoint is the authority on where a ticker trades — especially for `base`.** The Coinbase B20 contracts were deployed unminted, and Treasures hides a cell until real supply exists: an unminted ticker shows `coinbase.address: null`, omits `base` from `available_chains`, and returns `422 no_routes` if you quote it anyway. The listed set therefore **grows over time** as Coinbase mints. Re-read this endpoint (5-min cache) instead of hardcoding a venue list.
 
+<a id="mag7x"></a>
+### `MAG7X` — a basket, not a stock
+
+One listing in the catalog is not a single company: **`MAG7X`**, the Ondo Intelligent Portfolio. It is a **basket of nine constituents: AAPL, AMZN, ETHA, GOOGL, IBIT, META, MSFT, NVDA, TSLA** — so despite the ticker it is **part crypto-ETF**: `IBIT` is a spot-Bitcoin ETF and `ETHA` a spot-Ether ETF. Do not present it as "the Magnificent 7", and do not treat it as equity exposure.
+
+Four things follow, and none of them apply to any other ticker:
+
+- **`eth` only.** It lists on Ethereum and nowhere else — `available_chains` is `["eth"]`.
+- **No `tradfi` block, ever.** A basket has no single underlying and no market-data profile, so `/stocks/prices` returns `tradfi: null` for it permanently. That is not an outage; do not poll for it to appear, and do not compute a premium against a missing reference.
+- **It is not on the retail catalog.** `MAG7X` is exposed on this API only.
+- **A `/quote/buy` can be refused with `422 basket_price_unavailable`.** Because there is no reference price for a basket, the only sanity check available is the issuer's own published price — if that is stale (older than an hour) or non-positive, the buy is refused rather than served unchecked. Transient: retry in a few minutes. **`/quote/sell` is never refused this way** — an exit is never gated on the issuer's price feed, so you can always get out. See [`errors.md`](errors.md).
+
+The honest disclosure: for `MAG7X` nothing independent is verifying the price you are quoted. Every other ticker is checked against its reference market price before a quote is issued.
+
+<a id="tradability-warnings"></a>
+### Tradability warnings
+
+A background probe quotes a ladder of buy sizes against every listed venue — and watches whether real orders settle — then publishes what it found. Its verdicts ride `/stocks/tickers` (and the `/stocks` list, same fields) at **two grains at once** — per venue cell inside the listing blocks, and per ticker at the top level of the item:
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `min_trade_size_usd` | integer USD | The smallest size measured to actually fill. Advisory: a smaller order is still accepted and still sent to the venue. |
+| `tradability` | `"thin"` \| `"untradable"` | `thin` = fills, but not at every size. `untradable` = a full measurement window passed with no fill at any size. **Neither is a block** — both are still quotable and submittable. |
+| `warn_reason` | `"settlement_failure"` \| `"no_price_feed"` \| `"no_fill_window"` \| `"no_settlements"` \| `"low_volume"` | Why the warning was raised. Per-reason action table: [`trading.md`](trading.md#tradability). Open vocabulary — see the note below. |
+| `thin_since` | ISO-8601 string | When the warning was first raised. Cell grain only, and present exactly when that cell's `tradability` is. |
+
+Which keys appear where:
+
+| Grain | Where | Keys |
+| --- | --- | --- |
+| cell | `ondo`, `xstocks` blocks — each spans **two** cells (sol + eth) | chain-suffixed: `sol_min_trade_size_usd`, `sol_tradability`, `sol_warn_reason`, `sol_thin_since`, and the four `eth_*` twins |
+| cell | `robinhood`, `coinbase` blocks — one cell each | bare: `min_trade_size_usd`, `tradability`, `warn_reason`, `thin_since` |
+| ticker | top level of the item, beside `ticker`/`name` | `min_trade_size_usd`, `tradability`, `warn_reason` — **no `thin_since`** (one stamp cannot date several cells' warnings) |
+
+- **The ticker-level roll-up is deliberately asymmetric.** `min_trade_size_usd` is the **cheapest floor across cells** (a buy routes to whichever cell can serve it), and the word follows that floor — `thin` beside a floor, `untradable` without one. `tradability` is emitted only when **every measured cell is warned**, never when just one is: a ticker with one unwarned cell is healthy somewhere, and labelling the whole ticker would hide a live listing. `warn_reason` at this grain is the **strongest** reason across the warned cells, not the cheapest cell's. So read the per-cell keys, not the ticker keys, to decide which venue to trade.
+- **Absent ≠ null, everywhere these fields appear.** They are omitted rather than sent as `null`. An absent `min_trade_size_usd` means no minimum is known (fall back to $3), never that there is none — and an absent `tradability` means unmeasured or unwarned, never "healthy". `warn_reason` can be absent beside a *present* `tradability` too: that warning predates the reason field, so read it as "reason not recorded", never "no reason".
+- **`available_chains` is untouched by any of this.** It answers "where does this token exist", so a warned venue still appears there — and a holder's chain never vanishes from a sell flow.
+- **Not stable over a cell's lifetime.** A `low_volume` warning flips to `settlement_failure` once a real order dies on that cell. Re-read (5-min cache) rather than caching the value yourself.
+- **`warn_reason` is an open vocabulary.** New values are added over time; an unrecognised one means "warned, reason unknown" — treat it like any listed reason rather than ignoring it.
+- The same three warning fields ride **every quote leg** ([`trading.md`](trading.md#tradability)) and **portfolio positions** (below).
+
 ## `GET /stocks/prices?tickers=AAPL,TSLA,MSFT`
 
 Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. Server enforces `/^[A-Z0-9.-]{1,10}$/i` per item, uppercased server-side.
@@ -40,16 +81,20 @@ Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. 
       "as_of": 1779220801
     },
     "onchain": {   // per-protocol/venue; any side null when no listing or no price-feed data
-      "ondo":      { "share_price_usd": "88.8680", "premium_vs_tradfi_pct": "-0.517", "volume_24h_usd": "4732002" },
-      "xstocks":   { "share_price_usd": "88.3500", "premium_vs_tradfi_pct": "-1.097", "volume_24h_usd": "2649" },
-      "robinhood": { "share_price_usd": "88.5000", "premium_vs_tradfi_pct": "-0.930", "volume_24h_usd": "1200" },
-      "coinbase":  { "share_price_usd": "88.6100", "premium_vs_tradfi_pct": "-0.807", "volume_24h_usd": "9400" }
+      "ondo":      { "share_price_usd": "88.8680", "premium_vs_anchor_pct": "-0.517", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.517", "volume_24h_usd": "4732002" },
+      "xstocks":   { "share_price_usd": "88.3500", "premium_vs_anchor_pct": "-1.097", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-1.097", "volume_24h_usd": "2649" },
+      "robinhood": { "share_price_usd": "88.5000", "premium_vs_anchor_pct": "-0.930", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.930", "volume_24h_usd": "1200" },
+      "coinbase":  { "share_price_usd": "88.6100", "premium_vs_anchor_pct": "-0.807", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.807", "volume_24h_usd": "9400" }
     }
   }]
 }
 ```
 
-`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. `premium_vs_tradfi_pct` (negative = on-chain cheaper) is computed against `tradfi.current_price_usd`; when `tradfi` is `null`, each venue's premium is `null` too. Use for quote-time comparison, P&L marks, "current price" UX.
+`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. Use for quote-time comparison, P&L marks, "current price" UX.
+
+- **`premium_vs_anchor_pct`** (negative = on-chain cheaper) — the premium against the reference named by `anchor_source`. `null`, with `anchor_source` absent, when no reference resolves at all.
+- **`anchor_source`** — `"tradfi_live"` (the regular-session print), `"tradfi_extended"` (the aftermarket print while it is still printing) or `"tradfi_frozen"` (the frozen regular-session close). Never the on-chain mark: the premium measures an on-chain price, so anchoring it there would measure that price against itself.
+- **`premium_vs_tradfi_pct` is deprecated** — it is measured against `tradfi.current_price_usd`, which freezes at the regular-session close, so it overstates the premium overnight and at weekends. Read `premium_vs_anchor_pct` instead, which names the reference it used.
 
 ## `GET /portfolio?sol_wallet=...&eth_wallet=...&source=all|internal`
 
@@ -78,6 +123,8 @@ Live reconciled USDC + tokenized-stock holdings for a wallet pair. Cached 30s pe
 **`partial` — the row list itself may be short.** The nullable columns below cover a cell we *read* but couldn't *price*. `partial` covers the other case: a cell we couldn't read at all (an RPC blip on the sol/eth side, or on either single-cell venue — Robinhood Chain 4663 or Base 8453). Such a cell is **dropped** from `positions` rather than reported as a zero — an unreliable balance must never look like a real one — so on `partial: true` the list omits holdings the wallet may have and **any total you sum from `usd_value` undercounts**. It is otherwise a normal `200`: retry rather than treat it as authoritative, and don't overwrite a good cached view with a partial one. `partial` can be `true` with `is_cached: true` (the 30s snapshot captured the failure); a retry inside that window returns the same partial answer, so back off past it. Cash is **not** covered — `usdc`/`usdg` independently fall back to `"0"` on a failed read, which is why you should never treat their `"0"` as proof of an empty balance either.
 
 `shares`, `usd_per_token`, `usd_per_share`, `usd_value` are each independently nullable — a position with a price-feed outage still surfaces with `tokens` populated so you can hold the row and re-render USD next poll. **Default any null to "unknown", never "0".** Tokens acquired outside Treasures reconcile in on the next read and emit a synthetic `external` row in `/trades`. **Exception — neither single-cell venue has an external-row reconciler:** you must **submit** each Robinhood-chain and Base trade via `/trade/submit` for it to appear in `/trades` at all — it enters as `broadcast` and reaches `completed` via the same status poll / backfill as `eth` (see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base)). An **unsubmitted** trade on either venue never appears in `/trades` and carries no cost basis; whether its balance shows on `/portfolio` is governed by the per-venue position gate below.
+
+**Positions can carry a tradability warning.** A position may include `tradability`, `warn_reason` and `thin_since` for its own `(ticker, protocol, chain)` cell — but only when the reason is **side-neutral** (`low_volume`, `no_price_feed` or `no_settlements`), since those bear on an exit as much as on an entry. A cell warned for a buy-sided reason (`no_fill_window`, `settlement_failure`), or one whose reason was never recorded, emits **nothing** here. `min_trade_size_usd` is never published on a position: it is a USD **buy** floor and this is an exit surface. Advisory as everywhere else — it never marks a holding unsellable. Field meanings: [Tradability warnings](#tradability-warnings).
 
 The three `source=internal` columns are derived from **completed internal trades only** (see [Internal-only P&L](#internal-only-pl) below). Caveat: because off-platform transfers are ignored by the basis, `shares_internal_only` can exceed the on-chain balance after you move tokens out — treat it as "shares bought via Treasures and not yet sold via Treasures", not a custody figure.
 

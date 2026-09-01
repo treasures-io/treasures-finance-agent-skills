@@ -173,13 +173,19 @@ paths:
                 $ref: "#/components/schemas/SimpleError"
               example: { error: quote_stale }
         "422":
-          description: No fillable routes returned by the planner.
+          description: |
+            No fillable routes returned by the planner, or a basket listing whose
+            issuer-published price is unusable.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NoRoutesError"
+                anyOf:
+                  - $ref: "#/components/schemas/NoRoutesError"
+                  - $ref: "#/components/schemas/BasketPriceUnavailableError"
               examples:
                 no_routes: { value: { error: no_routes } }
+                basket_price_unavailable:
+                  { value: { error: basket_price_unavailable } }
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
@@ -348,6 +354,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/SimpleError"
               example: { error: quote_stale }
+        "422":
+          description: |
+            You sent `acknowledged_warnings` and it does not match the warnings served with this
+            `quote_id`. Only reachable when the field is present — omitting it always proceeds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleErrorWithMessage"
+              example:
+                {
+                  error: warnings_not_acknowledged,
+                  message: "echo warnings_ack_token from the quote as acknowledged_warnings to proceed",
+                }
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/ScreeningUnavailable" }
@@ -774,6 +793,38 @@ components:
           example: { error: screening_unavailable }
 
   schemas:
+    # ------------ Listing-tradability advisory (shared by every surface that carries it) ---
+    Tradability:
+      type: string
+      enum: [thin, untradable]
+      description: >
+        Probe warning for one cell. `thin` — the cell fills, but not at every size below its
+        measured minimum. `untradable` — nothing filled at any size across a full measurement
+        window, and no minimum accompanies it. **Neither value disables the cell**; quotes are
+        still accepted for both. Absent means unmeasured or unwarned — never
+        healthy-with-value-null.
+    WarnReason:
+      type: string
+      enum: [settlement_failure, no_price_feed, no_fill_window, no_settlements, low_volume]
+      description: >
+        Why the cell is warned, strongest evidence first: `settlement_failure` (a real order died)
+        > `no_price_feed` (the venue holds no price for the pair) > `no_fill_window` (a full window
+        of quiet auctions) > `no_settlements` (no value-bearing on-chain settlement in the census
+        window) > `low_volume` (a volume proxy). Absent when unwarned, or when the warn predates
+        reason recording. Not stable over a cell's lifetime — a `low_volume` warn that later kills a
+        real order flips to `settlement_failure`.
+    SideNeutralWarnReason:
+      type: string
+      enum: [low_volume, no_price_feed, no_settlements]
+      description: >
+        The subset of `WarnReason` that bears on an exit as much as an entry, and the only values a
+        sell surface publishes. The buy-sided reasons (`no_fill_window`, `settlement_failure`) are
+        measured against buys, so a sell leg carrying one would warn about someone else's trade; a
+        cell warned only for those publishes nothing here.
+    ThinSince:
+      type: string
+      format: date-time
+      description: When the warning above was first raised. Present exactly when `tradability` is.
     # ------------ Primitives ----------------------------------------------
     SolAddress:
       type: string
@@ -805,7 +856,7 @@ components:
 
     Ticker:
       type: string
-      pattern: "^[A-Z][A-Z0-9.]{0,9}$"
+      pattern: "^[A-Z0-9][A-Z0-9.]{0,9}$"
       example: AAPL
 
     Chain:
@@ -892,14 +943,14 @@ components:
               slippage_exceeded,
               amount_too_small,
               price_off_reference,
+              price_implausible,
               reference_unavailable,
               no_price_feed,
               market_closed,
             ]
           description: |
             Present only when a strict majority of dropped cells share the same
-            actionable reason; otherwise omitted. `reference_unavailable` is the
-            exception — it describes the whole quote, not a majority of cells.
+            actionable reason; otherwise omitted.
 
             `price_off_reference` covers both non-caller-tunable price refusals:
             an outright refusal against the asset's reference market price (a
@@ -925,14 +976,38 @@ components:
             still serves the ticker. Retry unpinned, or on another chain from
             `available_chains`, before waiting out the session.
 
-            `reference_unavailable` is distinct: no reference market price could
-            be obtained for the asset at all, so the cap above could not be
-            evaluated and the quote is refused rather than served unchecked.
-            Permanent for an asset our market-data provider does not cover;
-            transient during a provider outage — a negative lookup is cached
-            for at most ~30s, so a retry after that clears it. Retrying is only
-            useful in the latter case, and cannot be distinguished from the
-            response — do not retry in a tight loop.
+            `price_implausible` — the quote sits so far from the reference that we
+            do not trust our own arithmetic, so we will not execute on it. No size,
+            no `max_slippage_bps` and no acknowledgement clears it; a re-quote may.
+
+            `reference_unavailable` is a **retained wire word with no current
+            producer**. A missing reference used to refuse the quote; it is now
+            served, with `tradfi_reference: null` and a `no_reference` entry in
+            `warnings[]`. Keep parsing the value — it is still published so a
+            client that models it does not break — but do not build a flow around
+            receiving it.
+      additionalProperties: false
+
+    BasketPriceUnavailableError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, enum: [basket_price_unavailable] }
+      description: |
+        Only reachable on **`/quote/buy`**, and only for a **basket** listing
+        (`MAG7X`, the Ondo Intelligent Portfolio). A basket has no single
+        underlying, so no reference market price exists for it and the usual
+        reference check cannot run — the one sanity check left is the issuer's
+        own published price. This refusal means that price was missing,
+        non-positive, or older than an hour.
+
+        `/quote/sell` never returns this: an exit is never gated on the issuer's
+        price feed, so a holder can always get out.
+
+        Distinct from `no_routes`: a route existed and the venue was fine, and
+        the refusal lands before any venue is asked for a price. Treat it as
+        transient and retry in a few minutes; no size or slippage change clears
+        it, and no other ticker is affected.
       additionalProperties: false
 
     LegAlreadySubmittedError:
@@ -989,6 +1064,33 @@ components:
         eth_min_trade_size_usd:
           type: integer
           description: Per-cell measured minimum for this protocol on Ethereum. See `sol_min_trade_size_usd`.
+        sol_tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Per-cell probe warning for this protocol on Solana. `thin` — the cell fills, but not at
+            every size below `sol_min_trade_size_usd`. `untradable` — nothing filled at any size
+            across a full measurement window, and no minimum accompanies it. **Neither value
+            disables the cell**; quotes are still accepted for both. Absent means unmeasured or
+            unwarned — never healthy-with-value-null. Chain-suffixed because this block spans a
+            Solana and an Ethereum cell.
+        sol_warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: >
+            Why the Solana cell is warned, strongest evidence first. Absent when unwarned, or when
+            the warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
+            warn that later kills a real order flips to `settlement_failure`.
+        sol_thin_since:
+          $ref: '#/components/schemas/ThinSince'
+          description: When the Solana warning was first raised. Present exactly when `sol_tradability` is.
+        eth_tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: Per-cell probe warning for this protocol on Ethereum. See `sol_tradability`.
+        eth_warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: Why the Ethereum cell is warned, strongest evidence first. See `sol_warn_reason`.
+        eth_thin_since:
+          $ref: '#/components/schemas/ThinSince'
+          description: When the Ethereum warning was first raised. Present exactly when `eth_tradability` is.
         token_ticker:
           type: [string, "null"]
           description: Issuer's wrapped-token symbol (`<TICKER>on` Ondo, `<TICKER>x` xStocks). Null when not listed.
@@ -1007,6 +1109,23 @@ components:
           description: >
             Measured minimum for this single-cell venue, in whole USDC. **Absent means
             no minimum is known**, never zero, and it is advisory rather than a gate.
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Probe warning for this single-cell venue. `thin` — the cell fills, but not at every
+            size below `min_trade_size_usd`. `untradable` — nothing filled at any size across a
+            full measurement window, and no minimum accompanies it. **Neither value disables the
+            cell**; quotes are still accepted for both. Absent means unmeasured or unwarned —
+            never healthy-with-value-null. Bare rather than chain-suffixed: this block names
+            exactly one cell.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: >
+            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the
+            warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
+            warn that later kills a real order flips to `settlement_failure`.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
         token_ticker:
           type: [string, "null"]
           description: Bare stock symbol (Robinhood Stock Tokens carry no on/x suffix). Null when not listed.
@@ -1016,6 +1135,8 @@ components:
       required:
         [
           current_price_usd,
+          currency,
+          price_native,
           change_24h_pct,
           market_cap_usd,
           pe_ttm,
@@ -1025,8 +1146,29 @@ components:
         ]
       properties:
         current_price_usd: { $ref: "#/components/schemas/DecimalString" }
-        change_24h_pct: { $ref: "#/components/schemas/DecimalString" }
-        market_cap_usd: { $ref: "#/components/schemas/DecimalString" }
+        currency:
+          type: string
+          description:
+            ISO-4217 quote currency of the underlying listing — "USD" for every US
+            row. Every other price on this block is already converted to USD.
+        price_native:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description:
+            The price as the exchange quotes it, before conversion, so a client can
+            render e.g. HK$446.20 without re-deriving it. Equal to
+            current_price_usd when currency is "USD".
+        change_24h_pct:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description:
+            Percent change in the LISTING's own currency, not converted — a ratio
+            does not convert, and doing it correctly would need yesterday's FX rate.
+        market_cap_usd:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+          description:
+            Null when the feed serves the line without a market cap (funds, newly
+            listed board codes). Converted to USD like every other price here.
         pe_ttm:
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
@@ -1050,32 +1192,64 @@ components:
           type: integer
           description: Exchange-side last-tick timestamp (unix seconds).
 
+    AnchorSource:
+      description:
+        Which reference a premium_vs_anchor_pct was measured against — the live regular-session
+        print, the aftermarket print while it is still printing, or the frozen regular-session
+        close. Never the on-chain mark - the premium measures an on-chain price, so anchoring it
+        there would measure that price against itself.
+      type: string
+      enum: [tradfi_live, tradfi_extended, tradfi_frozen]
+
     StockOnchainAggregate:
       type: object
-      required: [avg_share_price_usd, premium_vs_tradfi_pct, volume_24h_usd]
+      required: [avg_share_price_usd, premium_vs_tradfi_pct, premium_vs_anchor_pct, volume_24h_usd]
       properties:
         avg_share_price_usd:
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
             - { type: "null" }
         premium_vs_tradfi_pct:
+          deprecated: true
+          description:
+            DEPRECATED - measured against tradfi.current_price_usd, which freezes at the
+            regular-session close, so it overstates the premium overnight and at weekends. Use
+            premium_vs_anchor_pct, which names the reference it used.
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
             - { type: "null" }
+        premium_vs_anchor_pct:
+          description:
+            Signed percent of avg_share_price_usd against the anchor named by anchor_source. Null
+            when no tradfi reference resolves at all, in which case anchor_source is absent.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        anchor_source: { $ref: "#/components/schemas/AnchorSource" }
         volume_24h_usd: { $ref: "#/components/schemas/DecimalString" }
 
     StockOnchainProtocolLeg:
       type: object
-      required: [share_price_usd, premium_vs_tradfi_pct, volume_24h_usd]
+      required: [share_price_usd, premium_vs_tradfi_pct, premium_vs_anchor_pct, volume_24h_usd]
       properties:
         share_price_usd:
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
             - { type: "null" }
         premium_vs_tradfi_pct:
+          deprecated: true
+          description: DEPRECATED - see StockOnchainAggregate.premium_vs_tradfi_pct.
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
             - { type: "null" }
+        premium_vs_anchor_pct:
+          description:
+            Signed percent of share_price_usd against the anchor named by anchor_source. Null when
+            no tradfi reference resolves at all, in which case anchor_source is absent.
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+        anchor_source: { $ref: "#/components/schemas/AnchorSource" }
         volume_24h_usd: { $ref: "#/components/schemas/DecimalString" }
 
     StockOnchainPerProtocol:
@@ -1127,17 +1301,42 @@ components:
             published unchanged outside it as a valid lower bound — off-session
             minimums are higher, never lower.
         tradability:
-          type: string
-          enum: [thin, untradable]
+          $ref: '#/components/schemas/Tradability'
           description: |
-            Present only when we have something to warn about. `thin` — it fills,
-            but not at every size below `min_trade_size_usd`. `untradable` —
-            nothing filled at any size across a full measurement window, and no
-            minimum is published alongside it.
+            Ticker-level roll-up of the per-cell warnings below. Present only when
+            **every** measured cell for this ticker is warned — not when any one is.
+            A ticker with one healthy measured cell is healthy somewhere and carries
+            nothing, so a single dead venue can never label a live listing.
+
+            The word follows the cheapest floor, exactly as it does per cell. `thin`
+            — every measured cell is warned and `min_trade_size_usd` is published
+            alongside. `untradable` — every measured cell is warned and none filled
+            at any size, so no minimum accompanies it. Cells the probe has not
+            measured are not counted either way, so `untradable` is a statement about
+            the measured surface, not proof that no venue can fill.
 
             **Neither value means the listing is disabled.** Quotes are still
             accepted for both; this is guidance to show a user before they try,
-            not a gate. A ticker buyable on any venue never carries `untradable`.
+            not a gate.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: |
+            Why the ticker is warned, strongest evidence first: a real order that
+            terminally expired, then the venue stating it holds no price for the
+            pair, then a full window of quiet auctions with no fill, then no
+            value-bearing on-chain settlement in the census window, then a
+            low-volume proxy.
+
+            Present only alongside `tradability`; absent when the warn predates
+            reason recording — that is "reason not recorded", never "no reason".
+            Rolled up as the **strongest** reason across the warned cells, not the
+            cheapest cell's, and not stable over a listing's lifetime: the value
+            changes when stronger evidence arrives. Read the per-cell
+            `sol_warn_reason` / `eth_warn_reason` / `warn_reason` on the venue
+            blocks below before committing to a cell.
+
+            There is no ticker-level `thin_since` — one stamp cannot date several
+            cells' warnings; take it per cell.
         ondo: { $ref: "#/components/schemas/StockProtocolListing" }
         xstocks: { $ref: "#/components/schemas/StockProtocolListing" }
         robinhood: { $ref: "#/components/schemas/RobinhoodListing" }
@@ -1153,8 +1352,9 @@ components:
         hidden until real supply exists: `address` and `token_ticker` are `null`, `base`
         is omitted from `available_chains`, and a quote returns `422 no_routes`. The
         listed set therefore grows over time — read this endpoint rather than hardcoding.
-        `min_trade_size_usd` is gated with them, so a hidden cell never publishes a
-        minimum for a venue the same response says does not exist.
+        `min_trade_size_usd` and the warn trio (`tradability`, `warn_reason`,
+        `thin_since`) are gated with them, so a hidden cell never publishes a minimum
+        or a warning for a venue the same response says does not exist.
       required: [address, share_multiplier, token_ticker]
       properties:
         address: { type: [string, "null"] }
@@ -1164,6 +1364,23 @@ components:
           description: >
             Measured minimum for this single-cell venue, in whole USDC. **Absent means
             no minimum is known**, never zero, and it is advisory rather than a gate.
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Probe warning for this single-cell venue. `thin` — the cell fills, but not at every
+            size below `min_trade_size_usd`. `untradable` — nothing filled at any size across a
+            full measurement window, and no minimum accompanies it. **Neither value disables the
+            cell**; quotes are still accepted for both. Absent means unmeasured or unwarned —
+            never healthy-with-value-null. Bare rather than chain-suffixed: this block names
+            exactly one cell.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: >
+            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the
+            warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
+            warn that later kills a real order flips to `settlement_failure`.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
         token_ticker:
           type: [string, "null"]
           description: Bare stock symbol (B20 tokens carry no on/x suffix). Null when not listed.
@@ -1299,8 +1516,8 @@ components:
         slippage_vs_tradfi_bps:
           type: integer
           description: >-
-            Signed; positive = unfavorable to you. Always present, since a 200 always carries a
-            `tradfi_reference` to measure against.
+            Signed; positive = unfavorable to you. Omitted when `tradfi_reference` is null — there
+            was nothing to measure against.
       additionalProperties: false
 
     QuoteBuyLeg:
@@ -1336,6 +1553,23 @@ components:
           minItems: 1
           description: Omitted on `quote_only` previews — the leg is non-executable.
           items: { $ref: "#/components/schemas/SignablePayload" }
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Probe warning for **this leg's own cell** — an exact `(ticker, protocol, chain)` match,
+            not a ticker roll-up. `thin` — the cell fills, but not at every size below its measured
+            minimum. `untradable` — nothing filled at any size across a full measurement window.
+            **Advisory, never a block**: the leg is still planned, priced and submittable, and there
+            is no request param to exclude warned cells. Absent means unmeasured or unwarned — never
+            healthy-with-value-null.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: >
+            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the warn
+            predates reason recording. Not stable over a cell's lifetime — a `low_volume` warn that
+            later kills a real order flips to `settlement_failure`.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
 
     QuoteSellLeg:
       type: object
@@ -1374,6 +1608,26 @@ components:
           type: array
           minItems: 1
           items: { $ref: "#/components/schemas/SignablePayload" }
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Probe warning for **this leg's own cell**, filtered to the sell side. Same two words as
+            on a buy leg, but published only when `warn_reason` is side-neutral (see below), so a
+            sell leg carries all three keys or none. **Advisory, never a block** — nothing here
+            refuses an exit. No `min_trade_size_usd` accompanies a sell anywhere on the API: it is a
+            USD buy floor while a sell is denominated in shares.
+        warn_reason:
+          $ref: '#/components/schemas/SideNeutralWarnReason'
+          description: >
+            Why the cell is warned. **Sell legs carry only the side-neutral reasons**:
+            `low_volume` (a thin pool is a bad exit as surely as a bad entry), `no_price_feed`
+            (no feed is no feed, either direction) and `no_settlements` (nothing ever settling here
+            is no less a dead end on exit). The two buy-sided reasons — `no_fill_window` (the
+            measurement ladder quotes buys) and `settlement_failure` (recorded on buys only) — say
+            nothing about an exit and are suppressed along with the whole trio, as is a warn whose
+            reason was never recorded.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
 
     QuoteBuyRequest:
       type: object
@@ -1384,7 +1638,17 @@ components:
         chain:
           oneOf:
             - { $ref: "#/components/schemas/Chain" }
+            - type: array
+              items: { $ref: "#/components/schemas/Chain" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
             - { type: "null" }
+          description: >-
+            One chain pins routing to it. An array (1–4, unique) auto-routes within those
+            chains only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. null/omitted = every
+            chain the ticker lists.
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
@@ -1417,7 +1681,17 @@ components:
         chain:
           oneOf:
             - { $ref: "#/components/schemas/Chain" }
+            - type: array
+              items: { $ref: "#/components/schemas/Chain" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
             - { type: "null" }
+          description: >-
+            One chain pins routing to it. An array (1–4, unique) auto-routes within those
+            chains only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. null/omitted = every
+            chain the ticker lists.
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
@@ -1431,9 +1705,39 @@ components:
       additionalProperties: false
       description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
 
+    TradeWarning:
+      type: object
+      required: [code]
+      description: >
+        One disclosed risk on a quote. `code` shares the open vocabulary of `WarnReason` plus the two
+        price-check codes below, so you learn one set rather than two; treat an unrecognised code as
+        "warned, reason unknown" rather than an error. The other keys are the material values behind
+        the code (a deviation in bps, the anchor used, the instant a warn was raised) and vary by code.
+      properties:
+        code:
+          type: string
+          description: >
+            `no_reference` — no reference market price could be obtained for the asset, so nothing
+            independent checked this quote's price. Permanent for an asset our market-data provider
+            does not cover (the HK listings, the Ondo basket); transient during a provider outage.
+            `off_reference` — a reference exists and the quote sits beyond its cap, in the direction
+            that costs you. Beyond an implausibility bound the quote is refused outright instead
+            (`no_routes` / `price_implausible`) and no acknowledgement can clear it.
+            Every other value is the routed cell's own `WarnReason`.
+      additionalProperties: true
+
+    WarningsAckToken:
+      type: string
+      pattern: "^[0-9a-f]{32}$"
+      description: >
+        A digest over this `quote_id` and the exact `warnings[]` served with it. Present only
+        alongside a non-empty set. Echo it back as `acknowledged_warnings` on
+        `POST /trade/submit` to record that you received these warnings before executing —
+        see that field for what the record does and does not mean.
+
     QuoteBuyResponse:
       type: object
-      required: [side, ticker, tradfi_reference, quotes]
+      required: [side, ticker, tradfi_reference, quotes, warnings]
       properties:
         quote_id:
           type: string
@@ -1444,30 +1748,45 @@ components:
           type: integer
           description: Unix seconds. Re-quote after this time. Omitted on `quote_only` previews.
         tradfi_reference:
-          # Non-nullable since the fail-closed NAV gate: a quote that cannot be price-checked
-          # against the reference is refused with 422 `reference_unavailable`, so a 200 always
-          # carries one. (Distinct from the browse surface's `tradfi`/TradfiBlock, which stays
-          # nullable — an asset with no reference price is still listed, just not quotable.)
-          $ref: "#/components/schemas/TradfiReference"
+          # Null when we had no reference to price-check against; the quote then carries a
+          # `no_reference` entry in `warnings[]`. Always present as a key.
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiReference" }
+            - { type: "null" }
         quotes:
           type: array
           items: { $ref: "#/components/schemas/QuoteBuyLeg" }
+        warnings:
+          type: array
+          description: >
+            Everything this quote discloses about the trade. **Always present**, `[]` when there is
+            nothing to disclose — so an empty list is never ambiguous with an older build. A warned
+            quote is still executable: this plane discloses and does not gate. Deciding what to show
+            an end user, and whether to proceed, is yours.
+
+            A leg reporting `tradability: "thin"` with no `warn_reason` emits NO
+            `warnings[]` entry: the reason column is newer than the verdict, so a cell warned before
+            it existed has nothing to name here and stays silent until the next probe pass records
+            one. The leg's own `tradability` is the disclosure in that window — do not read an empty
+            `warnings[]` beside a `thin` leg as "no risk".
+          items: { $ref: "#/components/schemas/TradeWarning" }
+        warnings_ack_token: { $ref: "#/components/schemas/WarningsAckToken" }
 
     QuoteSellResponse:
       type: object
       required:
-        [quote_id, side, ticker, expires_at, tradfi_reference, quotes, totals]
+        [quote_id, side, ticker, expires_at, tradfi_reference, quotes, totals, warnings]
       properties:
         quote_id: { type: string }
         side: { type: string, enum: [sell] }
         ticker: { $ref: "#/components/schemas/Ticker" }
         expires_at: { type: integer }
         tradfi_reference:
-          # Non-nullable since the fail-closed NAV gate: a quote that cannot be price-checked
-          # against the reference is refused with 422 `reference_unavailable`, so a 200 always
-          # carries one. (Distinct from the browse surface's `tradfi`/TradfiBlock, which stays
-          # nullable — an asset with no reference price is still listed, just not quotable.)
-          $ref: "#/components/schemas/TradfiReference"
+          # Null when we had no reference to price-check against; the quote then carries a
+          # `no_reference` entry in `warnings[]`. Always present as a key.
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiReference" }
+            - { type: "null" }
         quotes:
           type: array
           items: { $ref: "#/components/schemas/QuoteSellLeg" }
@@ -1477,6 +1796,11 @@ components:
           properties:
             shares_total: { $ref: "#/components/schemas/DecimalString" }
             usdc_total_estimated: { $ref: "#/components/schemas/DecimalString" }
+        warnings:
+          type: array
+          description: See `QuoteBuyResponse.warnings` — same contract on both sides.
+          items: { $ref: "#/components/schemas/TradeWarning" }
+        warnings_ack_token: { $ref: "#/components/schemas/WarningsAckToken" }
 
     # ------------ Quote status --------------------------------------------
     PublicLegStatus:
@@ -1593,6 +1917,24 @@ components:
           type: array
           minItems: 1
           items: { $ref: "#/components/schemas/SignedLeg" }
+        acknowledged_warnings:
+          allOf: [{ $ref: "#/components/schemas/WarningsAckToken" }]
+          description: >
+            **Optional, and never required.** Echo the quote's `warnings_ack_token` to have the
+            acknowledgement recorded beside the trade; omit it and the trade proceeds exactly as
+            before, with the acknowledgement columns left empty.
+
+            We record the warnings we served on **every** trade whether or not you echo anything, so
+            omitting this loses you a record of your own acknowledgement, not ours of the disclosure.
+
+            Sending a value that does not match the warnings served with this `quote_id` is refused
+            with `warnings_not_acknowledged` (422) rather than recorded — clear it by omitting the
+            field or by re-quoting and echoing the fresh token. A clean quote (`warnings: []`)
+            ignores the field entirely.
+
+            **What this does not cover.** Disclosing risk to your own end users, and keeping evidence
+            that you did, is governed by your integrator agreement and your records — not by this
+            field. Echoing a token records what *you* were told, never what your user was.
       additionalProperties: false
 
     LegResult:
@@ -1819,6 +2161,24 @@ components:
           oneOf:
             - { $ref: "#/components/schemas/DecimalString" }
             - { type: "null" }
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >-
+            Probe warning for the exact `(ticker, protocol, chain)` cell this position names,
+            filtered to the sell side. Published only when `warn_reason` is side-neutral (see
+            below), so a position carries all three keys or none. **Advisory, never a block** —
+            it never marks a holding unsellable. `min_trade_size_usd` is never published on a
+            position: it is a USD buy floor while a sell is denominated in shares. Absent means
+            unmeasured, unwarned, or buy-sided — never healthy-with-value-null.
+        warn_reason:
+          $ref: '#/components/schemas/SideNeutralWarnReason'
+          description: >-
+            Why the held cell is warned. **Positions carry only the side-neutral reasons**:
+            `low_volume`, `no_price_feed` and `no_settlements`. The buy-sided reasons
+            (`no_fill_window`, `settlement_failure`) say nothing about an exit and suppress the
+            whole trio, as does a warn whose reason was never recorded.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
 
     PortfolioResponse:
       type: object
