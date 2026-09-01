@@ -28,7 +28,8 @@ rejected for "not using the skill" — it relies on track 2 alone.
 
 | Caller | Sends `X-Treasures-Skill-Version`? | Protected by |
 | --- | --- | --- |
-| **Skill client** (`treasures-wallet` / `treasures-b2b-api`) | yes — the skill's fetch helper does it | Opt-in skill gate (`Deprecation`/`Sunset` → `426 + upgrade`) **and** standard versioning |
+| **Skill client** (`treasures-b2b-api`) | yes — its fetch helper does it | Opt-in skill gate (`Deprecation`/`Sunset` → `426 + upgrade`) **and** standard versioning |
+| **Skill client** (`treasures-wallet`) | **not yet** — see the note below | Standard versioning only, like a generic client |
 | **Generic integration** (bespoke client) | no | Standard versioning only (`/v1`→`/v2`, `Sunset`/`410`) |
 
 ## Request headers (skill → API) — OPTIONAL
@@ -38,8 +39,14 @@ rejected for "not using the skill" — it relies on track 2 alone.
 | `X-Treasures-Skill` | `treasures-wallet` \| `treasures-b2b-api` | which client |
 | `X-Treasures-Skill-Version` | the skill's `metadata.version` (e.g. `1.0.0`) | semver; **presence opts the caller into the skill gate** |
 
-These are **not required**. The skill's fetch helper attaches them so skill clients
-opt in automatically; any other client may omit them with no penalty.
+These are **not required**. `treasures-b2b-api`'s fetch helper attaches them, so that skill
+opts in automatically; any other client may omit them with no penalty.
+
+> ⚠️ **`treasures-wallet` does not implement this yet** — it sends neither header and acts on
+> none of the response signals below. It is therefore a generic client for gate purposes:
+> never deprecated, never `426`'d, and never warned. Until it does, the repo
+> [`CHANGELOG.md`](../CHANGELOG.md) is the only place a wallet-skill change is announced.
+> Nothing in this spec should be read as describing shipped `treasures-wallet` behavior.
 
 ## Response headers (API → caller)
 
@@ -119,7 +126,7 @@ guarantee — it does not depend on any skill header:
 - Skills react to these too (see Skill behavior) — so drift surfaces even for a skill
   call that happened to omit the header.
 
-## Skill behavior (both skills implement)
+## Skill behavior (`treasures-b2b-api` implements; `treasures-wallet` does not yet)
 
 Each skill's `SKILL.md` is the normative, agent-facing home for these rules (this doc is
 the spec they implement). In brief: **send** the two skill headers (the fetch helper

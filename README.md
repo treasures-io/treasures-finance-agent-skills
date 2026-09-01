@@ -8,7 +8,7 @@ A skill is a folder of plain-Markdown instructions (`SKILL.md`) that a coding ag
 
 | Skill | What it does |
 | ----- | ------------ |
-| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
+| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC, and read portfolio + trade history for a single end-user wallet pair. Covers US and Hong Kong listings across Solana, Ethereum, Base and Robinhood Chain. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
 | [`treasures-wallet`](skills/treasures-wallet/SKILL.md) | Operate a Treasures delegated wallet over HTTP: onboard (provision a wallet + mint a scoped API key), quote, execute async buys/sells (non-custodial — the agent never signs; Treasures signs as a delegated signer scoped strictly to RWA trades), read balances/portfolio/trade history, and manage API keys. Trades tokenized equities (xStocks / Ondo) vs USDC on Solana or Ethereum with only HTTPS + an API key — no web3 libraries, keys, or RPC. |
 
 ## Install
@@ -53,6 +53,13 @@ This repo also doubles as a [Claude Code plugin marketplace](https://code.claude
 
 Manage anytime with `/plugin`; pull updates with `/plugin marketplace update`. Add `--scope project` to the install to share it with everyone on a project.
 
+## What's new
+
+Every release is listed in [`CHANGELOG.md`](CHANGELOG.md), newest first, with the entries
+that need action from you marked **⚠ Action**. Read it after updating — additive features
+(new chains, new response fields, widened request shapes) are announced there and nowhere
+else.
+
 ## Versioning & staleness
 
 Each skill declares a `metadata.version`, and the API enforces it on an **opt-in**
@@ -60,6 +67,10 @@ basis: a skill that sends its version gets a deprecation warning while it's agin
 a hard stop (before any trade) once it's past sunset — without affecting generic,
 non-skill API clients. Full spec:
 [`docs/skill-version-compatibility.md`](docs/skill-version-compatibility.md).
+
+Note that `treasures-wallet` does **not** yet send its version, so it is treated as a
+generic client: never gated, but never warned either. For that skill the changelog is the
+only update signal.
 
 ## License
 
