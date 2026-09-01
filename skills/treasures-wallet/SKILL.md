@@ -8,7 +8,7 @@ description: >
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
 tags:
   - treasures
   - delegated-wallet
@@ -306,7 +306,7 @@ const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
 
 const SKILL_NAME = 'treasures-wallet';
-const SKILL_VERSION = '1.2.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.3.0'; // = SKILL.md metadata.version
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
   const res = await fetch(url, {

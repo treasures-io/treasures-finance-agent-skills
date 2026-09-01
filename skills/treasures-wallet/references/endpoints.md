@@ -183,7 +183,7 @@ See [`onboarding.md`](onboarding.md). Mint (`none`) · consent `GET /:requestId`
 | `GET API/wallets/:id/delegation/grant-spec` | per-chain inputs for client-side Privy grant | `{specs:[{chain,address,signerId,policyIds}]}` |
 | `POST API/wallets/:id/delegation/enable` | enable delegated trading (409 if not granted) | `{app_enabled,signers}` |
 | `POST API/wallets/:id/delegation/disable` | disable | `{app_enabled,signers}` |
-| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); over the per-tx / rolling-24h cap → `422 withdraw_cap_exceeded` with `cap: per_tx\|daily`; cap store unreachable → `503 withdraw_cap_unavailable` (retryable); unsupported asset/chain pairing → `422 unsupported_withdrawal` | unsigned tx |
+| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); no size cap — unsupported asset/chain pairing → `422 unsupported_withdrawal` | unsigned tx |
 
 Source of truth: `src/api/routes/api/v1/wallets.ts`, `src/api/routes/api/v1/onboarding-sessions.ts`,
 `src/api/routes/public/v1/{trades,portfolio}.ts`; mounts in `src/api/index.ts`.

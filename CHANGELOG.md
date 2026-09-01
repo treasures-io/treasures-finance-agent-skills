@@ -16,9 +16,19 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
-## Unreleased — b2b `1.10.0`, wallet `1.2.0`
+## Unreleased — b2b `1.10.0`, wallet `1.3.0`
 
-Published together. Folds in b2b `1.7.0`, `1.8.0` and `1.9.0`, which never shipped standalone.
+Published together. Folds in b2b `1.7.0`, `1.8.0` and `1.9.0`, and wallet `1.2.0`, none of which
+shipped standalone.
+
+### treasures-wallet `1.3.0` — withdrawals are no longer size-capped
+
+- `POST /wallets/:id/withdrawals` **no longer enforces a per-transaction or rolling-24h size cap.**
+  `422 withdraw_cap_exceeded` (with `cap: per_tx|daily`) and `503 withdraw_cap_unavailable` are gone
+  — if you branch on either, that code is now unreachable and can be removed.
+- `422 unsupported_withdrawal` remains, for an asset/chain pairing the wallet cannot withdraw.
+- Nothing else about the endpoint changes: it still returns an **unsigned** transaction for the owner
+  to sign client-side.
 
 ### treasures-wallet `1.2.0` — the sell contract, corrected
 
