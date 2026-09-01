@@ -33,6 +33,19 @@ Published together. Folds in b2b `1.7.0` and `1.8.0`, which never shipped standa
   no consent recorded; a present-but-mismatched token is rejected `422`.
 - **New warn reason `no_settlements`** — the venue quotes normally but no on-chain settlement has
   been observed for it. Advisory: it never hides or blocks a listing.
+- **⚠ Action — two fields that were published as non-nullable can now be `null`.** Both are on the
+  B2B surface and both were declared required and non-nullable in the `1.6.0` OpenAPI, so a client
+  that modelled them from the published spec was following our documentation. Guard both before
+  parsing:
+  - `tradfi_reference` on a quote response. An asset with no reference price to check against used
+    to be refused outright with `422 reference_unavailable`; it is now priced, returned on a `200`
+    with `tradfi_reference: null`, and disclosed as a `no_reference` entry in `warnings[]`. The
+    field is still published, so a client that models it does not break — but do not build a flow
+    around always receiving a value. `premium_vs_anchor_pct` is omitted when it is null.
+  - `market_cap_usd` on the tradfi block — a foreign line or a fund can quote without one rather
+    than dropping the whole block.
+
+  Neither field gates or prices a trade. Nothing else in this release loosens a published type.
 - **⚠ Action — ticker charset widened** to `^[A-Z0-9][A-Z0-9.]{0,9}$` so HKEX board codes (`700` =
   Tencent) parse. If you validate tickers client-side with a letter-leading pattern, widen it or you
   will reject valid symbols.
