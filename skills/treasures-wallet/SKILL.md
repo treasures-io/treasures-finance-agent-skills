@@ -8,7 +8,7 @@ description: >
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.0.1"
+  version: "1.1.0"
 tags:
   - treasures
   - delegated-wallet
@@ -162,10 +162,17 @@ examples: [`references/examples.md`](references/examples.md).
 ## Quote — `GET API/wallets/:id/quotes`
 
 Auth `X-API-Key` (scope `quote`). Query: `chain?`,`protocol?`,`side`,`asset`,(`notional_usdc` XOR
-`shares`),`slippage_bps` (≤ 500). Omit `chain`/`protocol` to auto-route (single best cell). 200 →
-`{chain,protocol,side,asset,max_amount_in,min_amount_out,route_type}` — **atomic strings** in the
-input/output asset; `chain`+`protocol` echo the **resolved** cell. Advisory only — the trade re-quotes
-route-first at submit.
+`shares`),`slippage_bps` (≤ 500). Omit `chain`/`protocol` to auto-route (single best cell). 200 on a
+**buy** → `{chain,protocol,side,asset,max_amount_in,min_amount_out,route_type}` — **atomic strings**
+in the input/output asset; `chain`+`protocol` echo the **resolved** cell. 200 on a **sell** →
+`{side,asset,route_type,legs:[{chain,protocol,shares_consumed,max_amount_in,min_amount_out}]}` — one
+entry per cell the sell draws from. Advisory only — the trade re-quotes route-first at submit.
+
+**Check `tradability`/`warn_reason` before submitting.** A buy carries them (plus `thin_since`) at the
+top level for the resolved cell; a sell carries them on each `legs[]` entry, side-neutral reasons only.
+A cell can price normally and still be warned (`settlement_failure` = quotes fine, settles never). Absent
+means unmeasured or unwarned — never `null`. Per-reason action table in
+[`references/endpoints.md`](references/endpoints.md#tradability).
 
 ## Buy — `POST API/wallets/:id/trades`
 
@@ -233,7 +240,9 @@ greedy algorithm:
   agent's executed trades (carry `side`/`tx_hash`/`usdc_amount`); `external` rows are on-chain transfers
   Treasures didn't execute.
 - **Portfolio (P&L)** — `GET READS/portfolio?sol_wallet=&eth_wallet=&source=` → positions + `usd_value`;
-  `source=internal` adds `shares_internal_only`, `avg_entry_price_per_share`, `unrealized_pnl`.
+  `source=internal` adds `shares_internal_only`, `avg_entry_price_per_share`, `unrealized_pnl`. A
+  position may also carry `tradability`/`warn_reason`/`thin_since` for its own cell — side-neutral
+  reasons only (`low_volume`, `no_price_feed`, `no_settlements`); it never marks a holding unsellable.
 
 ## Onboarding & API keys (summary — detail in references)
 
@@ -269,6 +278,12 @@ greedy algorithm:
 6. **Gas / funding:** Solana needs SOL (fees + one-time Token-2022 ATA rent per new asset); the first
    Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the fill itself is
    gasless). Surface `needs_funding` from `/balances`.
+7. **Read the preview's `tradability`/`warn_reason` before every trade.** They are advisory — a warned
+   cell still quotes and still executes — so the agent decides: pin another `chain`+`protocol` on
+   `settlement_failure`/`no_fill_window`/`no_settlements`, skip the asset on `no_price_feed`, keep sizes
+   small on `low_volume`. `warn_reason` is an open vocabulary — treat an unlisted value as "warned,
+   reason unknown" rather than an error. Table in
+   [`references/endpoints.md`](references/endpoints.md#tradability).
 
 ## Reusable helpers (TypeScript; adapt to your runtime — `big.js` for decimals)
 

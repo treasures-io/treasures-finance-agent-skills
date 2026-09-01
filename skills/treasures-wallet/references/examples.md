@@ -22,6 +22,8 @@ curl -s "$API/wallets/$WID/delegation" # → { app_enabled, signers }
 # auto-route $10 NVDA buy → resolves to the single best cell (here solana/ondo)
 curl -s "$API/wallets/$WID/quotes?side=buy&asset=NVDA&notional_usdc=10&slippage_bps=100" -H "x-api-key: $KEY"
 # → {"chain":"solana","protocol":"ondo","side":"buy","asset":"NVDA","max_amount_in":"10000000","min_amount_out":"47382065","route_type":"dex_aggregator"}
+#   a warned cell also carries "tradability":"thin"|"untradable", "warn_reason":"…", "thin_since":"…" —
+#   advisory, absent when unwarned; act per endpoints.md#tradability before trading
 
 # pinned cell, sell quote
 curl -s "$API/wallets/$WID/quotes?chain=ethereum&protocol=xstocks&side=sell&asset=NVDA&shares=0.047&slippage_bps=100" -H "x-api-key: $KEY"
