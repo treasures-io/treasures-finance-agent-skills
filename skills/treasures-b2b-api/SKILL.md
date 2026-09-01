@@ -2,7 +2,7 @@
 name: treasures-b2b-api
 description: Use to build an AI agent on the Treasures public B2B API — discover tokenized stocks, quote/execute trades on Solana, Ethereum, Robinhood Chain and Base, bridge USDC across Solana and Ethereum, and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling.
 metadata:
-  version: "1.9.0"
+  version: "1.10.0"
 tags:
   - treasures
   - b2b-api
@@ -22,7 +22,7 @@ Guide for AI agents (and any non-human caller) using the Treasures public B2B AP
 
 - **Base URL:** `https://api.treasures.io/public/v1`
 - **Network:** trades execute against **Ethereum mainnet + Solana mainnet-beta — real funds, not a testnet**, plus two more venues: **Robinhood Chain (4663)** — now co-ranked in unpinned quotes, not just pinned — and **Base (8453)**. Point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
-- **Required headers:** set `Content-Type: application/json` on every request carrying a body — a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.9.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions — plus `Deprecation`/`Sunset` warning headers during the grace window — instead of a silent break. Omitting the version header opts out of that early warning.
+- **Required headers:** set `Content-Type: application/json` on every request carrying a body — a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.10.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions — plus `Deprecation`/`Sunset` warning headers during the grace window — instead of a silent break. Omitting the version header opts out of that early warning.
 - **Wire format:** all token amounts, USDC, shares, prices, and bps-derived decimals are **strings** (avoid JS float drift). Integer fields (`expires_at`, `*_bps`, `quote_index`) are JSON numbers. Never round-trip a money value through JS `number`.
 
 This entry doc is the map + the footguns. **It is not enough on its own to execute a trade** — full schemas, signing code, and error tables live in the references below. **Load the reference for the task before you act; you don't need to read them all.**
@@ -141,7 +141,8 @@ Sending your skill version opts you into a version gate: deprecation warnings wh
 ages, then a hard stop once stale. Route **every** call through one helper that attaches it:
 
 ```ts
-const SKILL_VERSION = '1.9.0'; // = SKILL.md metadata.version
+const SKILL_NAME = 'treasures-b2b-api';
+const SKILL_VERSION = '1.10.0'; // = SKILL.md metadata.version
 
 // Route EVERY Treasures API call through this — don't call fetch() directly. It attaches the
 // skill version and applies the gate to every response: 426 hard-stops, deprecation warns.
@@ -150,7 +151,7 @@ async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> 
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      'X-Treasures-Skill': 'treasures-b2b-api',
+      'X-Treasures-Skill': SKILL_NAME,
       'X-Treasures-Skill-Version': SKILL_VERSION,
       ...init.headers,
     },
@@ -162,13 +163,41 @@ async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> 
   const sunset = res.headers.get('Sunset'), warning = res.headers.get('Warning');   // non-blocking — aging skill (finish, then warn user)
   if (res.headers.get('Deprecation') || sunset || warning)
     console.warn(`skill deprecated — sunset ${sunset ?? '?'}; update: ${res.headers.get('Link') ?? 'see SKILL.md'}${warning ? ` — ${warning}` : ''}`);
+  notifyIfNewer(res);                                       // informational — an update exists
   return res;
+}
+
+// `X-Treasures-Skill-Latest: treasures-b2b-api=<ver>; treasures-wallet=<ver>` rides every quote,
+// trade and bridge response, whether or not you send a skill header. News, not policy: nothing here
+// may block, retry or change a trade decision. Warn once.
+let updateNotified = false;
+function notifyIfNewer(res: Response): void {
+  if (updateNotified) return;
+  const header = res.headers.get('X-Treasures-Skill-Latest');
+  const latest = header?.split(';')
+    .map((pair) => pair.trim().split('='))
+    .find(([skill]) => skill === SKILL_NAME)?.[1];
+  if (!latest || latest === SKILL_VERSION) return;
+  updateNotified = true;
+  console.warn(
+    `A newer ${SKILL_NAME} skill is available (${latest}; you have ${SKILL_VERSION}). ` +
+    `What's new: https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/CHANGELOG.md`
+  );
 }
 ```
 
+- **`X-Treasures-Skill-Latest` response header → informational, never blocking.** Present on every
+  quote / trade / bridge response including the `426`, listing the published version of each skill
+  (`treasures-b2b-api=<ver>; treasures-wallet=<ver>`). If it names a version above your
+  `SKILL_VERSION`, an update exists — tell the user once and point them at the
+  [CHANGELOG](https://github.com/treasures-io/treasures-finance-agent-skills/blob/main/CHANGELOG.md).
+  It is **not** a deprecation: nothing has stopped working, and you must not retry, block or alter
+  a trade because of it. Releases are additive, so an older skill keeps working — but new chains,
+  new response fields and widened request shapes are announced here and in the changelog only.
 - **`Deprecation` / `Sunset` / `Warning` response headers → non-blocking.** Finish the
   current operation, then tell the user this skill is deprecated, the `Sunset` date,
-  and to update (use the `Link` URL).
+  and to update (use the `Link` URL). A `Sunset` may be absent while no window is open — the
+  deprecation still stands, it just has no published deadline yet.
 - **`426 skill_version_unsupported` → blocking.** The server fails closed **before**
   any fund move. Do **not** submit or retry — surface the response's `upgrade` command
   and stop.

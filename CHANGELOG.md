@@ -16,9 +16,42 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
-## Unreleased — b2b `1.9.0`, wallet `1.1.0`
+## Unreleased — b2b `1.10.0`, wallet `1.2.0`
 
-Published together. Folds in b2b `1.7.0` and `1.8.0`, which never shipped standalone.
+Published together. Folds in b2b `1.7.0`, `1.8.0` and `1.9.0`, which never shipped standalone.
+
+### treasures-wallet `1.2.0` — the sell contract, corrected
+
+- **⚠ Action — a sell returns N legs, not one job. If you built a sell flow from `1.0.1` or `1.1.0`,
+  it is mis-parsing every sell.** Those releases said the server "does NOT split" a sell, told you to
+  reproduce a greedy split client-side, and documented `job_id` at the top level of the `202`. That
+  stopped being true on 2026-07-18. The server has since planned and executed the split itself:
+
+  ```json
+  { "order_status": "pending",
+    "legs": [ { "job_id": "job_s0", "chain": "sol", "protocol": "ondo",     ... },
+              { "job_id": "job_s1", "chain": "eth", "protocol": "xstocks", ... } ] }
+  ```
+
+  Read `job_id` from each `legs[]` entry and poll them all — legs settle at different speeds, so the
+  order is not done when the first one lands. A **buy** keeps the flat top-level shape; branch on the
+  `side` you sent, not on inspecting the body. `order_status` is `pending` while any leg is
+  non-terminal, else `confirmed` / `partially_filled` / `failed`, and it is a submit-time snapshot —
+  re-derive it from the polled legs. `partially_filled` is a real outcome, not an error.
+- **Delete the client-side greedy-split helper.** One `POST /trades` with one `Idempotency-Key`
+  replaces it. Pinning `chain`+`protocol` still narrows to a single venue and still `422`s
+  `quote_unavailable` if that cell holds less than the requested size.
+- **The skill now sends `X-Treasures-Skill` / `X-Treasures-Skill-Version`,** so wallet agents enrol
+  in the version gate for the first time — deprecation warnings while the skill ages, and a clean
+  `426` with upgrade instructions instead of a silent break. Nothing is gated today.
+
+### treasures-b2b-api `1.10.0` — update notifications
+
+- Reads the new **`X-Treasures-Skill-Latest`** response header and tells you once when a newer skill
+  exists, pointing here. Informational only: it never blocks, retries, or changes a trade decision.
+  Both skills read it, and the wallet skill does so without needing to enrol in the gate.
+- `Sunset` may now be **absent** on a deprecation. The deprecation still stands; it simply has no
+  published deadline yet. `Link` always carries the upgrade pointer, so follow that regardless.
 
 ### treasures-b2b-api `1.9.0` — foreign listings, exchange axis, two-tier quote guardrail
 

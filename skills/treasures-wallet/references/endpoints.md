@@ -130,7 +130,14 @@ agent decides, by reason:
 ### `POST API/wallets/:id/trades` — auth `key:trade` (or `owner`)
 Headers: `Idempotency-Key` (required → 400 `missing_idempotency_key`; base64url/UUID charset `[A-Za-z0-9_-]`, ≤ 128 chars → 400 `invalid_idempotency_key`), `Content-Type: application/json`.
 Body (`.strict`): `{ chain?, protocol?, side, asset, size:{notional_usdc}|{shares}, slippage_bps }`.
-→ **202** job (see job shape). Route-first: no-route/cap/unwhitelisted are **sync 4xx** (no job).
+→ **202**. A **buy** returns one flat job (see job shape), `job_id` at the top level. A **sell**
+returns a group — `{ order_status, legs:[ job… ] }` — because the server splits it across every venue
+the wallet holds; `job_id` is on each `legs[]` entry, and you poll them all. `order_status` is
+`pending` while any leg is non-terminal, else `confirmed` / `partially_filled` / `failed`; it is a
+submit-time snapshot, so re-derive it from the polled legs. A **pinned** sell (`chain`+`protocol`)
+returns the same group shape with one entry, and 422s `quote_unavailable` if the pinned cell holds
+less than the requested size. One `Idempotency-Key` covers the whole order, legs included.
+Route-first: no-route/cap/unwhitelisted are **sync 4xx** (no job).
 Body also accepts an **optional** `acknowledged_warnings` (the preview's `warnings_ack_token`) — see
 [`warnings[]` on the preview](#warnings). Errors: 400, 401, 403 `key_cap_exceeded`/`policy_denied`, 404,
 422 (incl. `warnings_not_acknowledged` when a token you sent matches nothing this quote disclosed), 503.
@@ -176,7 +183,7 @@ See [`onboarding.md`](onboarding.md). Mint (`none`) · consent `GET /:requestId`
 | `GET API/wallets/:id/delegation/grant-spec` | per-chain inputs for client-side Privy grant | `{specs:[{chain,address,signerId,policyIds}]}` |
 | `POST API/wallets/:id/delegation/enable` | enable delegated trading (409 if not granted) | `{app_enabled,signers}` |
 | `POST API/wallets/:id/delegation/disable` | disable | `{app_enabled,signers}` |
-| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); over the per-tx / rolling-24h cap → `422 withdraw_cap_exceeded` with `cap: per_tx\|daily` | unsigned tx |
+| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); over the per-tx / rolling-24h cap → `422 withdraw_cap_exceeded` with `cap: per_tx\|daily`; cap store unreachable → `503 withdraw_cap_unavailable` (retryable); unsupported asset/chain pairing → `422 unsupported_withdrawal` | unsigned tx |
 
 Source of truth: `src/api/routes/api/v1/wallets.ts`, `src/api/routes/api/v1/onboarding-sessions.ts`,
 `src/api/routes/public/v1/{trades,portfolio}.ts`; mounts in `src/api/index.ts`.

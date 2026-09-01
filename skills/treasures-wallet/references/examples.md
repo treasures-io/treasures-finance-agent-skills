@@ -41,24 +41,26 @@ curl -s "$API/wallets/$WID/trades/job_…" -H "x-api-key: $KEY"  # same trade ke
 # confirmed → {"state":"confirmed","result":{"amount_in":"…","amount_out":"…","tx_sig":"…"}}
 ```
 
-## Sell larger than one cell → 422, then client-side greedy split
+## Sell across cells → one call, N legs
 ```bash
-# Holdings spread across cells; 0.14 exceeds any single cell:
-curl -s "$API/wallets/$WID/quotes?side=sell&asset=NVDA&shares=0.14&slippage_bps=100" -H "x-api-key: $KEY"
-# → 422 {"error":"quote_unavailable"}   (server does NOT split — split client-side)
+# The server splits a sell across every venue the wallet holds. One POST, one Idempotency-Key.
+curl -s -X POST "$API/wallets/$WID/trades" -H "x-api-key: $KEY" \
+  -H "Idempotency-Key: $(uuidgen)" -H 'content-type: application/json' \
+  -d '{"side":"sell","asset":"NVDA","size":{"shares":"0.14"},"slippage_bps":100}'
+# → 202 {"order_status":"pending",
+#        "legs":[{"job_id":"job_…","chain":"sol","protocol":"ondo","state":"broadcast",...},
+#                {"job_id":"job_…","chain":"eth","protocol":"xstocks","state":"routing",...}]}
 
-# 1) quote each held cell → rank by net USDC/share (min_amount_out/shares) descending.
-#    Observed: sol·ondo $205.91 > eth·xstocks $197.94 > eth·ondo $192.31
-# 2) greedy-fill 0.14: leg1 sol·ondo 0.0956, leg2 eth·xstocks 0.0444
-# 3) execute sequentially (fresh Idempotency-Key each), confirm before next leg:
-for cell in "solana ondo 0.0956" "ethereum xstocks 0.0444"; do
-  set -- $cell
-  curl -s -X POST "$API/wallets/$WID/trades" -H "x-api-key: $KEY" \
-    -H "Idempotency-Key: $(uuidgen)" -H 'content-type: application/json' \
-    -d "{\"chain\":\"$1\",\"protocol\":\"$2\",\"side\":\"sell\",\"asset\":\"NVDA\",\"size\":{\"shares\":\"$3\"},\"slippage_bps\":100}"
-  # poll each job_id to confirmed before the next leg
-done
-# Result this session: 0.14 sold for ~$28.86 (sol ~2s, eth ~27s), 2 internal rows written.
+# Poll EVERY leg — job_id is per leg, and legs settle at different speeds (sol ~2s, eth ~20-40s).
+curl -s "$API/wallets/$WID/trades/job_…" -H "x-api-key: $KEY"
+# Sum result.amount_out over the confirmed legs for what you received. Some legs confirmed and
+# some failed is `partially_filled` — a real outcome, not an error.
+
+# Pinning narrows to ONE venue; same {order_status, legs} shape, one entry. Larger than that cell
+# holds → 422 quote_unavailable.
+curl -s -X POST "$API/wallets/$WID/trades" -H "x-api-key: $KEY" \
+  -H "Idempotency-Key: $(uuidgen)" -H 'content-type: application/json' \
+  -d '{"chain":"solana","protocol":"ondo","side":"sell","asset":"NVDA","size":{"shares":"0.09"},"slippage_bps":100}'
 ```
 
 ## Reads (no key)
