@@ -158,6 +158,84 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/StockDetailResponse" }
+              examples:
+                aapl:
+                  summary: US large-cap during the regular session
+                  description: >-
+                    Illustrative values. `exchange`, `exchange_country` and `data_delay` are present
+                    because the venue resolved; `display_ticker` is absent because a US row's bare
+                    `ticker` is already the display form. `extended_hours` is null during the regular
+                    session.
+                  value:
+                    ticker: AAPL
+                    name: Apple Inc.
+                    description: Apple designs, manufactures and markets smartphones, personal computers, tablets, wearables and accessories, and sells related services.
+                    sector: Technology
+                    industry: Consumer Electronics
+                    website: https://www.apple.com
+                    logo_url: https://assets.treasures.io/logos/AAPL.png
+                    available_chains: [sol, eth, robinhood, base]
+                    exchange: NASDAQ
+                    exchange_country: US
+                    data_delay: realtime
+                    listings:
+                      - protocol: ondo
+                        chain: sol
+                        address: 9wJ6gxvqYc6P3kHhTTMVSaMxfsBGBN47f3T8kdgWvB2d
+                        share_multiplier: "1"
+                        token_ticker: AAPLon
+                        min_trade_size_usd: 21
+                      - protocol: xstocks
+                        chain: eth
+                        address: "0x9d275685dc284c8eb1c79f6aba7a63dc75ec890a"
+                        share_multiplier: "1"
+                        token_ticker: AAPLx
+                      - protocol: robinhood
+                        chain: robinhood
+                        address: "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9"
+                        share_multiplier: "1"
+                        token_ticker: AAPL
+                      - protocol: coinbase
+                        chain: base
+                        address: "0xb200000000000000000000c2e324d24d7eecd1fb"
+                        share_multiplier: "1"
+                        token_ticker: AAPL
+                    tradfi:
+                      current_price_usd: "227.63"
+                      currency: USD
+                      price_native: "227.63"
+                      change_24h_pct: "1.12"
+                      market_cap_usd: "3461000000000"
+                      pe_ttm: "34.6"
+                      volume_shares: "48213000"
+                      volume_1d_usd: "10974000000"
+                      as_of: 1789056000
+                    extended_hours: null
+                    market_session: regular
+                    is_holiday: false
+                    holiday_name: null
+                    analyst:
+                      rating: Buy
+                      target_price_usd: "250.00"
+                    analyst_grades:
+                      - firm: Morgan Stanley
+                        grade: Overweight
+                        action: buy
+                        date: "2026-09-08"
+                      - firm: Barclays
+                        grade: Equal Weight
+                        action: hold
+                        date: "2026-09-02"
+                    earnings:
+                      next_date: "2026-10-30"
+                      eps_estimate: "1.62"
+                    news:
+                      - title: Apple unveils new iPhone lineup
+                        url: https://example.com/apple-iphone
+                        publisher: Reuters
+                        published_at: "2026-09-09T17:05:00Z"
+                        type: news
+                        snippet: Apple introduced its next iPhone generation at its annual September event.
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { description: Missing or invalid integrator key }
         "403": { description: Reporting key presented (insufficient_scope) }
@@ -182,6 +260,54 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/QuoteBuyRequest"
+            examples:
+              default_routing:
+                summary: Auto-route across every chain the ticker lists
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  max_slippage_bps: 100
+                  sol_wallet: 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCTFNP
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    sol_signature: 3sJ7...(base58 signature over the challenge)
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
+              speed_transaction:
+                summary: Speed route on base, wallet pays gas (`execution` omitted = `"transaction"`)
+                description: >-
+                  Returns one or two complete unsigned transactions (`evm_eip1559_tx` on base,
+                  `evm_legacy_tx` on robinhood) to sign whole and return as `evm_signed_tx`. The
+                  wallet needs native ETH on that chain. See the `speed_transaction_pair` response
+                  example.
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  chain: base
+                  priority: speed
+                  max_slippage_bps: 100
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
+              speed_user_operation:
+                summary: Speed route on base, your paymaster pays gas (`execution:"user_operation"`)
+                description: >-
+                  Returns one `evm_calls` payload to pack into a sponsored ERC-4337 v0.7
+                  UserOperation from an EIP-7702-delegated Modular Account v2 wallet and return as
+                  `evm_user_operation`. Requires `priority:"speed"`. See the `speed_user_operation`
+                  response example.
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  chain: base
+                  priority: speed
+                  execution: user_operation
+                  max_slippage_bps: 100
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
       responses:
         "200":
           description: OK
@@ -189,6 +315,114 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/QuoteBuyResponse"
+              examples:
+                speed_transaction_pair:
+                  summary: "`priority:\"speed\"` on base — wallet not yet approved, so `approve` then `swap`"
+                  description: >-
+                    `tx_hex` / `tx_base64` are truncated here; each is a complete unsigned
+                    transaction with nonce, gas and fees already set. Sign both bytes-as-is and
+                    return one `evm_signed_tx` per payload, in this order. An already-approved wallet
+                    gets the `swap` payload only. `gasless:false` and `estimated_gas_usd` are the
+                    caller's own gas.
+                  value:
+                    quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                    side: buy
+                    ticker: AAPL
+                    expires_at: 1789056042
+                    tradfi_reference:
+                      price_usd: "227.63"
+                      market_status: open
+                      as_of: 1789055995
+                    quotes:
+                      - quote_index: 0
+                        chain: base
+                        protocol: coinbase
+                        price_usdc_per_share: "228.11"
+                        estimated_output_shares: "0.438385"
+                        estimated_output_tokens: "0.438385"
+                        base_asset: usdc
+                        amount_base: "100"
+                        cost_breakdown_bps:
+                          treasures_fee_bps: 10
+                          dex_swap_fee_bps: 5
+                          estimated_slippage_bps: 0
+                          price_impact_bps: 0
+                          slippage_vs_tradfi_bps: 21
+                        gasless: false
+                        estimated_gas_usd: "0.0031"
+                        signable_payloads:
+                          - type: evm_eip1559_tx
+                            role: approve
+                            from: "0x1111111111111111111111111111111111111111"
+                            tx_hex: "0x02f8b2822105"
+                            tx_base64: AvisgiEF
+                            approval_spender: null
+                            chain_id: 8453
+                            nonce: 41
+                            gas: "58000"
+                            max_fee_per_gas: "12000000"
+                            max_priority_fee_per_gas: "1000000"
+                          - type: evm_eip1559_tx
+                            role: swap
+                            from: "0x1111111111111111111111111111111111111111"
+                            tx_hex: "0x02f9024c822105"
+                            tx_base64: AvkCTIIhBQ
+                            approval_spender: "0x111111125421cA6dc452d289314280a0f8842A65"
+                            chain_id: 8453
+                            nonce: 42
+                            gas: "310000"
+                            max_fee_per_gas: "12000000"
+                            max_priority_fee_per_gas: "1000000"
+                    warnings: []
+                speed_user_operation:
+                  summary: "`priority:\"speed\"` + `execution:\"user_operation\"` on base — one `evm_calls` payload"
+                  description: >-
+                    `calls[].data` is truncated here. Pack the calls, in order, into ONE ERC-4337 v0.7
+                    UserOperation from `sender` (`execute` for one call, `executeBatch` for two),
+                    sponsor it with your paymaster, sign, and return it as `evm_user_operation`.
+                    The leg is `gasless:true` with `estimated_gas_usd:"0"` because the paymaster pays.
+                  value:
+                    quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                    side: buy
+                    ticker: AAPL
+                    expires_at: 1789056042
+                    tradfi_reference:
+                      price_usd: "227.63"
+                      market_status: open
+                      as_of: 1789055995
+                    quotes:
+                      - quote_index: 0
+                        chain: base
+                        protocol: coinbase
+                        price_usdc_per_share: "228.11"
+                        estimated_output_shares: "0.438385"
+                        estimated_output_tokens: "0.438385"
+                        base_asset: usdc
+                        amount_base: "100"
+                        cost_breakdown_bps:
+                          treasures_fee_bps: 10
+                          dex_swap_fee_bps: 5
+                          estimated_slippage_bps: 0
+                          price_impact_bps: 0
+                          slippage_vs_tradfi_bps: 21
+                        gasless: true
+                        estimated_gas_usd: "0"
+                        signable_payloads:
+                          - type: evm_calls
+                            chain_id: 8453
+                            sender: "0x1111111111111111111111111111111111111111"
+                            entry_point: "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+                            approval_spender: "0x111111125421cA6dc452d289314280a0f8842A65"
+                            calls:
+                              - role: approve
+                                to: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+                                data: "0x095ea7b3000000000000000000000000111111125421ca6dc452d289314280a0f8842a65ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                                value: "0"
+                              - role: swap
+                                to: "0x111111125421cA6dc452d289314280a0f8842A65"
+                                data: "0x07ed2379"
+                                value: "0"
+                    warnings: []
         "400":
           description: >-
             Invalid request body, slippage out of range, unknown ticker, zero amount, or (pinned
@@ -431,6 +665,51 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/TradeSubmitRequest"
+            examples:
+              speed_signed_pair:
+                summary: Speed-route leg (`execution:"transaction"`) — both transactions signed whole
+                description: >-
+                  One `evm_signed_tx` per `SignableEvmTx` payload the quote issued, in the order
+                  issued (`approve` at nonce n, `swap` at n+1). Sign each `tx_hex` unchanged —
+                  never re-nonce, re-estimate or re-serialize — and do not broadcast; Treasures
+                  does. `signed_tx_hex` is truncated here.
+                value:
+                  quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                  signed:
+                    - quote_index: 0
+                      signed_payloads:
+                        - type: evm_signed_tx
+                          signed_tx_hex: "0x02f8f5822105"
+                        - type: evm_signed_tx
+                          signed_tx_hex: "0x02f9028f822105"
+              user_operation:
+                summary: Speed-route leg (`execution:"user_operation"`) — one sponsored, signed UserOperation
+                description: >-
+                  The v0.7 UserOperation you built from the quote's `evm_calls` payload, sponsored by
+                  your paymaster and signed by the delegated wallet. Do not send it to a bundler
+                  yourself; Treasures simulates, submits and returns `user_op_hash`. `callData`,
+                  `paymasterData` and `signature` are truncated here. Numerics may be decimal or
+                  0x-hex strings.
+                value:
+                  quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                  signed:
+                    - quote_index: 0
+                      signed_payloads:
+                        - type: evm_user_operation
+                          user_operation:
+                            sender: "0x1111111111111111111111111111111111111111"
+                            nonce: "0x1a"
+                            callData: "0x34fcd5be"
+                            callGasLimit: "0x5b8d8"
+                            verificationGasLimit: "0x1d4c0"
+                            preVerificationGas: "0x11170"
+                            maxFeePerGas: "0xb71b00"
+                            maxPriorityFeePerGas: "0xf4240"
+                            paymaster: "0x2cc0c7981D846b9F2a16276556f6e8cb52BfB633"
+                            paymasterVerificationGasLimit: "0x186a0"
+                            paymasterPostOpGasLimit: "0xc350"
+                            paymasterData: "0x000000000000"
+                            signature: "0xff0000"
       responses:
         "200":
           description: |
@@ -441,6 +720,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TradeSubmitResponse"
+              examples:
+                speed_broadcast:
+                  summary: Speed-route leg accepted — `tx_hash` is the swap's from the start
+                  description: >-
+                    On a pair the swap hash is known immediately (it is `keccak256` of the signed
+                    swap) but appears on chain only after the bundled `approve` mines. Poll
+                    `/quote/{quote_id}/status` until `completed`.
+                  value:
+                    results:
+                      - quote_index: 0
+                        trade_id: trd_9vLw2nRb5cYd8FhJ7Kp3mQxT
+                        status: broadcast
+                        tx_hash: "0x6d1c9d3b1f9a1c1c0f7e2d4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8"
+                        order_hash: null
+                        user_op_hash: null
+                        error_code: null
+                    failed_legs: []
+                user_operation_broadcast:
+                  summary: UserOperation accepted by the bundler — `user_op_hash` set, `tx_hash` still null
+                  description: >-
+                    `tx_hash` becomes the bundle transaction once mined; poll
+                    `/quote/{quote_id}/status`. A paymaster refusal would instead be
+                    `status: broadcast_failed` with `error_code: sponsorship_rejected`.
+                  value:
+                    results:
+                      - quote_index: 0
+                        trade_id: trd_9vLw2nRb5cYd8FhJ7Kp3mQxT
+                        status: broadcast
+                        tx_hash: null
+                        order_hash: null
+                        user_op_hash: "0x2b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfe"
+                        error_code: null
+                    failed_legs: []
         "400":
           description: Malformed body, incomplete submit, or `quote_index` not in snapshot.
           content:
