@@ -4,7 +4,7 @@ Load when building the `ownership_proof` for `/quote/buy`, `/quote/sell`, or `/b
 
 ## When required & wallet rules
 
-Required on `POST /quote/buy`, `POST /quote/sell`, `POST /bridge/quote` (bridge needs **both** signatures). Everything else is unauthenticated. `/trade/submit` is gated by the per-leg signed payload itself — a strictly stronger proof than `ownership_proof`.
+Required on `POST /quote/buy`, `POST /quote/sell`, `POST /bridge/quote` (bridge needs **both** signatures). A different credential, your integrator key in `X-API-Key`, is required on `GET /settlements`, `POST /quote/preview` and `GET /stocks/{ticker}` — never an `ownership_proof`. Everything else is unauthenticated. `/trade/submit` is gated by the per-leg signed payload itself — a strictly stronger proof than `ownership_proof`.
 
 At least one of `sol_wallet` / `eth_wallet` is required on `/quote/*`; `/bridge/quote` requires both. Each wallet you send must have a matching signature, verified cryptographically (Ed25519 for Solana, secp256k1 EIP-191 recovery for Ethereum).
 

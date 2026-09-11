@@ -1,6 +1,6 @@
 # Data — discovery, portfolio, trades
 
-Load when reading `/stocks/*`, `/portfolio`, or `/trades`. All four are unauthenticated public reads (no `ownership_proof`).
+Load when reading `/stocks/*`, `/portfolio`, or `/trades`. None of them takes an `ownership_proof`. All are unauthenticated public reads **except** `GET /stocks/{ticker}` and `GET /settlements`, which require your integrator key (`X-API-Key`).
 
 ## `GET /stocks/tickers`
 
@@ -96,6 +96,53 @@ Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. 
 - **`anchor_source`** — `"tradfi_live"` (the regular-session print), `"tradfi_extended"` (the aftermarket print while it is still printing) or `"tradfi_frozen"` (the frozen regular-session close). Never the on-chain mark: the premium measures an on-chain price, so anchoring it there would measure that price against itself.
 - **`premium_vs_tradfi_pct` is deprecated** — it is measured against `tradfi.current_price_usd`, which freezes at the regular-session close, so it overstates the premium overnight and at weekends. Read `premium_vs_anchor_pct` instead, which names the reference it used.
 
+## `GET /stocks/{ticker}`
+
+Everything the catalog knows about one ticker, in one call — the route behind a company page. **Requires your integrator key**: send `X-API-Key: tik_…`. No key is `401 invalid_api_key`; a read-only `trk_` reporting key is `403 insufficient_scope` (it reaches the reporting routes and nothing else). Unknown or delisted ticker → `404`. Cached 60s server-side; the path segment is uppercased for you.
+
+```jsonc
+{
+  "ticker": "AAPL",
+  "name": "Apple Inc.",
+  "description": "Apple Inc. designs, manufactures and markets smartphones…",
+  "sector": "Technology",
+  "industry": "Consumer Electronics",
+  "website": "https://www.apple.com",
+  "logo_url": "https://…/AAPL.png",   // null until a logo has been mirrored for this ticker
+  "available_chains": ["sol", "eth", "robinhood", "base"],
+  "exchange": "NASDAQ",               // absent (never null) when unresolved; with it, exchange_country + data_delay
+  "exchange_country": "US",
+  "data_delay": "realtime",           // or "delayed_15m" — absent does NOT mean realtime
+  // "display_ticker": "0700.HK",     // absent for a US row; render `display_ticker ?? ticker`
+  "listings": [
+    { "protocol": "ondo", "chain": "sol", "address": "…", "share_multiplier": "0.4818", "token_ticker": "AAPLon" },
+    { "protocol": "xstocks", "chain": "eth", "address": "0x…", "share_multiplier": "1", "token_ticker": "AAPLx",
+      "min_trade_size_usd": 25, "tradability": "thin", "warn_reason": "low_volume", "thin_since": "2026-08-21T02:11:04.000Z" }
+  ],
+  "tradfi": { "current_price_usd": "228.14", "currency": "USD", "price_native": "228.14",
+              "change_24h_pct": "0.61", "market_cap_usd": "3471000000000", "pe_ttm": "34.9",
+              "volume_shares": "41200311", "volume_1d_usd": "9401000000", "as_of": 1779220801 },
+  "extended_hours": { "price_usd": "228.90", "change_usd": "0.76", "change_pct": "0.333",
+                      "session": "post", "as_of": 1779238800 },
+  "market_session": "post",           // regular | pre | post | closed
+  "is_holiday": false,
+  "holiday_name": null,
+  "analyst": { "rating": "Buy", "target_price_usd": "252.00" },
+  "analyst_grades": [{ "firm": "Morgan Stanley", "grade": "Overweight", "action": "buy", "date": "2026-09-02" }],
+  "earnings": { "next_date": "2026-10-29", "eps_estimate": "1.61" },
+  "news": [{ "title": "…", "url": "https://…", "publisher": "Reuters", "published_at": "2026-09-05T13:02:11.000Z",
+             "type": "stock", "snippet": "…" }]   // no image field: the vendor image host is not published here
+}
+```
+
+- **Every block may be `null`, independently.** The blocks are assembled in parallel and each is fault-isolated, so `tradfi`, `extended_hours`, the `market_session`/`is_holiday`/`holiday_name` trio, `analyst`, `analyst_grades`, `earnings` and `news` degrade one at a time — any of them can be null purely because its fetch failed. **For `tradfi`, `extended_hours`, `analyst`, `analyst_grades` and `earnings`, null also means "there is no such value for this ticker right now"**: no analyst coverage, no report inside the 30-day horizon, no extended print (or a regular session, when the extended feed is deliberately withheld), no reference price. The response does not tell you which of the two it was, so do not render "unavailable" and "none" differently off these fields.
+- **`news` is the one block that separates the two.** `[]` means we hold no headlines for the ticker; `null` means the read failed. It is therefore the only block worth re-reading on an empty answer rather than caching the absence. Each item carries `title`, `url`, `publisher`, `published_at`, `type` and `snippet` — **no image field**: the story image is served from the news vendor's own host, which this plane does not publish.
+- **`listings[]` is per cell, and its `chain` is the quote vocabulary.** Each entry is one real `(protocol, chain, address)` deployment — forward `protocol` + `chain` straight to `/quote/buy` / `/quote/sell`. A combination the ticker does not list is simply absent from the array, so treat it as the authoritative "where can I trade this". The advisory `min_trade_size_usd` / `tradability` / `warn_reason` / `thin_since` fields ride each entry with the same rules as everywhere else (absent ≠ null; advisory, never a gate).
+- **No `onchain` block here.** This route is the profile + reference-price view. For per-protocol on-chain prices and premiums, call `GET /stocks/prices` (section above) — the two are meant to be used together.
+- **`logo_url` is ours to serve**, an absolute `https` URL you can hot-link or cache. `null` means no logo has been mirrored for this ticker yet.
+- **`extended_hours` is a sibling of `tradfi`, never a replacement.** `tradfi` stays anchored to the regular session; the extended print is null during `regular`, and it holds its last value overnight and at weekends — label staleness from its `as_of` rather than assuming it is live. `market_session` is global (US-equity, holiday/half-day aware), not per-ticker: overnight it reads `closed` while `extended_hours.session` still says `post`.
+- **`analyst_grades` is latest-per-firm**, most recent first, capped at 15 firms — not a full history. `earnings` names the nearest report inside a 30-day horizon and is `null` when none falls in it.
+
 ## `GET /portfolio?sol_wallet=...&eth_wallet=...&source=all|internal`
 
 Live reconciled USDC + tokenized-stock holdings for a wallet pair. Cached 30s per pair. Pass **either or both** wallets (single-wallet valid; neither → `400 invalid_request`). `source` (default `all`) is a **column toggle, not a row filter** — positions are always the on-chain holdings; `internal` additionally populates the three cost-basis columns below.
@@ -122,13 +169,13 @@ Live reconciled USDC + tokenized-stock holdings for a wallet pair. Cached 30s pe
 
 **`partial` — the row list itself may be short.** The nullable columns below cover a cell we *read* but couldn't *price*. `partial` covers the other case: a cell we couldn't read at all (an RPC blip on the sol/eth side, or on either single-cell venue — Robinhood Chain 4663 or Base 8453). Such a cell is **dropped** from `positions` rather than reported as a zero — an unreliable balance must never look like a real one — so on `partial: true` the list omits holdings the wallet may have and **any total you sum from `usd_value` undercounts**. It is otherwise a normal `200`: retry rather than treat it as authoritative, and don't overwrite a good cached view with a partial one. `partial` can be `true` with `is_cached: true` (the 30s snapshot captured the failure); a retry inside that window returns the same partial answer, so back off past it. Cash is **not** covered — `usdc`/`usdg` independently fall back to `"0"` on a failed read, which is why you should never treat their `"0"` as proof of an empty balance either.
 
-`shares`, `usd_per_token`, `usd_per_share`, `usd_value` are each independently nullable — a position with a price-feed outage still surfaces with `tokens` populated so you can hold the row and re-render USD next poll. **Default any null to "unknown", never "0".** Tokens acquired outside Treasures reconcile in on the next read and emit a synthetic `external` row in `/trades`. **Exception — neither single-cell venue has an external-row reconciler:** you must **submit** each Robinhood-chain and Base trade via `/trade/submit` for it to appear in `/trades` at all — it enters as `broadcast` and reaches `completed` via the same status poll / backfill as `eth` (see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base)). An **unsubmitted** trade on either venue never appears in `/trades` and carries no cost basis; whether its balance shows on `/portfolio` is governed by the per-venue position gate below.
+`shares`, `usd_per_token`, `usd_per_share`, `usd_value` are each independently nullable — a position with a price-feed outage still surfaces with `tokens` populated so you can hold the row and re-render USD next poll. **Default any null to "unknown", never "0".** Tokens acquired outside Treasures reconcile in on the next read and emit a synthetic `external` row in `/trades`. **Exception — neither single-cell venue has an external-row reconciler:** you must **submit** each Robinhood-chain and Base trade via `/trade/submit` for it to appear in `/trades` at all — it enters as `broadcast` and reaches `completed` via the same status poll / backfill as `eth` (see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base)). An **unsubmitted** trade on either venue never appears in `/trades` and carries no cost basis; its balance still shows on `/portfolio` like any held cell — provided you send your integrator key, or Treasures already knows this wallet on some chain — snapshotted for 30 s (below).
 
 **Positions can carry a tradability warning.** A position may include `tradability`, `warn_reason` and `thin_since` for its own `(ticker, protocol, chain)` cell — but only when the reason is **side-neutral** (`low_volume`, `no_price_feed` or `no_settlements`), since those bear on an exit as much as on an entry. A cell warned for a buy-sided reason (`no_fill_window`, `settlement_failure`), or one whose reason was never recorded, emits **nothing** here. `min_trade_size_usd` is never published on a position: it is a USD **buy** floor and this is an exit surface. Advisory as everywhere else — it never marks a holding unsellable. Field meanings: [Tradability warnings](#tradability-warnings).
 
 The three `source=internal` columns are derived from **completed internal trades only** (see [Internal-only P&L](#internal-only-pl) below). Caveat: because off-platform transfers are ignored by the basis, `shares_internal_only` can exceed the on-chain balance after you move tokens out — treat it as "shares bought via Treasures and not yet sold via Treasures", not a custody figure.
 
-**Single-cell venue rows (Robinhood Chain 4663 · Base 8453).** Both venues report on `/portfolio`, and they behave identically — a wallet holding Robinhood Stock Tokens or Coinbase B20 tokens surfaces extra positions with a **bare** `token_ticker` (no `on`/`x` suffix): `chain: "robinhood"`, `protocol: "robinhood"` and `chain: "base"`, `protocol: "coinbase"` respectively. Both read **live** from the caller's own EOA on that chain (keyed off `eth_wallet`) — the 30s reconciler cache and the `is_cached` flag cover only the sol/eth cells, so these rows are never stale (and cost an RPC read per request). An RPC blip on either chain omits that venue's rows rather than failing the response — flagged `partial: true` (above), so an omitted row stays distinguishable from a wallet that holds none.
+**Single-cell venue rows (Robinhood Chain 4663 · Base 8453).** Both venues report on `/portfolio`, and they behave identically — a wallet holding Robinhood Stock Tokens or Coinbase B20 tokens surfaces extra positions with a **bare** `token_ticker` (no `on`/`x` suffix): `chain: "robinhood"`, `protocol: "robinhood"` and `chain: "base"`, `protocol: "coinbase"` respectively. **Positions** read through their own 30s held-cells snapshot off the caller's own EOA on that chain (keyed off `eth_wallet`) — the 30s reconciler cache and the `is_cached` flag cover only the sol/eth cells, so this snapshot is independent of them — and that read happens for **any** `eth_wallet` when you send a valid `tik_` integrator key. **Send your integrator key on this call.** With a valid `tik_` key, positions are read for **any** `eth_wallet` you ask about. `X-API-Key` is OPTIONAL on `/portfolio`, so without it you are anonymous and only a wallet Treasures already knows returns positions — and your end-user wallets are not ones it knows until they have **traded** through us, so a wallet that merely holds (an airdrop, a transfer in) reads as empty. Send the key and that distinction disappears. For an ANONYMOUS caller the read only happens **for a wallet Treasures already knows on some chain**: an `eth_wallet` that is not in Treasures's own custody, is not a B2C wallet, and has no B2B ledger row anywhere gets an empty `positions` list for that venue with **no RPC and no snapshot access**, and is **not** flagged `partial`, since nothing was owed to an address with no record. **Idle cash is never gated this way** — it still reads live for an unknown wallet exactly as for a known one (below). For a known wallet, an RPC blip on either chain omits that venue's positions rather than failing the response — flagged `partial: true` (above), so an omitted row stays distinguishable from a wallet that holds none.
 
 Each venue's **idle cash** is read from the same EOA and reported alongside:
 
@@ -139,9 +186,9 @@ Each venue's **idle cash** is read from the same EOA and reported alongside:
 
 > ⚠️ **`usdc.base` is a different contract from mainnet USDC.** `usdc` carries `sol`, `eth` **and `base`**; treat the three as separate balances on separate chains, never as one pooled figure.
 
-A wallet holding only cash (no stock tokens yet) still shows it. Cash serves from a 30s snapshot that a settled trade invalidates, so a post-trade read reflects the new balance rather than waiting out the TTL; a failed read is never cached. `"0"` when there is no `eth_wallet`, the venue lists no cells, or the chain read fails — a failed cash read is **not** flagged `partial`, because `"0"` is indistinguishable from a real zero.
+A wallet holding only cash (no stock tokens yet) still shows it — **cash reads live regardless of whether the wallet is otherwise known to Treasures**. Cash serves from a 30s snapshot that a settled trade invalidates, so a post-trade read reflects the new balance rather than waiting out the TTL; a failed read is never cached. `"0"` when there is no `eth_wallet`, the venue lists no cells, or the chain read fails — a failed cash read is **not** flagged `partial`, because `"0"` is indistinguishable from a real zero.
 
-> ⚠️ **Positions on these two venues are gated on your trade history — cash is not.** We read a venue's positions only for a wallet we already hold a ledger row for **on that venue** (a trade made through this API and reported via `/trade/submit`). Neither venue writes to the reconciler ledger, so the read costs a live round-trip every request and is skipped for wallets that have never touched the venue. The gate is per **(wallet, venue)**: trading on 4663 does not open the Base read, and vice versa. Consequence — tokens you moved in by **direct transfer**, or a trade you **never submitted**, are absent from `positions`, and because nothing was read the response is **not** flagged `partial`. Submit your trades on both venues to keep positions complete, or value those holdings from your own RPC.
+> Positions on both venues are read for **any** wallet when you send your integrator key, and otherwise for every wallet Treasures knows on any chain (snapshotted for 30 s and invalidated when a trade settles) — a token transferred into your wallet from outside shows exactly like one bought here. To an ANONYMOUS caller, an `eth_wallet` Treasures has never seen gets an empty `positions` list here and is not flagged `partial`, so it is indistinguishable from a wallet holding nothing — **send `X-API-Key` and that case disappears.** Idle cash on these venues always reads live, unaffected by either check.
 
 Two caveats specific to the position cells:
 

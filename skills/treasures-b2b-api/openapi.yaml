@@ -15,13 +15,16 @@ info:
     **Auth.** Only `POST /quote/buy`, `POST /quote/sell` and `POST /bridge/quote`
     require `ownership_proof` (wallet-key signature over a canonical challenge —
     see `OwnershipProof`). `POST /trade/submit` is gated by the per-leg signed
-    payload itself. `GET /settlements` **requires** an integrator API key in
-    `X-API-Key` (see `IntegratorApiKey`); every other route may be called
-    anonymously.
+    payload itself. Three routes **require** an integrator API key in `X-API-Key`
+    (see `IntegratorApiKey`) — `GET /settlements`, `POST /quote/preview` (which binds
+    no wallet, so the key is what identifies the caller) and `GET /stocks/{ticker}`
+    (whose profile, analyst, earnings and news blocks are served to contracted
+    integrators only). Every other route may be called anonymously.
 
-    **Integrator API keys are optional everywhere else — but not ignored.** If you
-    send `X-API-Key` on any route, a key beginning `tik_`/`trk_` is verified and a
-    bad one is rejected rather than silently downgraded to anonymous:
+    **Integrator API keys are optional on every route but those three — and never
+    ignored.** If you send `X-API-Key` on any route, a key beginning `tik_`/`trk_`
+    is verified and a bad one is rejected rather than silently downgraded to
+    anonymous:
 
     | Condition | Response |
     |---|---|
@@ -126,6 +129,119 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
 
+  /stocks/{ticker}:
+    get:
+      operationId: getStockDetail
+      tags: [Stocks]
+      summary: Company / ticker details (integrator key required)
+      description: |
+        Everything the catalog knows about one ticker: profile (description, sector, industry,
+        website, logo), listings per (protocol, chain), the B2B tradfi block, pre/post-market
+        print, market session, analyst consensus and grades, next earnings, and the latest news.
+        Every block is best-effort and degrades to `null` on its own. Requires `X-API-Key`
+        (a general `tik_` key; reporting keys are refused). Cached 60 s.
+
+        There is deliberately **no `onchain` block** on this route — for per-protocol on-chain
+        prices call `GET /stocks/prices`.
+
+        This route takes no query parameters: any is a 400, as on the three sibling stocks routes.
+      security:
+        - IntegratorApiKey: []
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/Ticker" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockDetailResponse" }
+              examples:
+                aapl:
+                  summary: US large-cap during the regular session
+                  description: >-
+                    Illustrative values. `exchange`, `exchange_country` and `data_delay` are present
+                    because the venue resolved; `display_ticker` is absent because a US row's bare
+                    `ticker` is already the display form. `extended_hours` is null during the regular
+                    session.
+                  value:
+                    ticker: AAPL
+                    name: Apple Inc.
+                    description: Apple designs, manufactures and markets smartphones, personal computers, tablets, wearables and accessories, and sells related services.
+                    sector: Technology
+                    industry: Consumer Electronics
+                    website: https://www.apple.com
+                    logo_url: https://assets.treasures.io/logos/AAPL.png
+                    available_chains: [sol, eth, robinhood, base]
+                    exchange: NASDAQ
+                    exchange_country: US
+                    data_delay: realtime
+                    listings:
+                      - protocol: ondo
+                        chain: sol
+                        address: 9wJ6gxvqYc6P3kHhTTMVSaMxfsBGBN47f3T8kdgWvB2d
+                        share_multiplier: "1"
+                        token_ticker: AAPLon
+                        min_trade_size_usd: 21
+                      - protocol: xstocks
+                        chain: eth
+                        address: "0x9d275685dc284c8eb1c79f6aba7a63dc75ec890a"
+                        share_multiplier: "1"
+                        token_ticker: AAPLx
+                      - protocol: robinhood
+                        chain: robinhood
+                        address: "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9"
+                        share_multiplier: "1"
+                        token_ticker: AAPL
+                      - protocol: coinbase
+                        chain: base
+                        address: "0xb200000000000000000000c2e324d24d7eecd1fb"
+                        share_multiplier: "1"
+                        token_ticker: AAPL
+                    tradfi:
+                      current_price_usd: "227.63"
+                      currency: USD
+                      price_native: "227.63"
+                      change_24h_pct: "1.12"
+                      market_cap_usd: "3461000000000"
+                      pe_ttm: "34.6"
+                      volume_shares: "48213000"
+                      volume_1d_usd: "10974000000"
+                      as_of: 1789056000
+                    extended_hours: null
+                    market_session: regular
+                    is_holiday: false
+                    holiday_name: null
+                    analyst:
+                      rating: Buy
+                      target_price_usd: "250.00"
+                    analyst_grades:
+                      - firm: Morgan Stanley
+                        grade: Overweight
+                        action: buy
+                        date: "2026-09-08"
+                      - firm: Barclays
+                        grade: Equal Weight
+                        action: hold
+                        date: "2026-09-02"
+                    earnings:
+                      next_date: "2026-10-30"
+                      eps_estimate: "1.62"
+                    news:
+                      - title: Apple unveils new iPhone lineup
+                        url: https://example.com/apple-iphone
+                        publisher: Reuters
+                        published_at: "2026-09-09T17:05:00Z"
+                        type: news
+                        snippet: Apple introduced its next iPhone generation at its annual September event.
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { description: Missing or invalid integrator key }
+        "403": { description: Reporting key presented (insufficient_scope) }
+        "404": { description: Unknown or inactive ticker }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
   /quote/buy:
     post:
       operationId: quoteBuy
@@ -144,6 +260,54 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/QuoteBuyRequest"
+            examples:
+              default_routing:
+                summary: Auto-route across every chain the ticker lists
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  max_slippage_bps: 100
+                  sol_wallet: 7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCTFNP
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    sol_signature: 3sJ7...(base58 signature over the challenge)
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
+              speed_transaction:
+                summary: Speed route on base, wallet pays gas (`execution` omitted = `"transaction"`)
+                description: >-
+                  Returns one or two complete unsigned transactions (`evm_eip1559_tx` on base,
+                  `evm_legacy_tx` on robinhood) to sign whole and return as `evm_signed_tx`. The
+                  wallet needs native ETH on that chain. See the `speed_transaction_pair` response
+                  example.
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  chain: base
+                  priority: speed
+                  max_slippage_bps: 100
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
+              speed_user_operation:
+                summary: Speed route on base, your paymaster pays gas (`execution:"user_operation"`)
+                description: >-
+                  Returns one `evm_calls` payload to pack into a sponsored ERC-4337 v0.7
+                  UserOperation from an EIP-7702-delegated Modular Account v2 wallet and return as
+                  `evm_user_operation`. Requires `priority:"speed"`. See the `speed_user_operation`
+                  response example.
+                value:
+                  ticker: AAPL
+                  amount_usdc: "100"
+                  chain: base
+                  priority: speed
+                  execution: user_operation
+                  max_slippage_bps: 100
+                  eth_wallet: "0x1111111111111111111111111111111111111111"
+                  ownership_proof:
+                    eth_signature: "0x5b2c...(65-byte signature over the challenge)"
+                    issued_at: 1789056000
       responses:
         "200":
           description: OK
@@ -151,14 +315,125 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/QuoteBuyResponse"
+              examples:
+                speed_transaction_pair:
+                  summary: "`priority:\"speed\"` on base — wallet not yet approved, so `approve` then `swap`"
+                  description: >-
+                    `tx_hex` / `tx_base64` are truncated here; each is a complete unsigned
+                    transaction with nonce, gas and fees already set. Sign both bytes-as-is and
+                    return one `evm_signed_tx` per payload, in this order. An already-approved wallet
+                    gets the `swap` payload only. `gasless:false` and `estimated_gas_usd` are the
+                    caller's own gas.
+                  value:
+                    quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                    side: buy
+                    ticker: AAPL
+                    expires_at: 1789056042
+                    tradfi_reference:
+                      price_usd: "227.63"
+                      market_status: open
+                      as_of: 1789055995
+                    quotes:
+                      - quote_index: 0
+                        chain: base
+                        protocol: coinbase
+                        price_usdc_per_share: "228.11"
+                        estimated_output_shares: "0.438385"
+                        estimated_output_tokens: "0.438385"
+                        base_asset: usdc
+                        amount_base: "100"
+                        cost_breakdown_bps:
+                          treasures_fee_bps: 10
+                          dex_swap_fee_bps: 5
+                          estimated_slippage_bps: 0
+                          price_impact_bps: 0
+                          slippage_vs_tradfi_bps: 21
+                        gasless: false
+                        estimated_gas_usd: "0.0031"
+                        signable_payloads:
+                          - type: evm_eip1559_tx
+                            role: approve
+                            from: "0x1111111111111111111111111111111111111111"
+                            tx_hex: "0x02f8b2822105"
+                            tx_base64: AvisgiEF
+                            approval_spender: null
+                            chain_id: 8453
+                            nonce: 41
+                            gas: "58000"
+                            max_fee_per_gas: "12000000"
+                            max_priority_fee_per_gas: "1000000"
+                          - type: evm_eip1559_tx
+                            role: swap
+                            from: "0x1111111111111111111111111111111111111111"
+                            tx_hex: "0x02f9024c822105"
+                            tx_base64: AvkCTIIhBQ
+                            approval_spender: "0x111111125421cA6dc452d289314280a0f8842A65"
+                            chain_id: 8453
+                            nonce: 42
+                            gas: "310000"
+                            max_fee_per_gas: "12000000"
+                            max_priority_fee_per_gas: "1000000"
+                    warnings: []
+                speed_user_operation:
+                  summary: "`priority:\"speed\"` + `execution:\"user_operation\"` on base — one `evm_calls` payload"
+                  description: >-
+                    `calls[].data` is truncated here. Pack the calls, in order, into ONE ERC-4337 v0.7
+                    UserOperation from `sender` (`execute` for one call, `executeBatch` for two),
+                    sponsor it with your paymaster, sign, and return it as `evm_user_operation`.
+                    The leg is `gasless:true` with `estimated_gas_usd:"0"` because the paymaster pays.
+                  value:
+                    quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                    side: buy
+                    ticker: AAPL
+                    expires_at: 1789056042
+                    tradfi_reference:
+                      price_usd: "227.63"
+                      market_status: open
+                      as_of: 1789055995
+                    quotes:
+                      - quote_index: 0
+                        chain: base
+                        protocol: coinbase
+                        price_usdc_per_share: "228.11"
+                        estimated_output_shares: "0.438385"
+                        estimated_output_tokens: "0.438385"
+                        base_asset: usdc
+                        amount_base: "100"
+                        cost_breakdown_bps:
+                          treasures_fee_bps: 10
+                          dex_swap_fee_bps: 5
+                          estimated_slippage_bps: 0
+                          price_impact_bps: 0
+                          slippage_vs_tradfi_bps: 21
+                        gasless: true
+                        estimated_gas_usd: "0"
+                        signable_payloads:
+                          - type: evm_calls
+                            chain_id: 8453
+                            sender: "0x1111111111111111111111111111111111111111"
+                            entry_point: "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+                            approval_spender: "0x111111125421cA6dc452d289314280a0f8842A65"
+                            calls:
+                              - role: approve
+                                to: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+                                data: "0x095ea7b3000000000000000000000000111111125421ca6dc452d289314280a0f8842a65ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                                value: "0"
+                              - role: swap
+                                to: "0x111111125421cA6dc452d289314280a0f8842A65"
+                                data: "0x07ed2379"
+                                value: "0"
+                    warnings: []
         "400":
-          description: Invalid request body, slippage out of range, unknown ticker, or zero amount.
+          description: >-
+            Invalid request body, slippage out of range, unknown ticker, zero amount, or (pinned
+            `execution: "user_operation"`) a wallet not delegated to Modular Account v2.
           content:
             application/json:
               schema:
                 anyOf:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
+                  - $ref: "#/components/schemas/WalletNotDelegatedError"
         "401":
           description: Ownership-proof failure.
           content:
@@ -191,6 +466,91 @@ paths:
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
         "503": { $ref: "#/components/responses/ScreeningUnavailable" }
 
+  /quote/preview:
+    post:
+      operationId: quotePreview
+      tags: [Quote]
+      summary: Wallet-less price preview (integrator key required)
+      security:
+        - IntegratorApiKey: []
+      description: |
+        The `quote_only` shape with **no wallet and no ownership proof**: prices every chain the
+        ticker lists (or those your `chain` / `protocol` filters allow) and returns the same legs
+        `POST /quote/buy` would, minus `quote_id`,
+        `expires_at`, every leg's `signable_payloads`, and `warnings_ack_token`. Nothing is
+        persisted, so there is no `/quote/{quote_id}/status` to poll and nothing to submit —
+        re-quote through `/quote/buy` for anything you intend to sign.
+
+        **A key is required here**, unlike every other quote route: this is the one quote that
+        binds no wallet at all. Send your general `tik_` key; a read-only `trk_` reporting key is
+        refused `403 insufficient_scope` like everywhere else off the reporting routes.
+
+        Identical requests inside a 10-second window are answered from one venue fan-out; a
+        refusal is never cached. Budgets are per-IP and per-organisation as elsewhere, **plus a
+        global ceiling shared by every caller of this route** — so a 429 here can be someone
+        else's traffic. Honour `Retry-After` rather than retrying immediately.
+
+        **Read `X-RateLimit-*` on this route as the shared bucket, not as yours.** The headers
+        report the **last** limiter applied, which here is that global ceiling, so
+        `X-RateLimit-Remaining: 0` says the route is saturated across all callers — not that
+        *you* are out of budget. Back off for `Retry-After` seconds and retry; do not stand down
+        for a whole minute on the assumption you exhausted a per-caller window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuotePreviewRequest"
+      responses:
+        "200":
+          description: Non-executable price preview.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteBuyResponse"
+        "400":
+          description: >-
+            Invalid request body, slippage out of range, unknown ticker, zero amount, or an
+            `amount_usdc` above the 1000000 preview cap.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401":
+          description: No integrator key presented, or an unknown one.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: invalid_api_key }
+        "403":
+          description: |
+            A read-only `trk_` reporting key was presented (`insufficient_scope`), the key was
+            retired (`key_revoked`), or your organisation is suspended (`integrator_suspended`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: insufficient_scope }
+        "422":
+          description: |
+            No fillable routes returned by the planner, or a basket listing whose
+            issuer-published price is unusable.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/NoRoutesError"
+                  - $ref: "#/components/schemas/BasketPriceUnavailableError"
+              examples:
+                no_routes: { value: { error: no_routes } }
+                basket_price_unavailable:
+                  { value: { error: basket_price_unavailable } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/ProviderUnavailable" }
+
   /quote/sell:
     post:
       operationId: quoteSell
@@ -213,13 +573,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/QuoteSellResponse"
         "400":
-          description: Invalid request body, slippage out of range, unknown ticker, or zero amount.
+          description: >-
+            Invalid request body, slippage out of range, unknown ticker, zero amount, or (pinned
+            `execution: "user_operation"`) a wallet not delegated to Modular Account v2.
           content:
             application/json:
               schema:
                 anyOf:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
+                  - $ref: "#/components/schemas/WalletNotDelegatedError"
         "401":
           description: Ownership-proof failure.
           content:
@@ -261,7 +624,10 @@ paths:
       description: |
         Public read-only — no `ownership_proof`. Ethereum in-flight rows are
         lazy-flipped against the upstream venue on read; Solana `broadcast_unknown` rows stay
-        in-flight until operator action. In-progress aggregates cached 10 s.
+        in-flight until operator action. In-progress aggregates are cached per venue class: 1 s while
+        a speed-route leg submitted in the last 5 min is still in flight, 10 s otherwise;
+        `poll_after_ms` sits just above that window and is `null` once the aggregate is terminal
+        (stop polling).
       parameters:
         - name: quote_id
           in: path
@@ -299,6 +665,51 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/TradeSubmitRequest"
+            examples:
+              speed_signed_pair:
+                summary: Speed-route leg (`execution:"transaction"`) — both transactions signed whole
+                description: >-
+                  One `evm_signed_tx` per `SignableEvmTx` payload the quote issued, in the order
+                  issued (`approve` at nonce n, `swap` at n+1). Sign each `tx_hex` unchanged —
+                  never re-nonce, re-estimate or re-serialize — and do not broadcast; Treasures
+                  does. `signed_tx_hex` is truncated here.
+                value:
+                  quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                  signed:
+                    - quote_index: 0
+                      signed_payloads:
+                        - type: evm_signed_tx
+                          signed_tx_hex: "0x02f8f5822105"
+                        - type: evm_signed_tx
+                          signed_tx_hex: "0x02f9028f822105"
+              user_operation:
+                summary: Speed-route leg (`execution:"user_operation"`) — one sponsored, signed UserOperation
+                description: >-
+                  The v0.7 UserOperation you built from the quote's `evm_calls` payload, sponsored by
+                  your paymaster and signed by the delegated wallet. Do not send it to a bundler
+                  yourself; Treasures simulates, submits and returns `user_op_hash`. `callData`,
+                  `paymasterData` and `signature` are truncated here. Numerics may be decimal or
+                  0x-hex strings.
+                value:
+                  quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                  signed:
+                    - quote_index: 0
+                      signed_payloads:
+                        - type: evm_user_operation
+                          user_operation:
+                            sender: "0x1111111111111111111111111111111111111111"
+                            nonce: "0x1a"
+                            callData: "0x34fcd5be"
+                            callGasLimit: "0x5b8d8"
+                            verificationGasLimit: "0x1d4c0"
+                            preVerificationGas: "0x11170"
+                            maxFeePerGas: "0xb71b00"
+                            maxPriorityFeePerGas: "0xf4240"
+                            paymaster: "0x2cc0c7981D846b9F2a16276556f6e8cb52BfB633"
+                            paymasterVerificationGasLimit: "0x186a0"
+                            paymasterPostOpGasLimit: "0xc350"
+                            paymasterData: "0x000000000000"
+                            signature: "0xff0000"
       responses:
         "200":
           description: |
@@ -309,6 +720,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TradeSubmitResponse"
+              examples:
+                speed_broadcast:
+                  summary: Speed-route leg accepted — `tx_hash` is the swap's from the start
+                  description: >-
+                    On a pair the swap hash is known immediately (it is `keccak256` of the signed
+                    swap) but appears on chain only after the bundled `approve` mines. Poll
+                    `/quote/{quote_id}/status` until `completed`.
+                  value:
+                    results:
+                      - quote_index: 0
+                        trade_id: trd_9vLw2nRb5cYd8FhJ7Kp3mQxT
+                        status: broadcast
+                        tx_hash: "0x6d1c9d3b1f9a1c1c0f7e2d4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8"
+                        order_hash: null
+                        user_op_hash: null
+                        error_code: null
+                    failed_legs: []
+                user_operation_broadcast:
+                  summary: UserOperation accepted by the bundler — `user_op_hash` set, `tx_hash` still null
+                  description: >-
+                    `tx_hash` becomes the bundle transaction once mined; poll
+                    `/quote/{quote_id}/status`. A paymaster refusal would instead be
+                    `status: broadcast_failed` with `error_code: sponsorship_rejected`.
+                  value:
+                    results:
+                      - quote_index: 0
+                        trade_id: trd_9vLw2nRb5cYd8FhJ7Kp3mQxT
+                        status: broadcast
+                        tx_hash: null
+                        order_hash: null
+                        user_op_hash: "0x2b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfe"
+                        error_code: null
+                    failed_legs: []
         "400":
           description: Malformed body, incomplete submit, or `quote_index` not in snapshot.
           content:
@@ -716,9 +1160,10 @@ components:
         access) and `trk_…` (reporting — read-only, intended to be handed to a
         third party, and accepted **only** on the reporting routes: today just
         `GET /settlements`. Every other route in this spec answers
-        `insufficient_scope`). Required by `GET /settlements`;
-        accepted on every other route for attribution and a per-organisation rate
-        bucket. Send it on `POST /trade/submit` too — that is what makes a trade
+        `insufficient_scope`). Required by `GET /settlements`, by
+        `POST /quote/preview` and by `GET /stocks/{ticker}` (the latter two take a
+        general `tik_` key only, being non-reporting routes); accepted on every other
+        route for attribution and a per-organisation rate bucket. Send it on `POST /trade/submit` too — that is what makes a trade
         appear in your `GET /settlements` reporting.
         A missing or unknown key is `401 invalid_api_key`; a real but retired key
         is `403 key_revoked`.
@@ -876,6 +1321,42 @@ components:
         its own `[MIN, MAX]` window — out-of-range returns `400 invalid_slippage`
         with the active bounds.
 
+    Execution:
+      type: [string, "null"]
+      enum: [transaction, user_operation, null]
+      description: >-
+        How a **speed-route** leg is handed back. `"transaction"` (the default — absent and `null`
+        mean the same) is the raw-transaction shape: one `SignableEvmTx` per transaction, signed
+        whole, gas paid by the wallet. `"user_operation"` returns the same calls as ONE `evm_calls`
+        payload (`SignableEvmCalls`) for you to pack into an ERC-4337 v0.7 UserOperation from the
+        wallet — which must be **EIP-7702-delegated to Alchemy Modular Account v2** on that chain —
+        sponsor with your own paymaster, sign, and return as `evm_user_operation`; Treasures submits
+        it to a bundler and tracks it. The leg is then `gasless: true` with
+        `estimated_gas_usd: "0"`. Only meaningful with `priority: "speed"` — sending
+        `"user_operation"` without it is `400 invalid_request`. Served on `base` and `robinhood`
+        (a chain whose bundler is not configured answers `422 no_routes` pinned, or drops that chain
+        with `speed_route_unavailable` / `disabled` unpinned). An undelegated
+        wallet is `400 wallet_not_delegated` when pinned, or a `wallet_not_delegated` drop reason.
+
+    Priority:
+      type: [string, "null"]
+      enum: [speed, null]
+      description: >-
+        How to route, when there is a choice. `"speed"` asks for the **speed route** on the two L2
+        venues that have one (`robinhood`, `base`): a single on-chain swap that settles in one block
+        instead of a relayed order, quoted as a complete unsigned transaction you sign and Treasures
+        broadcasts. It costs you native gas on that chain; no pre-approval is needed — a wallet
+        that has not approved the router gets an `approve` payload bundled before the `swap` (see
+        `SignableEvmTx` `role`). Absent/`null` = today's
+        routing, unchanged. A **filter, not a preference**: under `"speed"` the only candidates are
+        `sol` (unchanged — its route is already fast) and the `robinhood`/`base` speed routes.
+        `eth` is never quoted under `"speed"`, and a `robinhood`/`base` leg the speed route cannot
+        serve is **absent** from the response — never returned on its relayed route — with a
+        `speed_route_unavailable` warning naming the chain and the reason. A one-element
+        `chain: "eth"` (or `["eth"]`) together with `"speed"` is a contradiction and is refused as
+        `400 invalid_request` (`priority: "speed" is not available on eth`); a set that also names
+        other chains simply loses `eth`.
+
     # ------------ Errors --------------------------------------------------
     SimpleError:
       type: object
@@ -947,6 +1428,7 @@ components:
               reference_unavailable,
               no_price_feed,
               market_closed,
+              insufficient_balance,
             ]
           description: |
             Present only when a strict majority of dropped cells share the same
@@ -986,6 +1468,16 @@ components:
             `warnings[]`. Keep parsing the value — it is still published so a
             client that models it does not break — but do not build a flow around
             receiving it.
+
+            `insufficient_balance` describes **your own wallet**, not the venue,
+            and is only reachable on a `chain`-pinned `priority: "speed"` request —
+            the one shape where the speed route is the only candidate, so its
+            refusal becomes the whole answer. The wallet is short the spent token
+            on that chain: fund it and re-quote. Unpinned, the same condition
+            drops that leg from the response (never a relayed fallback) and the
+            response carries a `speed_route_unavailable` warning. (A missing
+            router allowance is never a refusal on either shape — the quote
+            bundles the approve.)
       additionalProperties: false
 
     BasketPriceUnavailableError:
@@ -1018,7 +1510,26 @@ components:
         message: { type: string }
         tx_hash: { type: [string, "null"] }
         order_hash: { type: [string, "null"] }
+        user_op_hash:
+          type: string
+          description: >-
+            Present only when the conflict is on a `user_operation` leg: the ERC-4337 op hash the
+            earlier submit owns (its `tx_hash` is null until the bundle mines).
       additionalProperties: false
+
+    WalletNotDelegatedError:
+      type: object
+      required: [error, chain, message]
+      properties:
+        error: { type: string, enum: [wallet_not_delegated] }
+        chain: { $ref: "#/components/schemas/Chain" }
+        message: { type: string }
+      additionalProperties: false
+      description: >-
+        A `chain`-pinned `priority: "speed"` + `execution: "user_operation"` request whose
+        `eth_wallet` is not EIP-7702-delegated to Alchemy Modular Account v2 on that chain. Only
+        the caller can clear it (delegate, then re-quote) — or re-quote with
+        `execution: "transaction"` for the raw-transaction shape.
 
     # ------------ Ownership proof ----------------------------------------
     OwnershipProof:
@@ -1411,6 +1922,290 @@ components:
             - { type: "null" }
         onchain: { $ref: "#/components/schemas/StockOnchainPerProtocol" }
 
+    StockExchange:
+      type: string
+      description: >-
+        The listing venue a stock trades on, and the source of `exchange_country` and `data_delay`.
+        Deliberately not the full exchange universe: it enumerates the venues this catalog serves,
+        and grows without a breaking change — treat an unlisted value as a new venue, not an error.
+      enum: [NASDAQ, NYSE, AMEX, CBOE, HKSE]
+
+    StockDataDelay:
+      type: string
+      description: >-
+        How fresh the TradFi tape for this venue is. `realtime` is the live quote; `delayed_15m`
+        means every price on the item — including `tradfi` — trails the market by about 15 minutes
+        and must be labelled as delayed wherever it is shown.
+      enum: [realtime, delayed_15m]
+
+    StockDetailListing:
+      type: object
+      description: >
+        One real (protocol, chain, address) token deployment for this ticker — the tuple you forward
+        to the quote routes as `protocol` + `chain`. Combos the ticker does not list are simply
+        absent, and a supply-gated `coinbase` cell publishes no entry at all until its token is
+        minted. Token decimals stay internal; read them on-chain.
+      required: [protocol, chain, address, share_multiplier, token_ticker]
+      properties:
+        protocol: { $ref: "#/components/schemas/Protocol" }
+        chain: { $ref: "#/components/schemas/Chain" }
+        address: { type: string }
+        share_multiplier: { type: [string, "null"] }
+        token_ticker: { type: string }
+        min_trade_size_usd:
+          type: integer
+          description: >
+            Smallest order size, in whole USDC, measured filling on THIS cell. **Absent means no
+            minimum is known**, never zero, and it is advisory rather than a gate.
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: >
+            Probe warning for this one cell. `thin` — the cell fills, but not at every size below
+            `min_trade_size_usd`. `untradable` — nothing filled at any size across a full
+            measurement window, and no minimum accompanies it. **Neither value disables the cell**;
+            quotes are still accepted for both. Absent means unmeasured or unwarned — never
+            healthy-with-value-null.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: >
+            Why the cell is warned, strongest evidence first. Absent when unwarned, or when the
+            warn predates reason recording. Not stable over a cell's lifetime — a `low_volume`
+            warn that later kills a real order flips to `settlement_failure`.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
+
+    ExtendedHoursBlock:
+      type: object
+      description: >-
+        Last pre/post-market print — a sibling of, never a substitute for, `tradfi`, whose fields all
+        stay anchored to the regular session. Null whenever no honest value exists: during the
+        regular session (the feed is stale then), when the ticker has no extended print, when
+        `tradfi` is null (no anchor for the change), or when the print is not newer than
+        `tradfi.as_of`. The feed prints only inside 04:00–20:00 ET and then holds its last value, so
+        overnight and at weekends this stays populated with the final post-market print — label
+        staleness off `as_of` rather than assuming it is live.
+      required: [price_usd, change_usd, change_pct, session, as_of]
+      properties:
+        price_usd: { $ref: "#/components/schemas/DecimalString" }
+        change_usd:
+          type: string
+          description: price_usd − tradfi.current_price_usd. May be negative.
+        change_pct:
+          type: string
+          description: >-
+            The same difference in percent, against the regular-session close. May be negative.
+        session:
+          type: string
+          description: >-
+            Which extended window this print came from — independent of `market_session`. Overnight
+            `market_session` is `closed` while this stays `post`.
+          enum: [pre, post]
+        as_of:
+          type: integer
+          description: Timestamp of the extended print (unix seconds).
+
+    AnalystRating:
+      type: object
+      required: [rating, target_price_usd]
+      properties:
+        rating:
+          type: [string, "null"]
+          description: Consensus label (e.g. "Buy").
+        target_price_usd: { type: [string, "null"] }
+
+    AnalystGrade:
+      type: object
+      required: [firm, grade, action, date]
+      properties:
+        firm: { type: string }
+        grade:
+          type: string
+          description: Raw grade text (e.g. "Overweight").
+        action: { type: string, enum: [buy, hold, sell] }
+        date:
+          type: string
+          description: ISO `YYYY-MM-DD`.
+
+    NextEarnings:
+      type: object
+      description: >-
+        The ticker's nearest scheduled report inside a 30-day horizon. The block is null when no
+        report falls in that window (or when the calendar read faulted) — never a farther date.
+      required: [next_date, eps_estimate]
+      properties:
+        next_date:
+          type: string
+          description: ISO `YYYY-MM-DD`.
+        eps_estimate:
+          oneOf:
+            - { $ref: "#/components/schemas/DecimalString" }
+            - { type: "null" }
+          description: Consensus EPS estimate. Null when none is published for the report.
+
+    NewsItem:
+      type: object
+      description: >-
+        One stored headline for this ticker, newest first, at most 10 per response. There is no
+        image field: the vendor's image host is not part of this plane's shape.
+
+      required: [title, url, publisher, published_at, type, snippet]
+      properties:
+        title: { type: string }
+        url: { type: [string, "null"] }
+        publisher:
+          type: [string, "null"]
+          description: The news outlet that published the story.
+        published_at:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC.
+        type:
+          type: string
+          description: >-
+            Story class — `stock` for a symbol-scoped story, `press_release` for an issuer release.
+            Open vocabulary: a value you do not recognise is a new class, not a schema violation.
+        snippet: { type: [string, "null"] }
+
+    StockDetailResponse:
+      type: object
+      description: >
+        Everything the catalog knows about one ticker. Every block backed by I/O is fault-isolated
+        and degrades to `null` on its own, so any block can be null because its fetch failed. For
+        `tradfi`, `extended_hours`, `analyst`, `analyst_grades` and `earnings`, null **also** means
+        "no such value exists for this ticker right now" — no coverage, no scheduled report, no
+        extended print, no priced reference — and the two causes are not distinguishable from the
+        response; read each field's own description for what its null covers. `news` is the one
+        block that separates them: `[]` means we hold no headlines, `null` means the read failed,
+        so it is the only one worth re-reading on an empty answer. There is deliberately no
+        `onchain` block: per-protocol on-chain prices live on `GET /stocks/prices`.
+      required:
+        [
+          ticker,
+          name,
+          description,
+          sector,
+          industry,
+          website,
+          logo_url,
+          available_chains,
+          listings,
+          tradfi,
+          extended_hours,
+          market_session,
+          is_holiday,
+          holiday_name,
+          analyst,
+          analyst_grades,
+          earnings,
+          news,
+        ]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        name: { type: string }
+        description:
+          type: [string, "null"]
+          description: >-
+            Company/asset description. Null when none is stored for this ticker; it is refreshed on
+            the catalog's own recheck cadence, not on your read.
+        sector: { type: [string, "null"] }
+        industry: { type: [string, "null"] }
+        website: { type: [string, "null"] }
+        logo_url:
+          type: [string, "null"]
+          description: >-
+            Absolute `https` URL of the company logo, served from Treasures' own object store rather
+            than the upstream source. Null when no logo has been mirrored for this ticker.
+        available_chains:
+          type: array
+          items: { $ref: "#/components/schemas/Chain" }
+        exchange:
+          $ref: '#/components/schemas/StockExchange'
+          description: >-
+            The venue this stock lists on. **Absent** — never null — when we have not resolved one,
+            so treat "no key" as unknown rather than as a US listing. Present together with
+            `exchange_country` and `data_delay` or not at all.
+        exchange_country:
+          type: string
+          description: >-
+            ISO-3166 alpha-2 country of the **exchange**, not of the issuer. Tencent lists in `HK`
+            while its issuer country is CN; do not read this as domicile. Derived from `exchange`,
+            so it is absent whenever `exchange` is.
+        data_delay:
+          $ref: '#/components/schemas/StockDataDelay'
+          description: >-
+            Freshness class of this row's TradFi prices, derived from `exchange`. Absent whenever
+            `exchange` is; absent does **not** mean realtime.
+        display_ticker:
+          type: string
+          description: >-
+            The ticker as it should be rendered — `0700.HK` for the row keyed `700`. **Absent for a
+            US row**, whose bare `ticker` is already the display form. Render `display_ticker ??
+            ticker`. Identity stays on `ticker`: every path segment and every other endpoint uses
+            that, never this.
+        listings:
+          type: array
+          items: { $ref: "#/components/schemas/StockDetailListing" }
+        tradfi:
+          oneOf:
+            - { $ref: "#/components/schemas/TradfiBlock" }
+            - { type: "null" }
+          description: >-
+            Null when no reference price resolves for the ticker — a basket, or any row the tape
+            does not cover — as well as on a fault.
+        extended_hours:
+          oneOf:
+            - { $ref: "#/components/schemas/ExtendedHoursBlock" }
+            - { type: "null" }
+          description: >-
+            Null for the ordinary reasons listed on `ExtendedHoursBlock` — the regular session, no
+            extended print, no `tradfi` anchor, a print no newer than `tradfi.as_of` — as well as
+            on a fault.
+        market_session:
+          type: [string, "null"]
+          description: >-
+            Current US-equity session — global, not per-ticker, and holiday/half-day aware. Picks
+            which of `tradfi` / `extended_hours` to render. Null when the session read faulted.
+          enum: [regular, pre, post, closed, null]
+        is_holiday:
+          type: [boolean, "null"]
+          description: >-
+            True on a NASDAQ holiday **and on its eve** (an early-close day reports this too, not
+            just the holiday's own date). Null when the session read faulted.
+        holiday_name:
+          type: [string, "null"]
+          description: >-
+            Name of the holiday when `is_holiday` is true; null otherwise, and null when the session
+            read faulted.
+        analyst:
+          oneOf:
+            - { $ref: "#/components/schemas/AnalystRating" }
+            - { type: "null" }
+          description: >-
+            Consensus rating and price target. Null when no analyst covers the ticker, and null on a
+            fault — the two are not distinguishable here.
+        analyst_grades:
+          oneOf:
+            - type: array
+              items: { $ref: "#/components/schemas/AnalystGrade" }
+            - { type: "null" }
+          description: >-
+            Latest grade per firm, most recent first, at most 15 firms. Null when no firm covers the
+            ticker, and null on a fault.
+        earnings:
+          oneOf:
+            - { $ref: "#/components/schemas/NextEarnings" }
+            - { type: "null" }
+          description: >-
+            Null when no report falls inside the 30-day horizon, and null on a fault.
+        news:
+          oneOf:
+            - type: array
+              items: { $ref: "#/components/schemas/NewsItem" }
+            - { type: "null" }
+          description: >-
+            Up to 10 stored headlines, newest first. `[]` means we hold none for this ticker; `null`
+            means the read faulted.
+
     StocksListResponse:
       type: object
       required: [stocks]
@@ -1444,9 +2239,14 @@ components:
         mapping:
           solana_versioned_tx: "#/components/schemas/SignableSolanaTx"
           evm_eip712_typed_data: "#/components/schemas/SignableEvmTypedData"
+          evm_eip1559_tx: "#/components/schemas/SignableEvmTx"
+          evm_legacy_tx: "#/components/schemas/SignableEvmTx"
+          evm_calls: "#/components/schemas/SignableEvmCalls"
       oneOf:
         - $ref: "#/components/schemas/SignableSolanaTx"
         - $ref: "#/components/schemas/SignableEvmTypedData"
+        - $ref: "#/components/schemas/SignableEvmTx"
+        - $ref: "#/components/schemas/SignableEvmCalls"
 
     SignableSolanaTx:
       type: object
@@ -1461,11 +2261,14 @@ components:
     SignableEvmTypedData:
       type: object
       description: >-
-        EIP-712 typed data for a gasless EVM order — carried by **every** EVM leg: eth
+        EIP-712 typed data for a gasless EVM order — the **default** payload on every EVM leg: eth
         (Ethereum mainnet), robinhood (Robinhood Chain / 4663) and base (Base / 8453), which
         all share the same sign-only model. Exactly one payload per leg; sign it with
         `eth_signTypedData_v4` and return the signature to `/trade/submit`. A resolver settles
         the signed order on-chain, so the caller broadcasts nothing and pays no native gas.
+        The one exception is `priority: "speed"`, under which a robinhood or base leg carries
+        `SignableEvmTx` instead — a complete transaction, and not gasless. eth always carries
+        this shape, and is never quoted under `priority: "speed"` at all.
       required: [type, typed_data]
       properties:
         type: { type: string, enum: [evm_eip712_typed_data] }
@@ -1473,6 +2276,118 @@ components:
           type: object
           description: EIP-712 typed-data object for the gasless EVM order; sign with `eth_signTypedData_v4`.
           additionalProperties: true
+      additionalProperties: false
+
+    SignableEvmTx:
+      type: object
+      description: >-
+        A **complete unsigned EVM transaction** — the speed-route payload, returned only on a
+        `priority: "speed"` leg (robinhood / base). Every field the transaction needs is already in
+        the bytes: `nonce`, `gas` and the fee pair are server-completed, so sign `tx_hex` **as-is**
+        with `signTransaction` and return `{ type: "evm_signed_tx", signed_tx_hex }` — do not
+        re-estimate, re-nonce or re-serialize it, and do not broadcast it yourself. Treasures
+        broadcasts the signed bytes; any edited field fails the submit-time bind as
+        `invalid_signature`. `type` is `evm_eip1559_tx` when the chain reports EIP-1559 fees and
+        `evm_legacy_tx` when it reports a flat `gas_price` — the two carry the same fields apart
+        from that pair. The fee fields are **mirrors of what is already in `tx_hex`**, present only
+        when the bytes carry them: read them for display, never to rebuild the transaction, and
+        treat an absent one as "this transaction does not set it" rather than as zero. The wallet
+        must hold native gas on the leg's chain. **No pre-approval is needed:** when the wallet has
+        not approved the router yet, the leg carries **two** payloads — `role: "approve"` (nonce n,
+        an ERC-20 `approve(router, max-uint256)` of the spent token) followed by `role: "swap"`
+        (nonce n+1). Sign and return **both**, in that order. An approved wallet gets the single
+        `swap` payload. Treasures sends the approve, waits for its receipt, then sends the swap; the
+        leg's `tx_hash` is the swap's from the start, but it becomes visible on chain only after the
+        approve mines (seconds). Sign each payload as-is: the nonces are consecutive and a resigned
+        or reordered one fails the bind as `invalid_signature`.
+      required: [type, role, from, tx_hex, tx_base64, approval_spender, chain_id, nonce, gas]
+      properties:
+        type: { type: string, enum: [evm_eip1559_tx, evm_legacy_tx] }
+        role:
+          type: string
+          enum: [approve, swap]
+          description: >-
+            Which transaction this is. `swap` is the trade; `approve` precedes it only on a wallet
+            that had no router allowance at quote time. Branch on `role`, never on array position —
+            and never sign only `signable_payloads[0]` when there are two.
+        from:
+          type: string
+          description: The signing wallet — the same EVM EOA the quote was bound to.
+        tx_hex:
+          type: string
+          description: Unsigned RLP transaction, 0x-prefixed. Sign exactly these bytes.
+        tx_base64:
+          type: string
+          description: The same unsigned transaction, base64 — for callers whose signer takes bytes.
+        approval_spender:
+          type: [string, "null"]
+          description: >-
+            On the `swap` payload: the on-chain router the swap pulls the spent token through,
+            **on this leg's chain** — informational; the bundled `approve` payload (when present)
+            already targets it. `null` on the `approve` payload, which needs no allowance itself.
+        chain_id:
+          type: integer
+          description: EVM chain id these bytes are signed for.
+        nonce:
+          type: integer
+          description: >-
+            Server-read pending nonce, already encoded in `tx_hex` (n on an `approve`, n+1 on the
+            `swap` that follows it). One in-flight speed trade per wallet per chain — a second
+            signed at the same nonce fails as `nonce_conflict`.
+        gas:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: Gas limit — already encoded in the bytes.
+        max_fee_per_gas:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: >-
+            EIP-1559 only, never with `gas_price`. Optional: present exactly when `tx_hex` sets it.
+        max_priority_fee_per_gas:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: >-
+            EIP-1559 only. Optional and independent of `max_fee_per_gas`: present exactly when
+            `tx_hex` sets it, absent when the transaction carries no priority fee.
+        gas_price:
+          allOf: [{ $ref: "#/components/schemas/DecimalString" }]
+          description: >-
+            Legacy only — sent instead of the 1559 pair, never alongside it. Present exactly when
+            `tx_hex` sets it.
+      additionalProperties: false
+
+    SignableEvmCalls:
+      type: object
+      description: >-
+        The `execution: "user_operation"` speed-route leg (base): the calls to pack
+        into ONE ERC-4337 v0.7 UserOperation from `sender` — your EIP-7702-delegated Modular
+        Account v2 wallet. Build it yourself (e.g. `@account-kit`): `execute(target, value, data)`
+        for a single call, `executeBatch([...])` **in this order** for two; sponsor it with your
+        own paymaster (an unsponsored op is refused — the leg is ranked at $0 gas); sign it under
+        `chain_id` and the v0.7 EntryPoint (`entry_point`, informational — the server pins it);
+        return `{ type: "evm_user_operation", user_operation }`. The server decodes `callData`
+        and binds every call byte-for-byte to these, plus `sender` = the quoted wallet, no
+        `factory` / `factoryData` (first-time delegation is out of scope), zero `value` on every
+        call, and a non-empty `paymaster`; any mismatch is `invalid_signature`. Exactly one per
+        leg. `approval_spender` is the router the `swap` call pulls through — what the `approve`
+        call, when present, grants (max-uint256).
+      required: [type, chain_id, sender, entry_point, approval_spender, calls]
+      properties:
+        type: { type: string, enum: [evm_calls] }
+        chain_id: { type: integer, enum: [4663, 8453] }
+        sender: { $ref: "#/components/schemas/EvmAddress" }
+        entry_point: { $ref: "#/components/schemas/EvmAddress" }
+        approval_spender: { $ref: "#/components/schemas/EvmAddress" }
+        calls:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items:
+            type: object
+            required: [role, to, data, value]
+            properties:
+              role: { type: string, enum: [approve, swap] }
+              to: { $ref: "#/components/schemas/EvmAddress" }
+              data: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+              value: { type: string, enum: ["0"] }
+            additionalProperties: false
       additionalProperties: false
 
     TradfiReference:
@@ -1520,6 +2435,28 @@ components:
             was nothing to measure against.
       additionalProperties: false
 
+    LegGasless:
+      type: boolean
+      description: >-
+        Who pays this leg's gas. `true` — a relayed order: you sign, a settlement network broadcasts,
+        you spend no native gas. `false` — a speed-route leg (`priority: "speed"`), returned as a
+        complete unsigned transaction you sign and Treasures broadcasts against **your** native
+        balance on that chain. Rides **every** kind of leg, not only speed ones; **absent** where the
+        upstream never reported it (some Solana legs), which is not the same claim as `false` — read
+        the payload `type` when it matters.
+
+    LegEstimatedGasUsd:
+      type: [string, "null"]
+      description: >-
+        **Speed-route legs only** (absent on every relayed leg): the estimated USD cost of the
+        broadcast this leg asks you to fund, and the figure the route ranking charged against this
+        leg. `null` when no USD gas price was available — the leg still ranks, just without its gas
+        term, and a `speed_route_unpriced_gas` warning naming this leg's `chain` says so. That
+        warning does **not** mean the leg fell back: this leg IS a speed-route leg and only its
+        gas figure is missing, so price the gas yourself before choosing it over a gasless leg.
+        An estimate over a live gas market: the signed transaction bounds what you can actually
+        spend, this string does not.
+
     QuoteBuyLeg:
       type: object
       required:
@@ -1548,10 +2485,14 @@ components:
           allOf: [{ $ref: "#/components/schemas/DecimalString" }]
           description: Base amount spent, human-decimal — the base-asset alias of `amount_usdc`.
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
+        gasless: { $ref: "#/components/schemas/LegGasless" }
+        estimated_gas_usd: { $ref: "#/components/schemas/LegEstimatedGasUsd" }
         signable_payloads:
           type: array
           minItems: 1
-          description: Omitted on `quote_only` previews — the leg is non-executable.
+          description: >-
+            Omitted on `quote_only` previews and on every `POST /quote/preview` leg — the leg is
+            non-executable.
           items: { $ref: "#/components/schemas/SignablePayload" }
         tradability:
           $ref: '#/components/schemas/Tradability'
@@ -1604,6 +2545,8 @@ components:
             Base amount received, human-decimal — the base-asset alias of `estimated_output_usdc`
             (equal value, base-denominated).
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
+        gasless: { $ref: "#/components/schemas/LegGasless" }
+        estimated_gas_usd: { $ref: "#/components/schemas/LegEstimatedGasUsd" }
         signable_payloads:
           type: array
           minItems: 1
@@ -1652,7 +2595,31 @@ components:
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
+            - type: array
+              items: { $ref: "#/components/schemas/Protocol" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
             - { type: "null" }
+          description: >-
+            One protocol pins routing to it. An array (1–4, unique) auto-routes within those
+            protocols only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. Narrowing by protocol never
+            relaxes admission: whatever survives still passes the same gates the unpinned route
+            applies. null/omitted = every protocol the ticker lists. To exclude one, send the
+            other three.
+        preferred_chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - { type: "null" }
+          description: >-
+            A preference, not a pin. The leg on this chain becomes `quote_index: 0` when the plan
+            has one; the other legs keep their price order, and none is added or dropped. Must be
+            one of the chains named in `chain` whenever `chain` is sent — a contradiction is
+            `400 invalid_request`, never a silent fallback. Absent, or naming a chain the plan has
+            no leg on, leaves the ordering exactly as it is today (cheapest first).
+        priority: { $ref: "#/components/schemas/Priority" }
+        execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
@@ -1695,7 +2662,34 @@ components:
         protocol:
           oneOf:
             - { $ref: "#/components/schemas/Protocol" }
+            - type: array
+              items: { $ref: "#/components/schemas/Protocol" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
             - { type: "null" }
+          description: >-
+            One protocol pins routing to it. An array (1–4, unique) auto-routes within those
+            protocols only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. Narrowing by protocol never
+            relaxes admission: whatever survives still passes the same gates the unpinned route
+            applies. null/omitted = every protocol the ticker lists. To exclude one, send the
+            other three.
+        preferred_chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - { type: "null" }
+          description: >-
+            A preference, not a pin. The greedy fill runs over this chain's holdings first and
+            over everything still unfilled after, so it changes which cells fill — never which
+            cells are eligible, and never the all-or-nothing submit rule. A cell on this chain
+            that cannot be priced on the first pass rejoins the second pass alongside the other
+            chains, so the preference costs at most one extra quote attempt and can never leave a
+            shortfall the unpinned fill would have covered. Must be one of the
+            chains named in `chain` whenever `chain` is sent — a contradiction is `400
+            invalid_request`. Absent = the plain greedy fill.
+        priority: { $ref: "#/components/schemas/Priority" }
+        execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
@@ -1704,6 +2698,72 @@ components:
         ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
       additionalProperties: false
       description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
+
+    QuotePreviewRequest:
+      type: object
+      description: >-
+        `QuoteBuyRequest` minus every wallet-bound field. `sol_wallet`, `eth_wallet`,
+        `ownership_proof` and `quote_only` are all rejected here as unknown keys — a preview binds
+        no wallet, so there is nothing to prove ownership of and nothing that could be executed.
+        `amount_usdc` is additionally capped at 1000000 on this route (unbounded on `/quote/buy`,
+        which settles against a real balance): above it the request is a 400.
+      required: [ticker, amount_usdc, max_slippage_bps]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        amount_usdc:
+          allOf:
+            - $ref: "#/components/schemas/UsdcHumanAmount"
+            - description: Preview-only bound — must be ≤ 1000000 USDC.
+        chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - type: array
+              items: { $ref: "#/components/schemas/Chain" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
+            - { type: "null" }
+          description: >-
+            One chain pins routing to it. An array (1–4, unique) auto-routes within those
+            chains only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. null/omitted = every
+            chain the ticker lists.
+        protocol:
+          oneOf:
+            - { $ref: "#/components/schemas/Protocol" }
+            - type: array
+              items: { $ref: "#/components/schemas/Protocol" }
+              minItems: 1
+              maxItems: 4
+              uniqueItems: true
+            - { type: "null" }
+          description: >-
+            One protocol pins routing to it. An array (1–4, unique) auto-routes within those
+            protocols only — `["x"]` is identical to `"x"`; a member the ticker has no cell on
+            is dropped, and an empty intersection is 422 no_routes. null/omitted = every protocol
+            the ticker lists. To exclude one, send the other three.
+        preferred_chain:
+          oneOf:
+            - { $ref: "#/components/schemas/Chain" }
+            - { type: "null" }
+          description: >-
+            A preference, not a pin — the leg on this chain becomes `quote_index: 0` when the
+            preview has one, and the rest keep their price order. Must be one of the chains named
+            in `chain` whenever `chain` is sent (`400 invalid_request` otherwise).
+        priority:
+          allOf: [{ $ref: "#/components/schemas/Priority" }]
+          description: >-
+            Accepted here so a preview prices what an executable `speed` request would route. The
+            preview binds no wallet, so the speed route is priced without one — its balance and
+            allowance conditions surface only on `/quote/buy` or `/quote/sell`.
+        execution:
+          allOf: [{ $ref: "#/components/schemas/Execution" }]
+          description: >-
+            Accepted so a preview prices the `user_operation` lane as it would execute (`gasless:
+            true`, `estimated_gas_usd: "0"`). No wallet is bound, so the delegation check runs
+            only on `/quote/buy` or `/quote/sell`.
+        max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+      additionalProperties: false
 
     TradeWarning:
       type: object
@@ -1723,7 +2783,31 @@ components:
             `off_reference` — a reference exists and the quote sits beyond its cap, in the direction
             that costs you. Beyond an implausibility bound the quote is refused outright instead
             (`no_routes` / `price_implausible`) and no acknowledgement can clear it.
-            Every other value is the routed cell's own `WarnReason`.
+            `speed_route_unavailable` — you sent `priority: "speed"` and the speed route could not
+            serve the named chain, so **that chain's leg is absent** from this response (it is never
+            returned on its relayed route instead). It carries `reason` and `chain` (the dropped
+            leg's chain — absent only when the whole speed route is off, which is a response-level
+            fact, not a per-leg one). Advisory — every leg that IS returned is fully executable;
+            re-quote without `priority` to get the relayed route on that chain.
+            The `reason` values this API emits today are exactly:
+            `disabled` (the speed route is switched off — this is the one reason with no `chain`),
+            `insufficient_balance` (the wallet is short the spent token),
+            `no_routes` (no reachable pool, or the built swap failed an integrity check), and
+            `provider_error` (an upstream failure, caught and downgraded — including a delegation
+            read that failed under `execution: "user_operation"`), and, under
+            `execution: "user_operation"` only, `wallet_not_delegated` (the wallet is not
+            EIP-7702-delegated to Modular Account v2 on the named chain) — where `disabled` then
+            also carries `chain` when it means "no bundler serves this chain yet". A missing router
+            allowance is not a reason: the quote bundles the approve instead (`SignableEvmTx`).
+            The list is **open** — this object does not restrict its properties, and a future release
+            may add a value — so branch on the ones you handle and treat anything else as
+            "speed route unavailable, reason unknown" rather than an error.
+            `speed_route_unpriced_gas` — the opposite outcome, and a separate code for exactly that
+            reason: the leg on the named `chain` **was** served on the speed route, but no USD gas
+            price was available, so its `estimated_gas_usd` is `null` and the route ranking ignored
+            gas for it. Carries `chain`, and no `reason`. Advisory — price the gas yourself before
+            choosing this leg over a gasless one.
+            Every other `code` value is the routed cell's own `WarnReason`.
       additionalProperties: true
 
     WarningsAckToken:
@@ -1731,7 +2815,9 @@ components:
       pattern: "^[0-9a-f]{32}$"
       description: >
         A digest over this `quote_id` and the exact `warnings[]` served with it. Present only
-        alongside a non-empty set. Echo it back as `acknowledged_warnings` on
+        alongside a non-empty set, and never on a preview — `quote_only` and `POST /quote/preview`
+        both omit it, having no `quote_id` to bind one to and nothing to submit it against. Echo it
+        back as `acknowledged_warnings` on
         `POST /trade/submit` to record that you received these warnings before executing —
         see that field for what the record does and does not mean.
 
@@ -1741,12 +2827,16 @@ components:
       properties:
         quote_id:
           type: string
-          description: Omitted on `quote_only` previews (no executable quote to submit).
+          description: >-
+            Omitted on `quote_only` previews and on `POST /quote/preview` (no executable quote to
+            submit).
         side: { type: string, enum: [buy] }
         ticker: { $ref: "#/components/schemas/Ticker" }
         expires_at:
           type: integer
-          description: Unix seconds. Re-quote after this time. Omitted on `quote_only` previews.
+          description: >-
+            Unix seconds. Re-quote after this time. Omitted on `quote_only` previews and on
+            `POST /quote/preview` — neither has an executable quote to expire.
         tradfi_reference:
           # Null when we had no reference to price-check against; the quote then carries a
           # `no_reference` entry in `warnings[]`. Always present as a key.
@@ -1822,6 +2912,7 @@ components:
         - side
         - tx_hash
         - order_hash
+        - user_op_hash
         - status
         - error_code
         - filled_shares
@@ -1837,6 +2928,12 @@ components:
         side: { type: string, enum: [buy, sell] }
         tx_hash: { type: [string, "null"] }
         order_hash: { type: [string, "null"] }
+        user_op_hash:
+          type: [string, "null"]
+          description: >-
+            `user_operation` legs only: the ERC-4337 op hash, from `broadcast` on; `tx_hash` is
+            null until the bundle mines, then carries the bundle transaction. Null on every other
+            leg.
         status: { $ref: "#/components/schemas/PublicLegStatus" }
         error_code: { type: [string, "null"] }
         filled_shares: { $ref: "#/components/schemas/DecimalString" }
@@ -1846,13 +2943,25 @@ components:
 
     QuoteStatusResponse:
       type: object
-      required: [quote_id, aggregate_status, is_cached, legs]
+      required: [quote_id, aggregate_status, is_cached, poll_after_ms, legs]
       properties:
         quote_id: { type: string }
         aggregate_status: { $ref: "#/components/schemas/AggregateStatus" }
         is_cached:
           type: boolean
-          description: True when served from the 10 s in-progress cache; false on DB-fresh reads and all terminal aggregates.
+          description: True when served from the in-progress cache; false on DB-fresh reads and all terminal aggregates.
+        poll_after_ms:
+          type: [integer, "null"]
+          description: |
+            Minimum useful interval before the next poll, in milliseconds. `1250` while a speed-route
+            leg submitted in the last 5 min is still in flight (it settles by receipt within a block
+            or two), `10250` when only gasless or Solana legs remain (the upstream order status is
+            synced at most every 10 s per leg regardless of poll rate) or a speed-route leg has
+            sat unmined past 5 min. `null` once `aggregate_status` is terminal — stop polling. The
+            value sits just above the server-side cache window so a client polling at it never reads
+            a stale entry. On a cached response (`is_cached: true`) it is the time left on that
+            cached view, not the full window, so a client that arrives late is not asked to wait
+            another one; it is never below 1000. Advisory: polling faster returns the cached view.
         legs:
           type: array
           items: { $ref: "#/components/schemas/PublicLeg" }
@@ -1887,15 +2996,109 @@ components:
           description: "0x-prefixed EIP-712 EOA signature (132 chars)."
       additionalProperties: false
 
+    SignedEvmTx:
+      type: object
+      description: >-
+        A whole signed EVM transaction — the reply to a `SignableEvmTx` (speed-route) leg. Sign the
+        payload's `tx_hex` unchanged and send the serialized result back; **you do not broadcast
+        it**, Treasures does, after checking that the bytes are the ones it issued (signer, chain,
+        `to`, calldata, value, nonce, gas and fees all bind against the quote), that the wallet
+        still holds the token and the native gas (and the allowance, on a single-payload leg), and
+        that the transaction still simulates. Any mismatch is a per-leg `invalid_signature`; a
+        simulation revert is `swap_reverted` (or `approve_failed` for a bundled approve) and
+        nothing is sent. A leg that issued two `SignableEvmTx` payloads needs **both** back, one
+        `evm_signed_tx` each; the server matches them by nonce.
+      required: [type, signed_tx_hex]
+      properties:
+        type: { type: string, enum: [evm_signed_tx] }
+        signed_tx_hex:
+          type: string
+          pattern: "^0x[0-9a-fA-F]+$"
+          maxLength: 16384
+          description: 0x-prefixed signed RLP transaction.
+      additionalProperties: false
+
+    SignedEvmUserOperation:
+      type: object
+      description: >-
+        The reply to a `SignableEvmCalls` leg: the sponsored, signed ERC-4337 **v0.7**
+        UserOperation (unpacked fields, `factory`/`factoryData` absent). Numeric fields as decimal
+        or `0x` hex strings; hex fields `0x`-prefixed. The server binds it to the quote (see
+        `SignableEvmCalls`), dedupes on its hash, re-checks balance (and allowance on a
+        single-call leg), simulates it on the bundler (`eth_estimateUserOperationGas` — a refusal
+        never reached the mempool: `nonce_conflict`, `sponsorship_rejected`, `swap_reverted`,
+        `provider_error`), then submits it. The result is `broadcast` with `user_op_hash` set and
+        `tx_hash` null; `/status` flips it once the bundle mines. Exactly one per leg; ≤ 16 KB.
+      required:
+        [
+          type,
+          user_operation,
+        ]
+      properties:
+        type: { type: string, enum: [evm_user_operation] }
+        user_operation:
+          type: object
+          required:
+            [
+              sender,
+              nonce,
+              callData,
+              callGasLimit,
+              verificationGasLimit,
+              preVerificationGas,
+              maxFeePerGas,
+              maxPriorityFeePerGas,
+              signature,
+            ]
+          properties:
+            sender: { $ref: "#/components/schemas/EvmAddress" }
+            nonce: { $ref: "#/components/schemas/Uint256String" }
+            callData: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+            callGasLimit: { $ref: "#/components/schemas/Uint128String" }
+            verificationGasLimit: { $ref: "#/components/schemas/Uint128String" }
+            preVerificationGas: { $ref: "#/components/schemas/Uint256String" }
+            maxFeePerGas: { $ref: "#/components/schemas/Uint128String" }
+            maxPriorityFeePerGas: { $ref: "#/components/schemas/Uint128String" }
+            paymaster: { $ref: "#/components/schemas/EvmAddress" }
+            paymasterVerificationGasLimit: { $ref: "#/components/schemas/Uint128String" }
+            paymasterPostOpGasLimit: { $ref: "#/components/schemas/Uint128String" }
+            paymasterData: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+            factory: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+            factoryData: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+            signature: { type: string, pattern: "^0x[0-9a-fA-F]*$", minLength: 4 }
+          additionalProperties: false
+      additionalProperties: false
+
+    Uint256String:
+      type: string
+      pattern: "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
+      description: >-
+        A uint256 as a decimal string, or as 0x-prefixed hex. The pattern admits up to 78 decimal
+        digits, which overshoots 2^256-1; the server bounds the VALUE as well and answers
+        `400 invalid_request` on an out-of-range one.
+
+    Uint128String:
+      type: string
+      pattern: "^(0x[0-9a-fA-F]{1,32}|[0-9]{1,39})$"
+      description: >-
+        A uint128 as a decimal string, or as 0x-prefixed hex — the ERC-4337 v0.7 PACKING width of the
+        gas-limit and fee fields (`accountGasLimits` and `gasFees` each pack two uint128s into one
+        32-byte slot). Bounded by value, not only by shape: an over-wide field is
+        `400 invalid_request` rather than a hasher throw.
+
     SignedPayload:
       oneOf:
         - $ref: "#/components/schemas/SignedSolanaPayload"
         - $ref: "#/components/schemas/SignedEvmPayload"
+        - $ref: "#/components/schemas/SignedEvmTx"
+        - $ref: "#/components/schemas/SignedEvmUserOperation"
       discriminator:
         propertyName: type
         mapping:
           solana_versioned_tx: "#/components/schemas/SignedSolanaPayload"
           evm_eip712_signature: "#/components/schemas/SignedEvmPayload"
+          evm_signed_tx: "#/components/schemas/SignedEvmTx"
+          evm_user_operation: "#/components/schemas/SignedEvmUserOperation"
 
     SignedLeg:
       type: object
@@ -1905,7 +3108,14 @@ components:
         signed_payloads:
           type: array
           minItems: 1
+          maxItems: 4
           items: { $ref: "#/components/schemas/SignedPayload" }
+          description: >-
+            One entry per payload the leg issued, IN THE ORDER THE QUOTE ISSUED THEM. A speed-route
+            leg may issue two (`approve` then `swap`) — sign and return both. Order is load-bearing
+            for idempotency: a replay is recognised by a hash over this array, so a re-submit that
+            reorders the entries is refused as a new submit (`leg_already_submitted`, 409). Fewer or
+            more entries than the leg issued is `incomplete_submit` (400), before anything is sent.
       additionalProperties: false
 
     TradeSubmitRequest:
@@ -1939,7 +3149,7 @@ components:
 
     LegResult:
       type: object
-      required: [quote_index, trade_id, status, tx_hash, order_hash, error_code]
+      required: [quote_index, trade_id, status, tx_hash, order_hash, user_op_hash, error_code]
       properties:
         quote_index: { type: integer, minimum: 0 }
         trade_id: { type: string }
@@ -1949,7 +3159,34 @@ components:
             [broadcast, broadcast_unknown, completed, failed, broadcast_failed]
         tx_hash: { type: [string, "null"] }
         order_hash: { type: [string, "null"] }
-        error_code: { type: [string, "null"] }
+        user_op_hash:
+          type: [string, "null"]
+          description: >-
+            `user_operation` legs only: the ERC-4337 op hash the bundler took, set from
+            `broadcast` on while `tx_hash` is still null (it becomes the bundle transaction once
+            mined — poll `/status`). Null on every other leg.
+        error_code:
+          type: [string, "null"]
+          description: >-
+            Per-leg failure reason — its own open vocabulary, never an HTTP `error` code:
+            `invalid_signature`, `quote_expired`, `not_enough_balance_or_allowance`,
+            `provider_error`, `status_check_exhausted`, one that only a `user_operation` leg can
+            carry — `sponsorship_rejected` (your paymaster refused to sponsor the op: deposit,
+            stake, rate limit, policy signature or a paymaster revert; nothing was submitted —
+            re-sponsor and re-sign) — and four that only a speed-route leg can
+            carry — `nonce_conflict` (another transaction from this wallet took the nonce: wait for
+            the earlier trade to go terminal, then re-quote), `insufficient_native_gas` (the signed
+            `gas × fee` exceeds the wallet's native balance: fund it, then re-quote), `swap_reverted`
+            (the swap reverted in simulation or on chain — nothing was spent on a simulation revert;
+            re-quote), `tx_dropped` (accepted by the node, then evicted without mining: re-quote and
+            re-sign), and `approve_failed` (a bundled `approve` reverted, or did not land within 10
+            minutes, so the swap was never sent: re-quote — if the approve did mine, the new quote
+            is single-payload). On any pair whose swap was never sent — `approve_failed`, and a
+            `nonce_conflict` / `provider_error` refused at the approve send — `tx_hash` is `null`,
+            because the swap hash the leg named never reached a node. `provider_error` now also
+            covers a speed-route pre-flight or transport failure — nothing was broadcast, so
+            re-quoting is safe. Treat an unrecognised
+            value as "failed, reason unknown".
 
     FailedLeg:
       type: object
@@ -2188,19 +3425,17 @@ components:
           type: array
           description: >-
             The sol/eth positions are read on-chain against the reconciler ledger.
-            **The two single-cell venues — Robinhood Chain (4663) and Base (8453) — are
-            only read for a wallet we already hold a ledger row for on that venue**: one
-            that has traded there through this API and reported it via `/trade/submit`.
-            Neither venue writes `client_balances`, so each read costs a live round-trip on
-            every request; skipping it for wallets that have never touched the venue keeps
-            it off the common path. The gate is **per (wallet, venue)** — trading on 4663
-            does not open the Base read, and vice versa.
-
-            Consequence: a holding on either venue that we hold no ledger row for — a direct
-            transfer into your own EOA, or a trade you never reported — is **not** listed,
-            and because nothing was read the response is **not** flagged `partial`. Report
-            your trades on both venues to keep positions complete. **Cash is never gated**
-            (`usdc.base`, `usdg.robinhood`), so a wallet holding only cash still reports it.
+            Positions on the two single-cell venues — Robinhood Chain (4663) and Base
+            (8453) — are read for every wallet Treasures knows on any chain,
+            snapshotted for 30 s (invalidated the moment a trade on that venue
+            settles). An `eth_wallet` that is not in Treasures's own custody, is not a
+            B2C wallet, and has no B2B ledger row anywhere gets an empty `positions`
+            list here with no RPC, and is not flagged `partial`. For a KNOWN wallet
+            there is no trade-history gate on top of that: a token transferred into
+            your own EOA from outside shows exactly like one bought through this API.
+            **Idle cash on these two venues (`usdc.base`, `usdg.robinhood`) is never
+            gated** — it still reads live even for an unknown wallet, so a wallet
+            holding only cash still reports it.
           items: { $ref: "#/components/schemas/PortfolioPosition" }
         usdc:
           type: object
