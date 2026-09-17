@@ -83,6 +83,9 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
       "cost_breakdown_bps": {
         "treasures_fee_bps": 30,
         "dex_swap_fee_bps": 8,
+        "integrator_fee_bps": 0,        // YOUR fee on this leg: your configured default, or the
+                                        // `integrator_fee_bps` you send (needs your X-API-Key). Already
+                                        // in estimated_output; submit the quote with the same key.
         "estimated_slippage_bps": 12,
         "slippage_vs_tradfi_bps": 75     // signed; positive = unfavorable. Always present on a 200
                                          // (a quote with no reference is refused, not returned).

@@ -122,6 +122,7 @@ Signing code, all-or-nothing per-proof rules, embedded-wallet troubleshooting, a
 | 403       | `address_blocked`                                                             | Wallet tied to a sanctioned entity — do not retry that wallet |
 | 410 / 404 | `quote_stale` / `quote_not_found`                                             | Re-quote                                                      |
 | 422       | `holdings_unknown` / 502 `provider_unavailable` / 503 `screening_unavailable` | Transient — backoff policy B, cap 5 attempts                  |
+| 503       | `portfolio_busy`                                                              | `/portfolio` only — honour `Retry-After`                      |
 | 429       | `Too many requests`                                                           | Honor `Retry-After` (delta-seconds)                           |
 
 ## Endpoint index

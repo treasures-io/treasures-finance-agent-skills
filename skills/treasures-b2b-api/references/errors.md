@@ -13,6 +13,7 @@ Top-level HTTP `error` codes. (Per-leg `error_code` values live inside `/quote/{
 | 400 | `invalid_request` | Schema/Zod validation failed. `message` names the offending field — e.g. `preferred_chain: must be one of the chains named in \`chain\`` when the preference contradicts the `chain` you sent (a contradiction is refused, never silently ignored), `priority: "speed" is not available on eth` when `priority:"speed"` is sent with `chain:"eth"` (eth has no speed route — [speed route](trading.md#speed)), or `protocol: must be one of ondo\|xstocks\|robinhood\|coinbase, or an array of 1–4 unique such values` / `protocol: must not repeat a protocol` | Permanent — fix payload |
 | 400 | `invalid_slippage` | `max_slippage_bps` outside bounds (`[10,5000]` quote, `[10,500]` bridge — response echoes cap) | Permanent — adjust |
 | 400 | `wallet_not_delegated` | (`/quote/buy`, `/quote/sell`, `chain`-pinned, `priority:"speed"` + `execution:"user_operation"`) the `eth_wallet` is not EIP-7702-delegated to Modular Account v2 on that `chain` (echoed in the body) — [user operation](trading.md#user-operation). Unpinned, the same condition drops that chain's leg with `speed_route_unavailable` / `wallet_not_delegated` | Permanent until you delegate — or re-quote with `execution:"transaction"` |
+| 400 | `invalid_integrator_fee` | (`/quote/*`, with your `X-API-Key`) the `integrator_fee_bps` you sent is above your ceiling (`max_bps` echoes it), or a venue Treasures routes through can't carry it — then `reason` says why: `fee_above_maximum` (too high for a venue), `fee_below_minimum` (too low for a venue — raise it, or send 0), or `fee_unavailable` (no fee can be charged on some route right now). Treat `reason` as an open set | Permanent — adjust the fee as `reason` says, send 0, or omit the field to use your configured default |
 | 400 | `incomplete_submit` | Sell missing legs, or `signed[]` empty | Permanent — sell all legs; buy submits exactly 1 |
 | 400 | `quote_index_mismatch` | Buy submitted >1 leg, unknown index, or duplicate | Permanent — re-quote with chain filter, or dedupe |
 | 400 | `same_chain_bridge` | Bridge `from_chain == to_chain` | Permanent |
@@ -35,10 +36,12 @@ Top-level HTTP `error` codes. (Per-leg `error_code` values live inside `/quote/{
 | 429 | `Too many requests` | Per-IP or per-(IP, wallet) limit. Body is the literal string `Too many requests` (not an enum) | Transient — honor `Retry-After` |
 | 502 | `provider_unavailable` | Upstream 5xx/429/network (quote venue, bridge, price feed, or RPC) | Transient — **policy B** |
 | 503 | `screening_unavailable` | Sanctions screening couldn't complete; request fails closed | Transient — **policy B** |
+| 503 | `portfolio_busy` | `/portfolio` only: the server is already computing as many fresh snapshots as it safely can and yours was not cached. Body `{ "error": "portfolio_busy" }` | Transient — sleep `Retry-After` (delta-seconds, currently 5) and retry the same request; a cached snapshot is never refused |
+| 503 | `integrator_fee_misconfigured` | (`/quote/*`, with your `X-API-Key`) your configured fee schedule no longer fits a venue Treasures routes through — a Treasures-side configuration issue, not your request | Not cleared by retrying soon — contact Treasures. To trade without your fee meanwhile, send `integrator_fee_bps: 0` |
 
 ## Rate limits
 
-Per-IP and per-(IP, wallet) buckets, 60s windows. **The numbers below are conservative floors** — the server's real per-endpoint ceilings are equal or higher — **but every caller is additionally capped by a global 300 requests/min per IP across _all_ endpoints** (see below), which is the binding limit for high-frequency polling. Pace to the 300/min aggregate, not the per-endpoint row:
+Per-IP and per-(IP, wallet) buckets, 60s windows. **The numbers below are conservative floors** — the server's real per-endpoint ceilings are equal or higher — **but every caller is additionally capped by a blanket per-IP ceiling across _all_ endpoints** (see below), which is the binding limit for high-frequency polling. Pace to that aggregate, not the per-endpoint row:
 
 | Endpoint group | Per-IP / min | Per-wallet / min |
 | --- | --- | --- |
@@ -50,15 +53,20 @@ Per-IP and per-(IP, wallet) buckets, 60s windows. **The numbers below are conser
 | `/bridge/quote` | 30 | 60 |
 | `/bridge/{id}/status` | 180 | — |
 | `/stocks/tickers`, `/stocks/prices` | 60 each (separate buckets) | — |
-| `/portfolio`, `/trades` | 60 | 60 |
+| `/portfolio` | 600 (anonymous callers only — see below) | 60 |
+| `/trades` | 60 | 60 |
 
-**Global ceiling.** A blanket **300 requests / minute per IP** applies across *all* endpoints combined (every route except health), on top of the per-endpoint buckets above. High-frequency polling (`/status` at 1 Hz across many quotes, plus `/portfolio` / `/trades`) is bounded by this aggregate, not the per-endpoint number — keep your **total** request rate under 300/min/IP, or spread across IPs.
+**Authenticated polling.** With a general `X-API-Key`, `/portfolio` is not bucketed by IP — your organisation bucket is the bound, sized for one request every 5 s per active end-user. Anonymous `/portfolio` calls keep the per-IP row.
+
+**Global ceiling.** A blanket per-IP ceiling, set per environment and always at or above the per-endpoint rows, applies across *all* endpoints combined (every route except health and `/portfolio`), on top of the per-endpoint buckets above. High-frequency polling (`/status` at 1 Hz across many quotes, plus `/trades`) is bounded by this aggregate, not the per-endpoint number — pace your **total** request rate to it, or spread across IPs.
 
 **`/quote/preview` also has a ceiling shared by every caller.** On top of its per-IP row and your per-organisation bucket, that route carries one global limit that all callers draw on together — it exists because a preview needs no wallet and so is the cheapest request to make in bulk. A `429` on `/quote/preview` can therefore be someone else's traffic rather than your own quota: honour `Retry-After` and re-check rather than backing off for the rest of the minute. Nothing else on the API has a shared bucket.
 
 **`X-RateLimit-*` on `/quote/preview` describes that shared bucket, not yours.** The headers always report the **last** limiter applied, and on this route that is the global ceiling — so `X-RateLimit-Remaining: 0` means the route is saturated across all callers, not that you have exhausted a per-caller window. Sleep `Retry-After` seconds and retry; do not treat it as a minute-long personal backoff, and do not size your own pacing off `X-RateLimit-Limit` here.
 
 429 returns `{ "error": "Too many requests" }` + a `Retry-After` header in **delta-seconds** (integer, e.g. `12` — never an HTTP-date). Sleep exactly that long; don't retry sooner.
+
+`/portfolio` snapshots refresh on a 30 s cadence (`as_of`, `is_cached`); polling faster than that returns the same snapshot.
 
 **Mid-flow 429 on a multi-leg sell.** `/trade/submit` is IP-only rate-limited (60/min). If a 429 hits between signing and submitting, the signed payloads stay valid until `quote.expires_at` — wait out `Retry-After` and submit unchanged. If `Retry-After` would push you past `expires_at − 5s`, re-quote on a fresh `quote_id`.
 

@@ -434,6 +434,7 @@ paths:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
                   - $ref: "#/components/schemas/WalletNotDelegatedError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
         "401":
           description: Ownership-proof failure.
           content:
@@ -464,7 +465,7 @@ paths:
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
-        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+        "503": { $ref: "#/components/responses/QuoteServiceUnavailable" }
 
   /quote/preview:
     post:
@@ -518,6 +519,7 @@ paths:
                 anyOf:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
         "401":
           description: No integrator key presented, or an unknown one.
           content:
@@ -550,6 +552,16 @@ paths:
                   { value: { error: basket_price_unavailable } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
+        "503":
+          description: |
+            Your configured fee schedule no longer fits a venue Treasures routes through
+            (`integrator_fee_misconfigured`). A Treasures-side configuration issue that retrying soon
+            won't clear — contact Treasures, or send `integrator_fee_bps: 0` to preview without your fee.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: integrator_fee_misconfigured }
 
   /quote/sell:
     post:
@@ -583,6 +595,7 @@ paths:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
                   - $ref: "#/components/schemas/WalletNotDelegatedError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
         "401":
           description: Ownership-proof failure.
           content:
@@ -614,7 +627,7 @@ paths:
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
-        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+        "503": { $ref: "#/components/responses/QuoteServiceUnavailable" }
 
   /quote/{quote_id}/status:
     get:
@@ -659,6 +672,10 @@ paths:
         Idempotent on `(quote_id, quote_index)`. The per-leg signed payload IS the
         authorization proof — no `ownership_proof` required here. Re-quote (`410
         quote_stale`) if the cached snapshot expired between issue and submit.
+
+        A quote that carries your integrator fee (`integrator_fee_bps > 0` on any leg) can
+        only be submitted with the same `X-API-Key` that quoted it; anything else is `403
+        quote_integrator_mismatch` and nothing is broadcast. Zero-fee quotes are unaffected.
       requestBody:
         required: true
         content:
@@ -921,6 +938,7 @@ paths:
                 $ref: "#/components/schemas/PortfolioResponse"
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/PortfolioBusy" }
 
   /trades:
     get:
@@ -1236,6 +1254,35 @@ components:
           schema:
             $ref: "#/components/schemas/SimpleError"
           example: { error: screening_unavailable }
+    PortfolioBusy:
+      description: |
+        The server is already computing as many fresh snapshots as it safely can
+        and yours was not cached — retry after `Retry-After` seconds; cached
+        snapshots are never refused.
+      headers:
+        Retry-After:
+          description: Delta-seconds to wait before retrying the same request.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: portfolio_busy }
+    QuoteServiceUnavailable:
+      description: |
+        `screening_unavailable`: sanctions screening could not be completed and the request was
+        rejected (fail-closed). Transient — back off and retry.
+        `integrator_fee_misconfigured` (with an `X-API-Key`): your configured fee schedule no longer
+        fits a venue Treasures routes through. A Treasures-side configuration issue that retrying
+        soon won't clear — contact Treasures, or send `integrator_fee_bps: 0` to quote without your fee.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          examples:
+            screening_unavailable: { value: { error: screening_unavailable } }
+            integrator_fee_misconfigured: { value: { error: integrator_fee_misconfigured } }
 
   schemas:
     # ------------ Listing-tradability advisory (shared by every surface that carries it) ---
@@ -2410,8 +2457,16 @@ components:
       # Flip it to required once partners have rolled forward.
       required: [treasures_fee_bps, dex_swap_fee_bps, estimated_slippage_bps]
       properties:
-        treasures_fee_bps: { type: integer, description: Treasures' integrator fee. }
+        treasures_fee_bps: { type: integer, description: Treasures' own fee, net. }
         dex_swap_fee_bps: { type: integer, description: Provider protocol + swap/execution fee. }
+        integrator_fee_bps:
+          type: integer
+          description: >-
+            Your own fee on this leg, net (D-IntegratorFee) — your configured default, or the
+            `integrator_fee_bps` you sent, stacked into the same on-wire fee as Treasures' and
+            paid out to you. Always emitted; `0` on an anonymous quote or a leg whose venue could
+            not collect it. Not yet in `required`, like `price_impact_bps`, so a strict validator
+            built against an older copy of this spec keeps working.
         estimated_slippage_bps:
           type: integer
           description: >-
@@ -2621,6 +2676,7 @@ components:
         priority: { $ref: "#/components/schemas/Priority" }
         execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
@@ -2691,6 +2747,7 @@ components:
         priority: { $ref: "#/components/schemas/Priority" }
         execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
@@ -2763,7 +2820,37 @@ components:
             true`, `estimated_gas_usd: "0"`). No wallet is bound, so the delegation check runs
             only on `/quote/buy` or `/quote/sell`.
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
       additionalProperties: false
+
+    IntegratorFeeBps:
+      type: integer
+      minimum: 0
+      maximum: 10000
+      description: >-
+        Your fee on this quote, net bps (D-IntegratorFee), overriding the default we configured for
+        your key, up to your per-partner ceiling. Omit to use the default. Requires an `X-API-Key`
+        (`tik_…`) — a non-zero value without one is `400 integrator_fee_requires_api_key`. It is
+        stacked into the same on-wire fee as Treasures' and already reflected in
+        `estimated_output_*`; on Solana the venue keeps half of that fee, so it charges the trader
+        twice this figure for you to net it. A quote that carries your fee can only be submitted
+        with your key (`403 quote_integrator_mismatch`).
+
+    IntegratorFeeError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, enum: [invalid_integrator_fee, integrator_fee_requires_api_key] }
+        max_bps:
+          type: integer
+          description: Your per-request ceiling — present on `invalid_integrator_fee`.
+        reason:
+          type: string
+          description: >-
+            Why a venue refused the requested fee, when that is the cause rather than your ceiling:
+            `fee_above_maximum`, `fee_below_minimum` (raise it, or send 0), or `fee_unavailable` (no
+            fee can be charged on some route right now). An open set — treat an unrecognised value
+            as "this fee can't be charged".
 
     TradeWarning:
       type: object
@@ -3672,8 +3759,11 @@ components:
       properties:
         name:
           type: string
-          enum: [treasures_fee, dex_fee]
+          enum: [treasures_fee, dex_fee, integrator_fee]
           description: >-
+            `integrator_fee` is your own fee on the trade (D-IntegratorFee), present only when the
+            trade carried one — it is what payouts to you are summed from, entry by entry.
+
             `treasures_fee` is our own take and is always present. `dex_fee` is the
             venue's take, net of ours, and is present only when it was recorded — trades
             settled before it was captured omit the entry rather than reporting a

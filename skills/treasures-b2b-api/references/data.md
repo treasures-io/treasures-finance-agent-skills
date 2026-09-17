@@ -288,10 +288,14 @@ Three things that will otherwise surprise you:
                               "price_usd_per_share": "166.946666666666" } },
     // dex_fee is the venue's take, net of ours. Absent (not 0) on trades settled before it was
     // recorded; a recorded 0 is emitted and means the venue charged no fee.
+    // integrator_fee is YOUR fee on the trade, present only when it carried one — your payouts are
+    // the sum of these entries, truncated exactly as shown here.
     "fee_costs": [{ "name": "treasures_fee", "percentage": "0.0025",
                     "amount_usd": "0.626050", "included": true },
                   { "name": "dex_fee", "percentage": "0.0010",
-                    "amount_usd": "0.250420", "included": true }]
+                    "amount_usd": "0.250420", "included": true },
+                  { "name": "integrator_fee", "percentage": "0.0020",
+                    "amount_usd": "0.500840", "included": true }]
   }],
   "next_cursor": "MjAyNi0wNy0zMFQx...",  // pass back as ?cursor= ; null on the last page
   "has_more": true
