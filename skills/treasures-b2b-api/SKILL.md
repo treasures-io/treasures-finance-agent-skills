@@ -36,7 +36,7 @@ This entry doc is the map + the footguns. **It is not enough on its own to execu
 | [`references/auth.md`](references/auth.md)         | building the `ownership_proof` (esp. on embedded/managed Solana wallets)                                    |
 | [`references/trading.md`](references/trading.md)   | quoting/submitting a buy or sell, signing trade legs, polling quote status, or setting first-time approvals |
 | [`references/bridging.md`](references/bridging.md) | bridging USDC between chains (incl. the `nonce=0` EVM trap)                                                 |
-| [`references/data.md`](references/data.md)         | reading `/stocks/*`, `/portfolio`, `/trades`, or `/settlements` (your own settled trades)                     |
+| [`references/data.md`](references/data.md)         | reading `/stocks/*`, `/portfolio`, `/trades`, `/settlements` (your own settled trades), or `/payouts` (your fee payouts) |
 | [`references/errors.md`](references/errors.md)     | handling an error code, rate limits, or simulating a tx before broadcast                                    |
 
 ## TL;DR — happy path
@@ -91,7 +91,7 @@ Set `allowance = max-uint256` once. Approve code + the `approval_spender` null/n
 
 ## Auth essentials
 
-Three endpoints require an `ownership_proof`: `POST /quote/buy`, `POST /quote/sell`, and `POST /bridge/quote` (**both** `sol_signature` + `eth_signature` mandatory on bridge — it spans both chains). Three more require your integrator key in `X-API-Key`: `GET /settlements`, `POST /quote/preview` and `GET /stocks/{ticker}`. Everything else is unauthenticated; `/trade/submit` is gated by the per-leg signed payload itself.
+Three endpoints require an `ownership_proof`: `POST /quote/buy`, `POST /quote/sell`, and `POST /bridge/quote` (**both** `sol_signature` + `eth_signature` mandatory on bridge — it spans both chains). Four more require your integrator key in `X-API-Key`: `GET /settlements`, the `/payouts` routes (general `tik_` key only), `POST /quote/preview` and `GET /stocks/{ticker}`. Everything else is unauthenticated; `/trade/submit` is gated by the per-leg signed payload itself.
 
 Sign this exact UTF-8 byte string (lines joined with `\n`) with each wallet's key:
 
@@ -142,7 +142,9 @@ Signing code, all-or-nothing per-proof rules, embedded-wallet troubleshooting, a
 | `/bridge/{bridge_quote_id}/status`               | none                                | GET    |
 | `/portfolio?sol_wallet=&eth_wallet=&source=`     | none                                | GET    |
 | `/trades?sol_wallet=&eth_wallet=&limit=&offset=&source=` | none                        | GET    |
-| `/settlements?limit=&cursor=&chain=&protocol=&ticker=&side=&token_out_address=&settled_from=&settled_to=` | `X-API-Key` (required) | GET |
+| `/settlements?limit=&cursor=&chain=&protocol=&ticker=&side=&token_out_address=&settled_from=&settled_to=&payout_id=&payout_status=` | `X-API-Key` (required) | GET |
+| `/payouts/accrued` · `/payouts?limit=&cursor=` · `/payouts/{payoutId}` | `X-API-Key` (`tik_` required) | GET |
+| `/payouts` (pay out everything owed; empty body) | `X-API-Key` (`tik_`) + `Idempotency-Key` | POST |
 
 ## Version & compatibility
 

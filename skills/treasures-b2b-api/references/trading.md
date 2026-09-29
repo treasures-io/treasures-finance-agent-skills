@@ -58,6 +58,7 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
   "preferred_chain": "sol" | null,       // put this chain first — a PREFERENCE, not a filter: it reorders, it never narrows. Buy: that chain's leg becomes quote_index 0. Sell: it is filled from first, then the rest. Must be one of the chains in `chain` when you send `chain` (else 400); a chain with nothing to offer falls back to normal ordering. Sell guarantee: preferred-chain holdings that cannot be priced on the first attempt rejoin the rest of the fill, so the preference can never leave a sell short — see POST /quote/sell
   "priority": "speed" | null,            // null/omitted = today's routing. "speed" asks for the speed route on robinhood/base — see below
   "max_slippage_bps": 50,                // 10 ≤ value ≤ 5000
+  "integrator_fee_bps": 25,              // optional, needs your X-API-Key (tik_): YOUR fee on this quote in net bps, overriding your configured default up to your ceiling; omit to use the default. A quote carrying it must be submitted with the same key (403 quote_integrator_mismatch). Paid out via /payouts (see data.md)
   "sol_wallet": "...", "eth_wallet": "0x...",   // at least one
   "ownership_proof": { /* see auth.md */ },
   "quote_only": false                    // true = price-only preview (see below); buy-only
@@ -83,6 +84,9 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
       "cost_breakdown_bps": {
         "treasures_fee_bps": 30,
         "dex_swap_fee_bps": 8,
+        "integrator_fee_bps": 0,        // YOUR fee on this leg: your configured default, or the
+                                        // `integrator_fee_bps` you send (needs your X-API-Key). Already
+                                        // in estimated_output; submit the quote with the same key.
         "estimated_slippage_bps": 12,
         "slippage_vs_tradfi_bps": 75     // signed; positive = unfavorable. Always present on a 200
                                          // (a quote with no reference is refused, not returned).

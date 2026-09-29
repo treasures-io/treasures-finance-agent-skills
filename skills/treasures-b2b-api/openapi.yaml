@@ -15,13 +15,14 @@ info:
     **Auth.** Only `POST /quote/buy`, `POST /quote/sell` and `POST /bridge/quote`
     require `ownership_proof` (wallet-key signature over a canonical challenge,
     see `OwnershipProof`). `POST /trade/submit` is gated by the per-leg signed
-    payload itself. Three routes **require** an integrator API key in `X-API-Key`
-    (see `IntegratorApiKey`): `GET /settlements`, `POST /quote/preview` (which binds
+    payload itself. These routes **require** an integrator API key in `X-API-Key`
+    (see `IntegratorApiKey`): `GET /settlements`, the `/payouts` routes (your
+    integrator fees and their payouts), `POST /quote/preview` (which binds
     no wallet, so the key is what identifies the caller) and `GET /stocks/{ticker}`
     (whose profile, analyst, earnings and news blocks are served to contracted
     integrators only). Every other route may be called anonymously.
 
-    **Integrator API keys are optional on every route but those three, and never
+    **Integrator API keys are optional on every route but those, and never
     ignored.** If you send `X-API-Key` on any route, a key beginning `tik_`/`trk_`
     is verified and a bad one is rejected rather than silently downgraded to
     anonymous:
@@ -67,6 +68,8 @@ tags:
     description: Wallet-scoped trade history.
   - name: Settlements
     description: Your organisation's own settled trade ledger, for reporting.
+  - name: Payouts
+    description: What you are owed in integrator fees, and the payouts that paid them.
 
 paths:
   /stocks:
@@ -438,6 +441,7 @@ paths:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
                   - $ref: "#/components/schemas/WalletNotDelegatedError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
         "401":
           description: Ownership-proof failure.
           content:
@@ -468,7 +472,7 @@ paths:
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
-        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+        "503": { $ref: "#/components/responses/QuoteServiceUnavailable" }
 
   /quote/preview:
     post:
@@ -522,6 +526,7 @@ paths:
                 anyOf:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
         "401":
           description: No integrator key presented, or an unknown one.
           content:
@@ -554,6 +559,17 @@ paths:
                   { value: { error: basket_price_unavailable } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
+        "503":
+          description: |
+            Your configured fee schedule no longer fits a venue Treasures routes through
+            (`integrator_fee_misconfigured`). A Treasures-side configuration issue that retrying soon
+            won't clear; contact Treasures, or send `integrator_fee_bps: 0` to preview without your fee.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: integrator_fee_misconfigured }
+
   /quote/sell:
     post:
       operationId: quoteSell
@@ -588,6 +604,7 @@ paths:
                   - $ref: "#/components/schemas/InvalidRequestError"
                   - $ref: "#/components/schemas/InvalidSlippageError"
                   - $ref: "#/components/schemas/WalletNotDelegatedError"
+                  - $ref: "#/components/schemas/IntegratorFeeError"
               examples:
                 payout_wallet_missing:
                   value:
@@ -632,7 +649,7 @@ paths:
         "403": { $ref: "#/components/responses/AddressBlocked" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
-        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
+        "503": { $ref: "#/components/responses/QuoteServiceUnavailable" }
 
   /quote/{quote_id}/status:
     get:
@@ -678,6 +695,9 @@ paths:
         authorization proof; no `ownership_proof` is required here. Re-quote (`410
         quote_stale`) if the cached snapshot expired between issue and submit.
 
+        A quote that carries your integrator fee (`integrator_fee_bps > 0` on any leg) can
+        only be submitted with the same `X-API-Key` that quoted it; anything else is `403
+        quote_integrator_mismatch` and nothing is broadcast. Zero-fee quotes are unaffected.
       requestBody:
         required: true
         content:
@@ -1146,6 +1166,25 @@ paths:
             type: integer
             minimum: 0
             maximum: 253402300798
+        - name: payout_id
+          in: query
+          description: >-
+            Only the trades whose integrator fee went out in this payout, the entries a
+            payout's `amount_usd` is summed from. Another organisation's payout id matches
+            nothing.
+          schema:
+            type: string
+            pattern: "^ipo_[A-Za-z0-9_-]{1,64}$"
+        - name: payout_status
+          in: query
+          description: >-
+            Where each trade's integrator fee stands. `unpaid`: no payout has claimed it yet;
+            these entries sum exactly to `GET /payouts/accrued`. `processing` / `paid`: the
+            status of the payout that claimed it. Only trades that carried an integrator fee
+            match any value.
+          schema:
+            type: string
+            enum: [unpaid, processing, paid]
       responses:
         "200":
           description: OK
@@ -1182,6 +1221,216 @@ paths:
               example: { error: "key_revoked" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
+  /payouts/accrued:
+    get:
+      operationId: getAccruedIntegratorFees
+      tags: [Payouts]
+      summary: What you are owed right now, and where it will be paid
+      security:
+        - IntegratorApiKey: []
+      description: |
+        The sum of the `integrator_fee` entries on your settled trades that no payout has
+        claimed yet: exactly the entries `GET /settlements?payout_status=unpaid` lists, with
+        the same truncation. Fees earned on every chain are pooled into one USD figure
+        (USDC and USDG count 1:1).
+
+        `payout_address` / `payout_chain` are where payouts go. Only Treasures can set or
+        change them; ask your contact. `previous_payout_address` and
+        `payout_address_updated_at` show the last change, so an unexpected one is visible
+        to you.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccruedIntegratorFees" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              example: { error: "invalid_api_key" }
+        "403":
+          description: >-
+            `insufficient_scope`: a reporting key. `key_revoked` / `integrator_suspended` as
+            on every route.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              example: { error: "insufficient_scope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /payouts:
+    post:
+      operationId: requestPayout
+      tags: [Payouts]
+      summary: Pay out everything you are owed, to your registered address
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Sends **all** of your accrued integrator fees (`GET /payouts/accrued`) to your registered
+        payout address, from Treasures' payout treasury. You choose nothing: the amount is what you are
+        owed, the destination is the address Treasures registered, and the body must be empty (or `{}`).
+
+        **`Idempotency-Key` is required.** A key is yours forever: repeating it returns the payout it
+        first created, whatever its status, including `failed`. To try again after a failure, send a
+        new key. Only one payout can be in progress at a time.
+
+        Limits: at least `minimum_usd`, at most `maximum_usd` (larger balances are paid out by
+        Treasures on request), one payout per cooldown window, and none for a while after your payout
+        address changes. `GET /payouts/accrued` reports all of them, including `next_eligible_at`.
+
+        `202` means the transfer was sent or is being sent. Poll `GET /payouts/{payoutId}` until
+        `status` is `paid` (or `failed`, in which case the fees are owed to you again).
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 128
+            pattern: "^[A-Za-z0-9_-]+$"
+      responses:
+        "202":
+          description: Payout created and sent (or being sent).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payout" }
+        "200":
+          description: The original payout, replayed for an `Idempotency-Key` you already used.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payout" }
+        "400":
+          description: >-
+            `missing_idempotency_key`, `invalid_idempotency_key`, or a non-empty body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "409":
+          description: >-
+            `payout_in_progress` (with `payout_id`), `payout_cooldown` / `address_hold` (with
+            `retry_after`, Unix seconds, and a `Retry-After` header), `payout_address_missing` (ask
+            Treasures to register one), `nothing_to_pay`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "422":
+          description: >-
+            `below_minimum` (with `amount_usd`, `minimum_usd`) or `requires_review` (with
+            `amount_usd`, `maximum_usd`; Treasures pays balances this large on request).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503":
+          description: "`payouts_unavailable`: payouts are paused or cannot be made right now. Retry later."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+    get:
+      operationId: listPayouts
+      tags: [Payouts]
+      summary: Your payout history, newest first
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Every payout of your integrator fees, newest first. Pass the previous response's
+        `next_cursor` back as `cursor` to page. To see the trades a payout covered, call
+        `GET /settlements?payout_id=…`.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          description: Opaque cursor from a prior response's `next_cursor`.
+          schema:
+            type: string
+            maxLength: 256
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PayoutsResponse" }
+        "400":
+          description: >-
+            Invalid query. `cursor: malformed` means restart from the first page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvalidRequestError" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /payouts/{payoutId}:
+    get:
+      operationId: getPayout
+      tags: [Payouts]
+      summary: One of your payouts
+      security:
+        - IntegratorApiKey: []
+      parameters:
+        - name: payoutId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payout" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "404":
+          description: >-
+            No such payout of yours. Another organisation's payout id answers the same, so
+            the response never reveals whether an id exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              example: { error: "payout_not_found" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
 components:
   securitySchemes:
     IntegratorApiKey:
@@ -1193,8 +1442,8 @@ components:
         access) and `trk_…` (reporting: read-only, intended to be handed to a
         third party, and accepted **only** on the reporting routes: today just
         `GET /settlements`. Every other route in this spec answers
-        `insufficient_scope`). Required by `GET /settlements`, by
-        `POST /quote/preview` and by `GET /stocks/{ticker}` (the latter two take a
+        `insufficient_scope`). Required by `GET /settlements`, by the `/payouts` routes,
+        by `POST /quote/preview` and by `GET /stocks/{ticker}` (all but `/settlements` take a
         general `tik_` key only, being non-reporting routes); accepted on every other
         route for attribution and a per-organisation rate bucket. Send it on `POST /trade/submit` too; that is what makes a trade
         appear in your `GET /settlements` reporting.
@@ -1284,6 +1533,21 @@ components:
           schema:
             $ref: "#/components/schemas/SimpleError"
           example: { error: portfolio_busy }
+    QuoteServiceUnavailable:
+      description: |
+        `screening_unavailable`: sanctions screening could not be completed and the request was
+        rejected (fail-closed). Transient; back off and retry.
+        `integrator_fee_misconfigured` (with an `X-API-Key`): your configured fee schedule no longer
+        fits a venue Treasures routes through. A Treasures-side configuration issue that retrying
+        soon won't clear; contact Treasures, or send `integrator_fee_bps: 0` to quote without your fee.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          examples:
+            screening_unavailable: { value: { error: screening_unavailable } }
+            integrator_fee_misconfigured: { value: { error: integrator_fee_misconfigured } }
+
   schemas:
     # ------------ Listing-tradability advisory (shared by every surface that carries it) ---
     Tradability:
@@ -2581,7 +2845,7 @@ components:
       # Flip it to required once partners have rolled forward.
       required: [treasures_fee_bps, dex_swap_fee_bps, estimated_slippage_bps]
       properties:
-        treasures_fee_bps: { type: integer, description: Treasures' integrator fee. }
+        treasures_fee_bps: { type: integer, description: Treasures' own fee, net. }
         dex_swap_fee_bps:
           type: [integer, "null"]
           description: >-
@@ -2589,6 +2853,14 @@ components:
             (`origin_chain` present): the hop's cost is disclosed instead in
             `cross_chain_cost_bps`/`cross_chain_cost_usdc` on the leg, and a recorded `0` here would
             claim the venue charged nothing. Always a number on a same-chain leg.
+        integrator_fee_bps:
+          type: integer
+          description: >-
+            Your own fee on this leg, net: your configured default, or the
+            `integrator_fee_bps` you sent, stacked into the same on-wire fee as Treasures' and
+            paid out to you. Always emitted; `0` on an anonymous quote or a leg whose venue could
+            not collect it. Not yet in `required`, like `price_impact_bps`, so a strict validator
+            built against an older copy of this spec keeps working.
         estimated_slippage_bps:
           type: integer
           description: >-
@@ -2862,6 +3134,7 @@ components:
         priority: { $ref: "#/components/schemas/Priority" }
         execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
@@ -2964,6 +3237,7 @@ components:
             enough of it can pay out on this chain, or a cross-chain leg was refused or could not
             land. A leg that fails on our side does not count toward that reason; re-quote.
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
         sol_wallet:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
@@ -3036,7 +3310,37 @@ components:
             true`, `estimated_gas_usd: "0"`). No wallet is bound, so the delegation check runs
             only on `/quote/buy` or `/quote/sell`.
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
+        integrator_fee_bps: { $ref: "#/components/schemas/IntegratorFeeBps" }
       additionalProperties: false
+
+    IntegratorFeeBps:
+      type: integer
+      minimum: 0
+      maximum: 10000
+      description: >-
+        Your fee on this quote, net bps, overriding the default we configured for
+        your key, up to your per-partner ceiling. Omit to use the default. Requires an `X-API-Key`
+        (`tik_…`); a non-zero value without one is `400 integrator_fee_requires_api_key`. It is
+        stacked into the same on-wire fee as Treasures' and already reflected in
+        `estimated_output_*`; on Solana the venue keeps half of that fee, so it charges the trader
+        twice this figure for you to net it. A quote that carries your fee can only be submitted
+        with your key (`403 quote_integrator_mismatch`).
+
+    IntegratorFeeError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, enum: [invalid_integrator_fee, integrator_fee_requires_api_key] }
+        max_bps:
+          type: integer
+          description: Your per-request ceiling; present on `invalid_integrator_fee`.
+        reason:
+          type: string
+          description: >-
+            Why a venue refused the requested fee, when that is the cause rather than your ceiling:
+            `fee_above_maximum`, `fee_below_minimum` (raise it, or send 0), or `fee_unavailable` (no
+            fee can be charged on some route right now). An open set; treat an unrecognised value
+            as "this fee can't be charged".
 
     TradeWarning:
       type: object
@@ -4018,6 +4322,99 @@ components:
             precision is not part of this contract; do not hardcode a scale.
         token: { $ref: "#/components/schemas/SettlementToken" }
 
+    AccruedIntegratorFees:
+      type: object
+      additionalProperties: false
+      required:
+        [amount_usd, trade_count, payout_chain, payout_address, previous_payout_address, payout_address_updated_at, payouts_enabled, minimum_usd, maximum_usd, next_eligible_at]
+      properties:
+        amount_usd:
+          type: string
+          description: Owed to you now, in USD at 6 dp, truncated.
+          example: "412.300000"
+        trade_count:
+          type: integer
+        payout_chain:
+          type: [string, "null"]
+          enum: [sol, base, null]
+          description: The chain payouts are sent on. `null` until Treasures registers an address.
+        payout_address:
+          type: [string, "null"]
+          description: The one address payouts go to. EVM addresses are EIP-55 checksummed.
+        previous_payout_address:
+          type: [string, "null"]
+          description: The address the last change replaced; `null` if it has never changed.
+        payout_address_updated_at:
+          type: [integer, "null"]
+          description: Unix seconds of the last registration or change.
+        payouts_enabled:
+          type: boolean
+          description: Whether `POST /payouts` is open on this environment.
+        minimum_usd:
+          type: string
+          description: The smallest payout `POST /payouts` makes.
+        maximum_usd:
+          type: string
+          description: The largest payout `POST /payouts` makes; above it, Treasures pays on request.
+        next_eligible_at:
+          type: [integer, "null"]
+          description: >-
+            Unix seconds before which `POST /payouts` will refuse (cooldown or address hold); `null`
+            when nothing is waiting.
+
+    Payout:
+      type: object
+      additionalProperties: false
+      required:
+        [payout_id, status, amount_usd, trade_count, chain, to_address, tx_hash, created_at, paid_at]
+      properties:
+        payout_id:
+          type: string
+          example: "ipo_V1StGXR8Z5jdHi6BmyT2k9"
+        status:
+          type: string
+          enum: [processing, paid, failed, cancelled]
+          description: >-
+            `processing`: created or sent, not yet final. `paid`: final (see `tx_hash`). `failed`: the
+            transfer did not happen; its fees are owed to you again. `cancelled`: withdrawn before
+            sending; its fees went back into what you are owed.
+        amount_usd:
+          type: string
+          description: >-
+            Sum of the `integrator_fee` entries it covers, exactly as `/settlements` reports each
+            one (`GET /settlements?payout_id=…`).
+        trade_count:
+          type: integer
+        chain:
+          type: [string, "null"]
+          description: The chain it is paid on; `null` on a payout cut before an address was registered, until paid.
+        to_address:
+          type: [string, "null"]
+        tx_hash:
+          type: [string, "null"]
+          description: >-
+            The transfer. On Solana it is known as soon as the payout is sent (while `processing`);
+            on Base once it lands.
+        created_at:
+          type: integer
+          description: Unix seconds.
+        paid_at:
+          type: [integer, "null"]
+          description: Unix seconds; `null` until paid.
+
+    PayoutsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Payout" }
+        next_cursor:
+          type: [string, "null"]
+        has_more:
+          type: boolean
+
     SettlementFeeCost:
       type: object
       additionalProperties: false
@@ -4025,8 +4422,11 @@ components:
       properties:
         name:
           type: string
-          enum: [treasures_fee, dex_fee]
+          enum: [treasures_fee, dex_fee, integrator_fee]
           description: >-
+            `integrator_fee` is your own fee on the trade, present only when the
+            trade carried one; it is what payouts to you are summed from, entry by entry.
+
             `treasures_fee` is our own take and is always present. `dex_fee` is the
             venue's take, net of ours, and is present only when it was recorded; trades
             settled before it was captured omit the entry rather than reporting a
@@ -4056,6 +4456,12 @@ components:
           type: boolean
           description: >-
             `true` when the fee was taken out of the swap rather than charged on top.
+        payout_id:
+          type: [string, "null"]
+          description: >-
+            `integrator_fee` only: the payout this fee went out in (see `GET /payouts/{payoutId}`),
+            or `null` while it is still owed to you.
+
     SettlementEntry:
       type: object
       additionalProperties: false

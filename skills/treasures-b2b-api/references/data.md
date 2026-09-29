@@ -1,6 +1,6 @@
 # Data — discovery, portfolio, trades
 
-Load when reading `/stocks/*`, `/portfolio`, or `/trades`. None of them takes an `ownership_proof`. All are unauthenticated public reads **except** `GET /stocks/{ticker}` and `GET /settlements`, which require your integrator key (`X-API-Key`).
+Load when reading `/stocks/*`, `/portfolio`, `/trades`, `/settlements` or `/payouts`. None of them takes an `ownership_proof`. All are unauthenticated public reads **except** `GET /stocks/{ticker}` and `GET /settlements`, which require your integrator key (`X-API-Key`), and the `/payouts` routes, which require a general `tik_` key.
 
 ## `GET /stocks/tickers`
 
@@ -288,10 +288,14 @@ Three things that will otherwise surprise you:
                               "price_usd_per_share": "166.946666666666" } },
     // dex_fee is the venue's take, net of ours. Absent (not 0) on trades settled before it was
     // recorded; a recorded 0 is emitted and means the venue charged no fee.
+    // integrator_fee is YOUR fee on the trade, present only when it carried one — your payouts are
+    // the sum of these entries, truncated exactly as shown here.
     "fee_costs": [{ "name": "treasures_fee", "percentage": "0.0025",
                     "amount_usd": "0.626050", "included": true },
                   { "name": "dex_fee", "percentage": "0.0010",
-                    "amount_usd": "0.250420", "included": true }]
+                    "amount_usd": "0.250420", "included": true },
+                  { "name": "integrator_fee", "percentage": "0.0020",
+                    "amount_usd": "0.500840", "included": true }]
   }],
   "next_cursor": "MjAyNi0wNy0zMFQx...",  // pass back as ?cursor= ; null on the last page
   "has_more": true
@@ -364,6 +368,12 @@ is a valid request that simply matches nothing — it is not a `400`.
 - **A cursor belongs to the filters that produced it.** Keep the filter parameters identical for
   every page of a loop. Changing any of them returns `400` with `cursor: filters_changed` — start
   that new query from the first page. Changing `limit` mid-loop is fine.
+- **`payout_id` / `payout_status` tie trades to your fee payouts.** Each `integrator_fee` entry in
+  `fee_costs` carries `payout_id` — the payout it went out in, `null` while it's still owed.
+  `?payout_id=ipo_…` lists exactly the trades a payout covered (their `integrator_fee.amount_usd`
+  sums to its `amount_usd`); `?payout_status=unpaid` lists what you're owed now, summing exactly to
+  `GET /payouts/accrued`; `processing` / `paid` follow the payout's own status. Only trades that
+  carried an integrator fee match.
 
 ```jsonc
 // paging a filtered query
@@ -375,6 +385,30 @@ do {
   cursor = page.next_cursor;
 } while (cursor);                                 // or drive it off has_more
 ```
+
+## `/payouts` — your fee payouts
+
+**Require your general `tik_` key** (a `trk_` reporting key is refused — reconcile through
+`/settlements?payout_id=` with it instead). Scoped to your organisation; another organisation's
+payout id is a `404`, the same as one that doesn't exist.
+
+- `GET /payouts/accrued` → `{ amount_usd, trade_count, payout_chain, payout_address,
+  previous_payout_address, payout_address_updated_at, payouts_enabled, minimum_usd, maximum_usd,
+  next_eligible_at }` — what you're owed now, pooled across every chain (USDC and USDG 1:1), where it
+  will be paid, and whether you can trigger a payout now. Only Treasures can set or change the payout
+  address; `previous_payout_address` shows the last change so an unexpected one is visible to you.
+- `POST /payouts` (empty body, **`Idempotency-Key` required**) pays out *everything* you're owed to
+  your registered address. `202` → poll `GET /payouts/{payout_id}` until `paid` or `failed`. A repeated
+  key returns the original payout whatever its status, so retry a `failed` one with a **new** key.
+  Refusals: `409 payout_in_progress` (one at a time), `409 payout_cooldown` / `address_hold` (with
+  `retry_after` and a `Retry-After` header), `409 payout_address_missing` (ask Treasures to register
+  one), `409 nothing_to_pay`, `422 below_minimum` / `requires_review` (above
+  `maximum_usd` Treasures pays on request), `503 payouts_unavailable` (paused — retry later).
+- `/payouts` → `{ data: Payout[], next_cursor, has_more }`, newest first; page with `cursor`.
+- `/payouts/{payoutId}` → one `Payout`: `{ payout_id, status, amount_usd, trade_count, chain,
+  to_address, tx_hash, created_at, paid_at }`. `status` is `processing` · `paid` · `failed` (nothing
+  was sent; the fees are owed to you again) · `cancelled` (withdrawn before sending). Times are unix
+  seconds.
 
 ## Internal-only P&L
 

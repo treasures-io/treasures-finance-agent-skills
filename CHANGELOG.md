@@ -18,9 +18,9 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ## Unreleased: b2b `1.16.0`
 
-Folds in b2b `1.15.0`, which did not ship standalone. Additive on the request: a caller that sends
-none of the new fields gets the same routing it got on `1.14.0`. The one **⚠ Action** is for strict
-response parsers.
+Folds in b2b `1.15.0`, which did not ship standalone, and publishes integrator fees and payouts for
+the first time. Additive on the request: a caller that sends none of the new fields gets the same
+routing it got on `1.14.0`. The one **⚠ Action** is for strict response parsers.
 
 ### treasures-b2b-api `1.16.0`: sell and receive USDC on another chain
 
@@ -47,8 +47,27 @@ response parsers.
   Solana legs remain; their upstream status now syncs every 3 s.
 - `/settlements` `dex_fee` on a speed-route leg the server broadcast is measured from the settled
   transaction rather than taken from the quote.
-- **Not included:** integrator fees and fee payouts. They are untested and deliberately left out of
-  this publication; they will ship under their own version.
+
+### treasures-b2b-api `1.16.0`: integrator fees and payouts (integrator key required)
+
+- **`integrator_fee_bps` on `/quote/buy`, `/quote/sell` and `/quote/preview`**: your own fee on the
+  quote, in net bps, overriding the default Treasures configured for your key, up to your ceiling.
+  Omit it to use the default. It is stacked into the same on-wire fee as Treasures' and already
+  reflected in `estimated_output_*`; on Solana the venue keeps half of that fee, so the trader is
+  charged twice the figure for you to net it.
+- Every quote leg reports **`cost_breakdown_bps.integrator_fee_bps`** (`0` on an anonymous quote).
+- **A quote carrying your fee must be submitted with the key that quoted it**: anything else is
+  `403 quote_integrator_mismatch` and nothing is broadcast. Zero-fee quotes are unaffected.
+- New refusals: `400 invalid_integrator_fee` (above your ceiling, or a venue cannot carry it; `reason`
+  says which), `400 integrator_fee_requires_api_key`, and `503 integrator_fee_misconfigured`.
+- **`/settlements`** gains an `integrator_fee` entry in `fee_costs`, carrying the `payout_id` it went
+  out in, and two filters: `payout_id` and `payout_status` (`unpaid` / `processing` / `paid`).
+- **Payouts**, general `tik_` key only: `GET /payouts/accrued` (what you are owed now, where it will
+  be paid, the limits and `next_eligible_at`), `POST /payouts` (claim everything owed to your
+  registered address; empty body, `Idempotency-Key` required), `GET /payouts` and
+  `GET /payouts/{payoutId}`. The payout address is set by Treasures only. Refusals include
+  `409 payout_in_progress` / `payout_cooldown` / `address_hold` / `payout_address_missing` /
+  `nothing_to_pay`, `422 below_minimum` / `requires_review` and `503 payouts_unavailable`.
 
 ### treasures-b2b-api `1.15.0`: cross-chain buy legs under `priority:"speed"`
 
@@ -98,8 +117,7 @@ skill text now says so. No `metadata.version` bump, so no gate signal fires — 
 - **`/portfolio` snapshots refresh on a 30 s cadence** (`as_of`, `is_cached`). Polling faster
   returns the same snapshot.
 - **Not included:** the backend spec already carries integrator-fee fields (`integrator_fee_bps`
-  and its error codes). They are untested and deliberately left out of this publication; they will
-  ship under their own version.
+  and its error codes). They were left out of this publication and ship in `1.16.0`, above.
 
 ## 2026-09-11 — b2b `1.14.0`
 
