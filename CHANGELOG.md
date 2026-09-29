@@ -16,7 +16,7 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
-## Unreleased: b2b `1.16.0`
+## 2026-09-29: b2b `1.16.0`
 
 Folds in b2b `1.15.0`, which did not ship standalone, and publishes integrator fees and payouts for
 the first time. Additive on the request: a caller that sends none of the new fields gets the same
