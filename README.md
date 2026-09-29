@@ -8,7 +8,7 @@ A skill is a folder of plain-Markdown instructions (`SKILL.md`) that a coding ag
 
 | Skill | What it does |
 | ----- | ------------ |
-| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC, and read portfolio + trade history for a single end-user wallet pair. Covers US and Hong Kong listings across Solana, Ethereum, Base and Robinhood Chain. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
+| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC, and read portfolio + trade history for a single end-user wallet pair, plus, for integrators, your fee settlements and payouts. Covers US and Hong Kong listings across Solana, Ethereum, Base and Robinhood Chain, including the opt-in speed route on Base and Robinhood Chain, cross-chain speed buys, and sells that pay out USDC on another chain. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
 | [`treasures-wallet`](skills/treasures-wallet/SKILL.md) | Operate a Treasures delegated wallet over HTTP: onboard (provision a wallet + mint a scoped API key), quote, execute async buys/sells (non-custodial — the agent never signs; Treasures signs as a delegated signer scoped strictly to RWA trades), read balances/portfolio/trade history, and manage API keys. Trades tokenized equities (xStocks / Ondo) vs USDC on Solana or Ethereum with only HTTPS + an API key — no web3 libraries, keys, or RPC. |
 
 **BNB Chain support is coming soon.**
@@ -70,9 +70,10 @@ a hard stop (before any trade) once it's past sunset — without affecting gener
 non-skill API clients. Full spec:
 [`docs/skill-version-compatibility.md`](docs/skill-version-compatibility.md).
 
-Note that `treasures-wallet` does **not** yet send its version, so it is treated as a
-generic client: never gated, but never warned either. For that skill the changelog is the
-only update signal.
+Both skills send `X-Treasures-Skill` / `X-Treasures-Skill-Version` (`treasures-wallet` since
+`1.2.0`), so both are enrolled: warned while aging, stopped cleanly once past sunset. The headers
+are optional on the API itself; a client that omits them is never gated and never warned, and the
+changelog is its only update signal.
 
 ## License
 
