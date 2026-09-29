@@ -16,7 +16,157 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
-## Unreleased — b2b `1.10.0`, wallet `1.3.0`
+## Unreleased: b2b `1.16.0`
+
+Folds in b2b `1.15.0`, which did not ship standalone. Additive on the request: a caller that sends
+none of the new fields gets the same routing it got on `1.14.0`. The one **⚠ Action** is for strict
+response parsers.
+
+### treasures-b2b-api `1.16.0`: sell and receive USDC on another chain
+
+- **`payout_chain` on `POST /quote/sell`** (`"sol"`, `"eth"` or `"base"`; absent or `null` keeps the
+  old behaviour). The sale's USDC lands on that chain, in your own wallet there. A `sol/xstocks`,
+  `base/coinbase` or `eth/ondo` position held on another chain sells cross-chain as **one leg**,
+  marked by `payout_chain` on the leg, whatever the `priority`. A position that cannot pay out there
+  is left out with a `cross_chain_route_unavailable` warning; it is never sold on its own chain
+  instead. Sell-only: `/quote/buy` and `/quote/preview` answer `400 invalid_request`.
+- **You fund the gas on a cross-chain sell leg**, on the position's own chain (`gasless: false`
+  whatever the `priority`), unless you send `execution: "user_operation"`, where your paymaster pays. On `eth` / `base` it is always two `evm_signed_tx` payloads, an exact-amount
+  `approve` then a `role: "deposit"`; under `execution: "user_operation"` it is one `evm_calls`
+  payload holding the same two calls; on `sol` it is a `solana_versioned_tx` that uses
+  address-lookup tables.
+- **`/quote/{quote_id}/status` legs** gain `payout_chain` and `payout_tx_hash`. On `completed`,
+  `payout_chain` names where the USDC actually landed, which is the sale's own chain if the payout
+  was returned there.
+- **`/settlements`** reports such a sale as two transactions: the sale (`sending`) and the payout
+  (`receiving`).
+- New refusals: `400 invalid_request` with a `payout_chain: ` message prefix (the payout wallet is
+  missing, or nothing in scope can pay out there), and `422 no_routes` with
+  `reason: "payout_route_unavailable"`.
+- `/quote/{quote_id}/status` asks for `poll_after_ms: 3250` (was `10250`) when only gasless or
+  Solana legs remain; their upstream status now syncs every 3 s.
+- `/settlements` `dex_fee` on a speed-route leg the server broadcast is measured from the settled
+  transaction rather than taken from the quote.
+- **Not included:** integrator fees and fee payouts. They are untested and deliberately left out of
+  this publication; they will ship under their own version.
+
+### treasures-b2b-api `1.15.0`: cross-chain buy legs under `priority:"speed"`
+
+- Under `priority: "speed"`, `/quote/buy` and `/quote/preview` may quote a cell you are **not
+  funded on** as a cross-chain leg instead of dropping it: one signature set moves your stable off
+  its origin chain and into the destination stock. The leg carries **`origin_chain`** (present only
+  on this kind of leg; `chain` stays the destination), `cross_chain_cost_bps` /
+  `cross_chain_cost_usdc`, and `base_asset` / `amount_base` in the **origin's** currency.
+- **⚠ Action (strict response parsers only):** `cost_breakdown_bps.dex_swap_fee_bps` is now
+  nullable. It is `null` only on a cross-chain leg (a `"speed"` buy, or a `payout_chain` sell from
+  `1.16.0`), so a caller that sends neither never sees it.
+- `chain: ["eth"]` with `"speed"` on `/quote/buy` and `/quote/preview` is no longer an
+  unconditional `400`: it returns a cross-chain leg or `422 no_routes`. On `/quote/sell` it is still
+  `400 invalid_request`, unless `payout_chain` names another chain.
+- Signing: an EVM-origin leg may carry a `role: "deposit"` payload whose paired `approve` is
+  **exact-amount**; a sol-origin leg names your own sol wallet as fee payer; an `evm_calls` payload
+  may carry `chain_id: 1`.
+- New `warnings[]`: `cross_chain_route_unavailable` and `cross_chain_price_deviation` (advisory,
+  never a refusal). New per-leg `error_code`s: `refunded`, `deposit_reverted`,
+  `delivered_other_currency`, `cross_chain_unsettled` (**do not re-quote**, it may still settle),
+  and a per-leg `quote_stale`. `422 no_routes` may carry `reason: "cross_chain_wallet_missing"`:
+  the buy could only be served cross-chain from a chain whose wallet you did not send.
+- Enums widen for an upcoming venue: `Chain` gains `arbitrum` and `Protocol` gains `reality`, and
+  `/stocks` / `/stocks/tickers` gain a `reality` listings block that is `null` until the venue
+  opens.
+- `/stocks/{ticker}` `onchain.*`: a venue whose on-chain price sits more than 1.5x from the tradfi
+  price reads `share_price_usd: null` (volume is still reported).
+
+---
+
+## 2026-09-19 — b2b `1.14.0` (content update, version unchanged)
+
+A documentation-only refresh of the `1.14.0` skill: the API contract below was already live, the
+skill text now says so. No `metadata.version` bump, so no gate signal fires — read this entry.
+
+### treasures-b2b-api — `portfolio_busy` and the rewritten rate limits
+
+- **`GET /portfolio` can now answer `503 portfolio_busy`** with a `Retry-After` header
+  (delta-seconds). It means the server is already computing as many fresh snapshots as it safely
+  can and yours was not cached. Sleep `Retry-After` and retry the same request; a cached snapshot
+  is never refused. The `apiFetch` helper's transient-error branch is the right place to handle it.
+- **Rate limits, restated.** Anonymous `/portfolio` calls have their own per-IP row (600/min). With
+  a general `tik_` key, `/portfolio` is not bucketed by IP at all: your organisation bucket is the
+  bound, sized for one request every 5 s per active end-user. The blanket per-IP ceiling across all
+  endpoints is now set per environment (always at or above the per-endpoint rows) and no longer
+  covers `/portfolio`. `/trades` keeps 60/min.
+- **`/portfolio` snapshots refresh on a 30 s cadence** (`as_of`, `is_cached`). Polling faster
+  returns the same snapshot.
+- **Not included:** the backend spec already carries integrator-fee fields (`integrator_fee_bps`
+  and its error codes). They are untested and deliberately left out of this publication; they will
+  ship under their own version.
+
+## 2026-09-11 — b2b `1.14.0`
+
+Folds in b2b `1.11.0`, `1.12.0` and `1.13.0`, none of which shipped standalone. Every item is
+additive on the request unless marked **⚠ Action**; the only actions are inside `priority:"speed"`,
+a shape that first appeared in `1.11.0`.
+
+### treasures-b2b-api `1.14.0` — `/portfolio` reads any wallet with your key
+
+- **⚠ Action — send your `tik_` key on `GET /portfolio`.** Positions on the two single-cell venues
+  (Robinhood Chain 4663, Base 8453) are read for **any** `eth_wallet` when a verified general key is
+  presented. Without it, only a wallet Treasures already has a row for is read, and an end-user
+  wallet that merely *holds* a token (an airdrop, a transfer in) comes back with an empty
+  `positions` list and is not flagged `partial`. Anonymous calls are byte-identical to before; cash
+  (`usdc.base`, `usdg.robinhood`) was never gated either way.
+
+### treasures-b2b-api `1.13.0` — sponsored user-operation lane
+
+- Optional `execution` request field on `/quote/buy`, `/quote/sell` and `/quote/preview`:
+  `"transaction"` (the default, byte-identical to `1.12.0`) or `"user_operation"`. Only meaningful
+  with `priority:"speed"`; sending it alone is `400 invalid_request`.
+- Under `"user_operation"` a `base` speed leg returns **one `evm_calls` signable payload** instead
+  of a signed-transaction pair. Pack it into a sponsored ERC-4337 UserOperation from an
+  EIP-7702-delegated (Modular Account v2) wallet, sign, and submit as `evm_user_operation`. The leg
+  is then `gasless: true` with `estimated_gas_usd: "0"`; there is no nonce to collide on.
+- New response keys: `user_op_hash` on submit results and `/status` legs (`null` elsewhere). New
+  refusals on that lane only: `sponsorship_rejected`, `wallet_not_delegated`. `robinhood` is not
+  served on this lane yet.
+
+### treasures-b2b-api `1.12.0` — speed route hardened (actions only if you send `priority:"speed"`)
+
+- **⚠ Action — `role` is now required on every `SignableEvmTx`** (`"approve"` or `"swap"`), and a
+  speed leg on an unapproved wallet returns **two payloads** with consecutive nonces: sign and
+  return both, in the order issued. Signing only `[0]` is `incomplete_submit`; reordering on a
+  replay is `leg_already_submitted`. The bundled approve grants the router an unlimited
+  (`max-uint256`) allowance on the token being spent, so surface that consent to the user.
+- **⚠ Action — `approval_spender` is nullable** on the speed route (the approve rides inside the
+  quote). `allowance_required` left both the `no_routes` reason enum and the
+  `speed_route_unavailable` reason list; a client that branched on it can drop that branch.
+- **`priority:"speed"` is a filter, not a preference.** `eth` is never quoted under it; a one-element
+  `chain:"eth"` (or `["eth"]`) with speed is `400 invalid_request`; a `robinhood`/`base` leg the
+  speed route cannot serve is **absent** from `quotes[]` with a `speed_route_unavailable` warning,
+  never handed back on its relayed route.
+- `approve_failed` on a pair means the approve reverted or did not land in 10 min and the swap was
+  never sent (`tx_hash` is `null`). Re-quote.
+
+### treasures-b2b-api `1.11.0` — routing controls, preview, ticker details
+
+- `protocol` on the quote routes accepts an array (1–4, unique: restrict the auto-route to a
+  protocol subset, exactly as `chain` already did). New `preferred_chain`: a preference, not a
+  pin. The leg on that chain becomes `quote_index: 0` when the plan has one; nothing is added or
+  dropped, and naming a chain outside a sent `chain` set is `400 invalid_request`.
+- **`priority:"speed"`** asks for the speed route on `robinhood` and `base`: a single on-chain swap
+  that settles in one block, returned as a complete unsigned transaction you sign and Treasures
+  broadcasts against **your** native gas on that chain. Absent or `null` is unchanged routing.
+- New response keys on every leg: `gasless` (who pays this leg's gas) and `estimated_gas_usd`
+  (speed-route legs only; `null` with a `speed_route_unpriced_gas` warning when no USD gas price was
+  available). New drop reason `speed_route_unavailable`; new submit refusals `insufficient_native_gas`,
+  `nonce_conflict`.
+- **Two new routes, both `tik_` key required:** `POST /quote/preview` (wallet-less price preview:
+  the buy-quote legs minus `quote_id`, `expires_at`, `signable_payloads` and `warnings_ack_token`;
+  nothing persisted; capped at 1,000,000 USDC; a route-wide shared rate ceiling, so honour
+  `Retry-After`) and `GET /stocks/{ticker}` (profile, listings, tradfi snapshot, extended hours,
+  market session, analyst consensus and grades, next earnings, latest news; every block best-effort
+  and `null` on its own; cached 60 s; no `onchain` block).
+
+## 2026-09-02 — b2b `1.10.0`, wallet `1.3.0`
 
 Published together. Folds in b2b `1.7.0`, `1.8.0` and `1.9.0`, and wallet `1.2.0`, none of which
 shipped standalone.

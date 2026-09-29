@@ -53,8 +53,8 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
 {
   "ticker": "AAPL",
   "amount_usdc": "100",                  // exactIn, string, 6 decimals max
-  "chain": "sol" | "eth" | "robinhood" | "base" | ["sol", "eth"] | null,  // one chain = pin; an array (1–4, unique) = auto-route within those chains only (["x"] ≡ "x"); null = every chain the ticker lists, robinhood/base included (see #robinhood, #base)
-  "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | ["ondo", "xstocks"] | null, // one protocol = pin; an array (1–4, unique) = auto-route within those protocols only (["x"] ≡ "x"); null = every protocol the ticker lists. To exclude one, send the other three. "robinhood" only pairs with chain:"robinhood", "coinbase" only with chain:"base"
+  "chain": "sol" | "eth" | "robinhood" | "base" | "arbitrum" | ["sol", "eth"] | null,  // one chain = pin; an array (one or more, unique) = auto-route within those chains only (["x"] ≡ "x"); null = every chain the ticker lists, robinhood/base included (see #robinhood, #base)
+  "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | "reality" | ["ondo", "xstocks"] | null, // one protocol = pin; an array (one or more, unique) = auto-route within those protocols only (["x"] ≡ "x"); null = every protocol the ticker lists. To exclude one, send the others. "robinhood" only pairs with chain:"robinhood", "coinbase" only with chain:"base", "reality" only with chain:"arbitrum"
   "preferred_chain": "sol" | null,       // put this chain first — a PREFERENCE, not a filter: it reorders, it never narrows. Buy: that chain's leg becomes quote_index 0. Sell: it is filled from first, then the rest. Must be one of the chains in `chain` when you send `chain` (else 400); a chain with nothing to offer falls back to normal ordering. Sell guarantee: preferred-chain holdings that cannot be priced on the first attempt rejoin the rest of the fill, so the preference can never leave a sell short — see POST /quote/sell
   "priority": "speed" | null,            // null/omitted = today's routing. "speed" asks for the speed route on robinhood/base — see below
   "max_slippage_bps": 50,                // 10 ≤ value ≤ 5000
@@ -181,7 +181,8 @@ A leg's `chain` determines the variant:
 | `robinhood` | `evm_eip712_typed_data` (one per leg, chain 4663) | `typed_data` — full EIP-712 object (gasless order) | sign typed data (`eth_signTypedData_v4`) → `{ type: "evm_eip712_signature", signature: "0x..." }` — **same as `eth`** (see [Robinhood](#robinhood)) |
 | `base` | `evm_eip712_typed_data` (one per leg, chain 8453) | `typed_data` — full EIP-712 object (gasless order) | sign typed data (`eth_signTypedData_v4`) → `{ type: "evm_eip712_signature", signature: "0x..." }` — **same as `eth`** (see [Base](#base)) |
 | `robinhood` / `base` **with `priority:"speed"`** | `evm_eip1559_tx` (8453) or `evm_legacy_tx` (4663) — **one or two of them** | `tx_hex` — a **complete** unsigned transaction (nonce, gas, fees already set), plus `role` (`approve` \| `swap`), `approval_spender` (null on the approve), `chain_id`, `nonce`, `gas` and the fee fields | sign each payload's bytes as-is (`signTransaction`) → one `{ type: "evm_signed_tx", signed_tx_hex: "0x..." }` per payload, **all of them**; **Treasures broadcasts them** — see [speed route](#speed) |
-| `base` **with `priority:"speed"` + `execution:"user_operation"`** | `evm_calls` (exactly one per leg) | `calls[]` — one or two `{ role, to, data, value:"0" }` (`approve` first when present, then `swap`), plus `sender`, `chain_id`, `entry_point` (v0.7) and `approval_spender` | pack the calls into ONE ERC-4337 v0.7 UserOperation from your MAv2-delegated wallet (`execute` / `executeBatch` in order), sponsor with your paymaster, sign, return `{ type: "evm_user_operation", user_operation }`; **Treasures submits it to a bundler** — see [user operation](#user-operation) |
+| `robinhood` / `base` **with `priority:"speed"` + `execution:"user_operation"`** | `evm_calls` (exactly one per leg) | `calls[]` — one or two `{ role, to, data, value:"0" }` (`approve` first when present, then `swap`), plus `sender`, `chain_id`, `entry_point` (v0.7) and `approval_spender` | pack the calls into ONE ERC-4337 v0.7 UserOperation from your MAv2-delegated wallet (`execute` / `executeBatch` in order), sponsor with your paymaster, sign, return `{ type: "evm_user_operation", user_operation }`; **Treasures submits it to a bundler** — see [user operation](#user-operation) |
+| any `chain` **with `priority:"speed"` + `origin_chain` present (cross-chain)** | `solana_versioned_tx` (sol origin) or `evm_eip1559_tx`/`evm_legacy_tx` (EVM origin, `role` may be `"deposit"`) or `evm_calls` (EVM origin, `execution:"user_operation"`) | same field shapes as the matching same-chain row above, keyed on **`origin_chain`**, not `chain` | sign per the origin's shape — see [cross-chain speed](#cross-chain-speed) |
 
 > By default the `eth`, `robinhood` and `base` quote payloads are **all** `evm_eip712_typed_data` — off-chain order signatures you sign but **never broadcast**. The `typed_data.domain.chainId` tells you which network the order settles on (`1` / `4663` / `8453`) — sign it as given, never rewrite it. A [speed-route](#speed) leg is the one trade payload that is a real transaction (`evm_eip1559_tx` / `evm_legacy_tx`): you still don't broadcast it — you sign the given bytes and Treasures sends them. **The only EVM payload you broadcast yourself is the bridge payload** (`evm_eip1559_tx`, see [`bridging.md`](bridging.md)) — and unlike a speed-route payload, the bridge one carries **no nonce**, which you must set. Branch on `type`, never on `chain` alone.
 
@@ -217,6 +218,7 @@ Shares → USDC. Server reads holdings across every chain × protocol — sol/et
 - `chain` and `protocol` accept the same one-value / array / null shapes as `/quote/buy`.
 - `preferred_chain` names the chain to sell from **first** — a preference, not a filter: the remaining chains still fill whatever is left, in the usual best-price order. Must be one of the chains in `chain` when you send `chain`. The preferred chain's holdings are priced first; whatever it does not fill continues over the remaining chains **and** over any preferred-chain holding that could not be priced on that first attempt, so the preference costs at most one extra pricing attempt and can never leave a sell short of what the same sell would have covered without it.
 - `priority: "speed"` works the same way as on a buy — robinhood/base legs come back as [speed-route](#speed) transactions you sign whole, `eth` holdings are never part of the fill, and a chain the speed route can't serve is dropped from it (`speed_route_unavailable`). On a sell the spent token is the **stock token**; if it is not yet approved to the router, the leg's first payload is the bundled `approve` for it — sign both.
+- `payout_chain` (`"sol"` | `"eth"` | `"base"`, default `null`) pays the sale's USDC out on that chain, to your own wallet there. A position held on another chain can then sell **cross-chain as one leg** (marked by `payout_chain` on the leg), whatever the `priority`; its `eth` / `base` payloads are `evm_signed_tx` pairs rather than `evm_eip712_typed_data`. See [payout chain](#payout-chain).
 - each quote carries `shares_consumed` + `tokens_consumed` + `estimated_output_usdc` instead of `estimated_output_*`.
 - response adds `"totals": { "shares_total": "0.5", "usdc_total_estimated": "117.10" }`.
 - `signable_payloads` shapes are identical (sol → `solana_versioned_tx`, eth / robinhood / base → `evm_eip712_typed_data`).
@@ -296,7 +298,7 @@ Atomic submission of signed payloads. No `ownership_proof` — the signed payloa
 
 ## `GET /quote/{quote_id}/status`
 
-Aggregate + per-leg view. Poll at `poll_after_ms`: `1250` while a [speed-route](#speed) leg is in flight (it settles by receipt within a block or two), `10250` when only gasless or Solana legs remain (their upstream status is synced at most every 10 s per leg, so polling faster only returns the cached view) or a speed-route leg has sat unmined past 5 min. On a cached response (`is_cached: true`) the value is the time left on that cached view rather than the full window, so a client that polls late is not asked to wait another one — it is still never below 1000. Never faster than 1 Hz.
+Aggregate + per-leg view. Poll at `poll_after_ms`: `1250` while a [speed-route](#speed) leg is in flight (it settles by receipt within a block or two), `3250` when only gasless or Solana legs remain (their upstream status is synced at most every 3 s per leg, so polling faster only returns the cached view) or a speed-route leg has sat unmined past 5 min. On a cached response (`is_cached: true`) the value is the time left on that cached view rather than the full window, so a client that polls late is not asked to wait another one — it is still never below 1000. Never faster than 1 Hz.
 
 ```jsonc
 {
@@ -331,6 +333,11 @@ Per-leg `error_code` (when `status` is `failed`/`broadcast_failed`):
 | `tx_dropped` | Speed route only: the transaction was accepted, then evicted without mining, and a re-send did not recover it | re-quote and re-sign |
 | `approve_failed` | Speed route only, two-payload leg: the bundled `approve` reverted (in simulation — nothing sent — or on chain), or did not land within 10 minutes; the swap was never sent | re-quote — if the approve did mine, the new quote is single-payload |
 | `sponsorship_rejected` | [`execution:"user_operation"`](#user-operation) only: your paymaster refused to sponsor the op (deposit / stake / rate limit / policy signature / paymaster revert) — nothing was submitted | fix the sponsorship under your Gas Manager policy, re-sign, re-submit (the quote is still valid inside its window) |
+| `quote_stale` | [Cross-chain speed](#cross-chain-speed) only, sol origin: the deposit's blockhash expired before broadcast — nothing left the wallet. Per-leg code, distinct from the top-level `410` at submit | re-quote |
+| `deposit_reverted` | [Cross-chain speed](#cross-chain-speed) only, EVM origin: the deposit reverted past the retry window | re-quote |
+| `refunded` | [Cross-chain speed](#cross-chain-speed) only: the intent could not fill; your deposit was returned to the origin wallet | re-quote |
+| `delivered_other_currency` | [Cross-chain speed](#cross-chain-speed) only: you were delivered a stablecoin instead of the destination token | terminal — nothing to retry |
+| `cross_chain_unsettled` | [Cross-chain speed](#cross-chain-speed) only: 6 hours with no terminal outcome after the deposit left your wallet | do NOT re-quote — it may still settle; wait it out |
 
 > `internal_error` is `/trade/submit`-only (in `failed_legs[]`); never appears here. Re-quote those indices on a fresh `quote_id`.
 
@@ -417,7 +424,7 @@ The single quote leg (`chain:"base"`, `protocol:"coinbase"`):
 
 Send `priority: "speed"` on `/quote/buy`, `/quote/sell` or `/quote/preview` and the `robinhood` (4663) and `base` (8453) legs come back as the **speed route**: a single on-chain swap that settles in one block, instead of the gasless order those venues return by default. `sol` legs are unchanged — Solana already settles in seconds. **`eth` legs are never returned under `priority: "speed"`**: eth has no fast route (its relayed order can take minutes to fill), so it is not a candidate.
 
-It is a **filter, not a preference**. Under `"speed"` the only legs you can receive are `sol` and speed-route `robinhood`/`base`. A `robinhood`/`base` leg the speed route can't serve is **absent** from `quotes[]` — it is never handed back on its gasless route instead — and a `speed_route_unavailable` entry in `warnings[]` says which chain and why. Every leg you do receive is executable as returned. Pinning `chain: "eth"` (or `["eth"]`) together with `"speed"` is a contradiction and is refused up front as `400 invalid_request` (`priority: "speed" is not available on eth`); a `chain` set that also names other chains simply loses `eth`. **`gasless` is present on every leg of every quote**, speed or not, so you can branch on it without inspecting the payload type.
+It is a **filter, not a preference**. Under `"speed"` the same-chain legs you can receive are `sol` and speed-route `robinhood`/`base`; a buy can also return a [cross-chain leg](#cross-chain-speed), which is the only way `eth` appears under `"speed"`. A `robinhood`/`base` leg the speed route can't serve is **absent** from `quotes[]` — it is never handed back on its gasless route instead — and a `speed_route_unavailable` entry in `warnings[]` says which chain and why. Every leg you do receive is executable as returned. On `/quote/buy` and `/quote/preview`, pinning `chain: "eth"` with `"speed"` returns a cross-chain leg or `422 no_routes`; on `/quote/sell` it is refused up front as `400 invalid_request` (`priority: "speed" is not available on eth`), and a `chain` set that also names other chains simply loses `eth`. A pin on any other chain with no speed route (e.g. `arbitrum`) is refused the same way on every endpoint. **`gasless` is present on every leg of every quote**, speed or not, so you can branch on it without inspecting the payload type.
 
 **What you take on, in exchange for one-block settlement:**
 
@@ -447,12 +454,105 @@ If you pinned `chain` to a single venue and the *only* problem is your own walle
 <a id="user-operation"></a>
 ### `execution: "user_operation"` — the speed route as a sponsored UserOperation
 
-Add `execution: "user_operation"` beside `priority: "speed"` (it is meaningless without it — `400 invalid_request`) and a `robinhood` / `base` speed leg comes back as **one `evm_calls` payload** instead of raw transactions: the same one or two calls (`approve` then `swap`, or just `swap`), with `sender` (your wallet), `chain_id`, `entry_point` (ERC-4337 EntryPoint v0.7) and `approval_spender`. The leg is `gasless: true` with `estimated_gas_usd: "0"` — **your paymaster pays**, not the wallet, so no native ETH float is needed and there is no nonce to collide on. `execution: "transaction"` (or omitting it) is the raw-transaction shape above, unchanged. The flag scopes the **speed-route legs only**: an unpinned fan-out still ranks `sol` alongside, so a `user_operation` response can contain a `sol` leg with its usual `solana_versioned_tx` payload beside the `evm_calls` one — sign each payload as its own `type` says.
+Add `execution: "user_operation"` beside `priority: "speed"` (it is meaningless without it — `400 invalid_request`) and a `robinhood` / `base` speed leg comes back as **one `evm_calls` payload** instead of raw transactions: the same one or two calls (`approve` then `swap`, or just `swap`), with `sender` (your wallet), `chain_id`, `entry_point` (ERC-4337 EntryPoint v0.7) and `approval_spender`. The leg is `gasless: true` with `estimated_gas_usd: "0"` — **your paymaster pays**, not the wallet, so no native ETH float is needed and there is no nonce to collide on. `execution: "transaction"` (or omitting it) is the raw-transaction shape above, unchanged. It works the same on `/quote/sell`: there the calls spend the **stock** — the `approve` (when present) is of the stock token for `approval_spender`, and the `swap` sells it for the chain's stable. The flag scopes the **speed-route legs only**: an unpinned fan-out still ranks `sol` alongside, so a `user_operation` response can contain a `sol` leg with its usual `solana_versioned_tx` payload beside the `evm_calls` one — sign each payload as its own `type` says.
 
-**Requirements.** (1) The `eth_wallet` must be **EIP-7702-delegated to Alchemy Modular Account v2** (v1.0.0 `0x69007702764179f14F51cdce752f4f775d74E139` or v1.1.0 `0x77021100bD87b7008E5E1989d0eB38555d0d0000`) **on that chain** — checked at quote time via `eth_getCode`. Pinned and not delegated: `400 wallet_not_delegated` naming the chain; unpinned: that chain's leg is dropped with `speed_route_unavailable` / `reason: "wallet_not_delegated"`. Delegating for the first time is your side (`eip7702Auth`); the quote never carries an `initCode`/`factory`. (2) The op must be **sponsored** — a `paymaster` is required; an unsponsored op is refused as `invalid_signature`. (3) **`base` only today**: `robinhood` has no bundler on this lane yet — pinned it is `422 no_routes`, unpinned it drops with `reason: "disabled"` naming the chain.
+**Requirements.** (1) The `eth_wallet` must be **EIP-7702-delegated to Alchemy Modular Account v2** (v1.0.0 `0x69007702764179f14F51cdce752f4f775d74E139` or v1.1.0 `0x77021100bD87b7008E5E1989d0eB38555d0d0000`) **on that chain** — checked at quote time via `eth_getCode`. Pinned and not delegated: `400 wallet_not_delegated` naming the chain; unpinned: that chain's leg is dropped with `speed_route_unavailable` / `reason: "wallet_not_delegated"`. Delegating for the first time is your side (`eip7702Auth`); the quote never carries an `initCode`/`factory`. (2) The op must be **sponsored** — a `paymaster` is required; an unsponsored op is refused as `invalid_signature`. (3) **Served on `base` and `robinhood`**: a chain the lane cannot serve at the moment is `422 no_routes` pinned, and unpinned it drops with `reason: "disabled"` naming the chain.
 
 **Build, sign, submit.** From `evm_calls`, build the UserOperation with your account SDK (e.g. `@account-kit`): `execute(to, 0, data)` for one call, `executeBatch([{target, value:0, data}, …])` **in the order given** for two; run your paymaster's sponsorship; sign under `chain_id` and the v0.7 EntryPoint; return `{ "type": "evm_user_operation", "user_operation": { sender, nonce, callData, callGasLimit, verificationGasLimit, preVerificationGas, maxFeePerGas, maxPriorityFeePerGas, paymaster, paymasterVerificationGasLimit, paymasterPostOpGasLimit, paymasterData, signature } }` (unpacked v0.7 fields, numerics as decimal or hex strings, ≤ 16 KB, no `factory`/`factoryData`). Treasures decodes `callData` and binds each call **byte-for-byte** to the quote (plus `sender`, zero `value`, a non-empty `paymaster`); a mismatch is a per-leg `invalid_signature` and nothing is submitted. It then re-checks your balance (and the allowance, on a single-call leg), **simulates the op on the bundler** (`eth_estimateUserOperationGas`) and submits it. A simulation refusal never reached the mempool: `nonce_conflict` (the account nonce moved — re-quote and re-sign), **`sponsorship_rejected`** (your paymaster declined: deposit, stake, rate limit, policy signature or a paymaster revert — fix the sponsorship, re-sign), `swap_reverted` (re-quote), `provider_error` (retry).
 
 **Status.** The accepted leg is `status: "broadcast"` with **`user_op_hash`** set and `tx_hash: null`; `/status` polls the bundler for the op's receipt (keep polling at `poll_after_ms`) and flips the leg to `completed` — `tx_hash` then carries the **bundle transaction** the op was included in — or `failed` + `swap_reverted` if the op reverted on chain. An op the bundler drops from its pool without mining is `failed` + `tx_dropped` after 10 minutes; Treasures never re-sends or replaces a UserOperation — that is yours. `user_op_hash` is `null` on every other kind of leg. It is a `/status` key: the reporting reads (`GET /trades`, `GET /settlements`) key on `tx_hash`, and because a bundle can carry more than one of your ops, two rows there may legitimately share one `tx_hash` with different outcomes — `/status` is where the two are told apart.
 
+<a id="cross-chain-speed"></a>
+## `priority: "speed"` — cross-chain legs when you aren't funded on the destination
+
+The speed route's chain-local scope ([above](#speed)) has one extension: when you are **not** funded on a candidate cell's own chain, `/quote/buy` and `/quote/preview` under `priority:"speed"` may quote it as a **cross-chain** leg instead of dropping it — one signature set moves your stable off its origin chain and into the destination stock, without a separate bridge-then-buy round trip. This is [pre-flight trap 10](../SKILL.md#trap-10); read that first for the short version.
+
+**Only when you're not funded on the destination.** A cell you ARE funded on always routes the normal way — same-chain sol / gasless / speed as documented above. Only a cell that fails that first check becomes a cross-chain candidate, sized from the first chain in your funding preference order (`sol` → `eth` → `robinhood` → `base`) among the wallets you supplied that actually covers the amount. No pooling across origins, and no origin at all means the cell is dropped exactly as it would be today (undisclosed — the same outcome an unfunded cell already gets).
+
+**Servable cells.** Not every destination is reachable this way — check for `origin_chain` on the leg you got back rather than assuming. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, and `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and `eth/xstocks` are never cross-chain destinations. `eth` enters the `"speed"` candidate set **only** as a cross-chain destination: it never returns on its own gasless route under `"speed"`, and a cross-chain failure drops it rather than falling back to gasless.
+
+**New leg fields.**
+
+```jsonc
+{
+  "quote_index": 0,
+  "chain": "eth", "protocol": "ondo",             // destination cell — unchanged meaning
+  "origin_chain": "robinhood",                     // new — only on a cross-chain leg: where your stable leaves from
+  "base_asset": "usdg", "amount_base": "100",      // the ORIGIN's currency — read this, not chain
+  "price_usdc_per_share": "325.98",
+  "estimated_output_shares": "0.3067", "estimated_output_tokens": "0.3067",
+  "cost_breakdown_bps": {
+    "treasures_fee_bps": 10,
+    "dex_swap_fee_bps": null,                      // new — null on every cross-chain leg
+    "estimated_slippage_bps": 45, "price_impact_bps": 45
+  },
+  "cross_chain_cost_bps": {                         // new — the hop's own cost, separate from the above
+    "swap_slippage_bps": 45, "gas_fee_bps": 12, "bridge_fee_bps": 10, "total_bps": 67
+  },
+  "cross_chain_cost_usdc": { "swap_slippage_usdc": "0.45", "gas_fee_usdc": "0.12", "bridge_fee_usdc": "0.10", "total_usdc": "0.67" },
+  "expires_at": 1730000060,
+  "signable_payloads": [ /* see below — shape depends on origin_chain and execution */ ]
+}
+```
+
+- **`origin_chain`** — present **only** on a cross-chain leg, so its presence is the marker: check for it before you assume `chain` tells you where your funds leave from — it does not, on this leg. `chain` is **always the destination**, consistent with every other leg on the API; `origin_chain` is the one new field naming where the spend actually starts.
+- **`base_asset`/`amount_base` name the origin's currency, not the destination's.** The `_usdc`-named fields follow the same rule they already do on [robinhood legs](#robinhood) — read `base_asset`, don't assume from `chain`.
+- **`cost_breakdown_bps.dex_swap_fee_bps` is `null`** on every cross-chain leg — the hop's swap/slippage cost lives in `cross_chain_cost_bps`/`cross_chain_cost_usdc` instead, and `cost_breakdown_bps.price_impact_bps` equals `cross_chain_cost_bps.swap_slippage_bps`.
+- **No minimum ticket size.** A cross-chain leg has no floor — the fee is disclosed and the same 500-bps deviation check runs, but a small order pays proportionally more; there is no size below which the route refuses.
+
+**Sell side: `priority:"speed"` alone never routes cross-chain.** A position you bought this way sells through the normal `eth` gasless route with no `priority`, and a holding that sits only on a chain the speed sell can't reach is `422 holdings_insufficient` under `"speed"`, same as any other speed-chain-only holding. The one cross-chain sell is [`payout_chain`](#payout-chain): it is opt-in, works with or without `priority`, and marks its leg with `payout_chain`, never `origin_chain`.
+
+**Signing — two new wrinkles, on top of the existing shapes above.**
+
+- **sol origin:** a `solana_versioned_tx` whose fee payer is **your own sol wallet** (it is also the deposit's signer): sign it as issued, once — exactly like a same-chain sol leg — and the wallet pays the SOL network fee. Every account key in the message is static (no lookup tables). To have a **sponsor** pay instead, recompile the message with the sponsor's key as payer (e.g. `TransactionMessage.decompile(tx.message)`, set `payerKey`, `compileToV0Message()`) and sign with both keys; the submit-time check binds your signature and the deposit, not the payer. Beyond the deposit it accepts only compute-budget, token-account-creation and sponsor-paid rent-transfer instructions.
+- **EVM origin, `execution:"transaction"` (default):** the same `evm_signed_tx` shape as the same-chain speed route, but `role` may be `"deposit"` instead of `"swap"` — this transaction only moves your stable off the origin chain; the exchange into the destination token happens off-chain via the fill. Its paired `approve` (when present) is **exact-amount**, not the unlimited `max-uint256` the same-chain speed route signs — a smaller, narrower allowance because the spender is a bridge depository, not a swap router.
+- **EVM origin, `execution:"user_operation"`:** the same `evm_calls` shape as [above](#user-operation), but `sender` is your **origin**-chain wallet (not the destination leg's wallet) and `chain_id` may be `1` (Ethereum mainnet) for an eth origin — a value the same-chain speed route never returns on this endpoint.
+
+**Status and errors.** `/status` and `/trade/submit` work exactly as documented above — same aggregate/per-leg shape, same `poll_after_ms` cadence. Two new disclosures and five new per-leg codes:
+
+- **`cross_chain_route_unavailable {chain, protocol, reason}`** in `warnings[]` — a cell that can go cross-chain (`eth/ondo`, `sol/xstocks`, `base/coinbase`) could not be served cross-chain and fell back to today's plan for it (dropped, or its existing same-chain outcome). `reason` ∈ `no_routes | over_max | fee_unavailable | disabled | provider_error | wallet_not_delegated` (`wallet_missing` is declared but not observed in practice — treat it as reserved). Distinct from `speed_route_unavailable`, which means your SAME-chain speed leg fell back.
+- **`cross_chain_price_deviation {chain, protocol, deviation_bps, threshold_bps}`** in `warnings[]` — advisory, never a refusal; the leg is fully executable regardless.
+- **`400 incomplete_submit`** at `/trade/submit` on ANY validation failure on a cross-chain leg's signed payload (a mismatched instruction, a wrong spender, a bad signature) — **nothing is broadcast, no row is created**, unlike a same-chain speed leg's failure mode (which can leave a per-leg `broadcast_failed` row). Re-sign and resubmit the same `quote_id`.
+- **`409 leg_already_submitted`** on a duplicate signature/hash — same idempotency contract as every other leg.
+- Per-leg `error_code` values only this arm can carry:
+
+| Code | Meaning | Action |
+| --- | --- | --- |
+| `quote_stale` | (sol origin) the deposit's blockhash expired before it was broadcast — nothing left the wallet. A per-leg code, distinct from the top-level `410 quote_stale` at submit (that one fires before any leg's bytes leave at all) | re-quote |
+| `deposit_reverted` | (EVM origin) the deposit reverted past the retry window | re-quote |
+| `refunded` | the cross-chain intent could not fill; your deposit was returned to the origin wallet — no token was bought | re-quote |
+| `delivered_other_currency` | you were delivered a stablecoin instead of the destination token — the fill genuinely could not complete | terminal — nothing to retry; you hold a different asset than requested |
+| `cross_chain_unsettled` | 6 hours passed with no terminal outcome after the deposit left your wallet | **do NOT re-quote** — it may still fill or refund on its own; a late fill is healed automatically |
+
 **Idempotency** is unchanged (a hash over the submitted array), and the op's own hash is deduped across quotes — the same signed op under a second `quote_id` is `409 leg_already_submitted` carrying `user_op_hash` — as is a re-submit of the same leg under a **different signature** (the op hash does not cover the signature, so it is the same op you already own).
+
+<a id="payout-chain"></a>
+## `payout_chain`: sell and receive USDC on another chain
+
+Send `payout_chain` (`"sol"`, `"eth"` or `"base"`) on `POST /quote/sell` and the sale's USDC lands on that chain, in your own wallet there (`sol_wallet` on `sol`, `eth_wallet` on `eth` and `base`). Absent or `null` is the default: every position sells on its own chain, exactly as a request without the field. It is independent of `priority`, and sell-only: sending it to `/quote/buy` or `/quote/preview` is `400 invalid_request`. `robinhood` and `arbitrum` are not payout chains.
+
+**How each position you hold is planned:**
+
+- a position already on `payout_chain` sells there as usual (under `priority:"speed"` it keeps the speed filter, so an `eth` position is left out when paying out on `eth`);
+- a `sol/xstocks`, `base/coinbase` or `eth/ondo` position on another chain sells **cross-chain as one leg**, marked by `payout_chain` on that leg, whatever the `priority`. The sale and the payout are one leg, with no separate payout step to submit;
+- any other position (`sol/ondo`, `eth/xstocks`, `robinhood`, `arbitrum`) is **left out** and named by a `cross_chain_route_unavailable` warning. It is never sold on its own chain instead, because that would pay out somewhere you did not ask for.
+
+With a payout on another chain, `chain: ["eth"]` together with `priority:"speed"` is accepted: the `eth/ondo` position sells cross-chain.
+
+**The cross-chain sell leg.** `payout_chain` is present only on this kind of leg, so its presence is the marker (`origin_chain` is never populated on a sell). `chain` / `protocol` stay the position being sold. `estimated_output_usdc` and `price_usdc_per_share` are what lands on `payout_chain`, net of the route's fees, and `base_asset` is always `usdc`. `cross_chain_cost_bps` / `cross_chain_cost_usdc` disclose the hop's own cost and `cost_breakdown_bps.dex_swap_fee_bps` is `null`, as on a [cross-chain buy leg](#cross-chain-speed). The leg is **`gasless: false` whatever the `priority`**: you pay the network gas on the leg's own `chain`, where the sale is sent. The exception is `execution:"user_operation"`, where your paymaster pays and the leg is `gasless: true`. `estimated_gas_usd` prices the `approve` and the sale on `eth` / `base`; it is `null` on `sol` and under `execution:"user_operation"`.
+
+**Signing, by the chain the position sits on:**
+
+- **`eth` / `base`, `execution:"transaction"` (the default):** always two payloads on the leg's own `chain`: an **exact-amount** `approve` of the tokens sold (served every time, whatever allowance the wallet already has), then a `role:"deposit"` that sells them and sends the USDC to `payout_chain`. Sign both whole as `evm_signed_tx`, in the order issued; branch on `role`, never on array position.
+- **`eth` / `base`, `execution:"user_operation"`:** one `evm_calls` payload holding the same two calls (`approve` of the stock for exactly the amount sold, then `deposit`). `sender` is your `eth_wallet`, `chain_id` is the leg's own chain (`8453` or `1`), and your paymaster pays the gas.
+- **`sol`:** a `solana_versioned_tx` with your sol wallet as fee payer, signed as issued. Unlike a cross-chain buy's deposit, its message uses address-lookup tables: a sponsor that recompiles it as payer may reference only the quoted tables, and the signed transaction must fit Solana's 1232-byte limit.
+
+**Status.** On [`/quote/{quote_id}/status`](#get-quotequote_idstatus) the leg carries `payout_chain` and `payout_tx_hash`. `tx_hash` stays the sale on `chain` (under `execution:"user_operation"` it is `null` until the leg completes, then the bundle that sold it). `payout_tx_hash` is the transaction on `payout_chain` that paid the USDC out, `null` until `completed`. On `completed`, `payout_chain` names where the USDC **actually** landed: if the cross-chain payout could not be made, the USDC may be returned on the sale's own `chain` instead, and `payout_chain` then equals `chain`. `filled_usdc` is the USDC that landed.
+
+**Refusals.**
+
+| Response | When | Action |
+| --- | --- | --- |
+| `400 invalid_request`, `message` prefixed `payout_chain: ` | the wallet for `payout_chain` is missing, or nothing in your `chain` / `protocol` scope can pay out there (a `robinhood` pin, or `chain: ["eth"]` with `protocol: "xstocks"`) | send the wallet, or widen the scope |
+| `422 holdings_insufficient` | your holdings in scope fall short, wherever they sit | reduce `amount_shares` |
+| `422 no_routes` with `reason: "payout_route_unavailable"` | you hold enough, but not enough of it can pay out on `payout_chain`, or a cross-chain leg was refused or could not land | pay out on another chain, send no `payout_chain` to sell each position on its own chain, or re-quote later |

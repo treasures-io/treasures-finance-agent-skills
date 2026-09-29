@@ -90,7 +90,7 @@ Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. 
 }
 ```
 
-`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. Use for quote-time comparison, P&L marks, "current price" UX.
+`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. A venue whose on-chain price sits more than 1.5× from the tradfi price, in either direction, reads `share_price_usd: null` (with null premiums) while `volume_24h_usd` is still reported: a thin pool can price one venue's listing far off the underlying, and a missing price is safer to act on than a wrong one. Use for quote-time comparison, P&L marks, "current price" UX.
 
 - **`premium_vs_anchor_pct`** (negative = on-chain cheaper) — the premium against the reference named by `anchor_source`. `null`, with `anchor_source` absent, when no reference resolves at all.
 - **`anchor_source`** — `"tradfi_live"` (the regular-session print), `"tradfi_extended"` (the aftermarket print while it is still printing) or `"tradfi_frozen"` (the frozen regular-session close). Never the on-chain mark: the premium measures an on-chain price, so anchoring it there would measure that price against itself.
@@ -298,8 +298,12 @@ Three things that will otherwise surprise you:
 }
 ```
 
-Treasures trades are single-chain swaps, so `sending` and `receiving` share one `tx_hash`, chain and
-timestamp — only the token and amount differ. Use `tokens` rather than assuming a decimal scale;
+On a single-chain swap `sending` and `receiving` share one `tx_hash`, chain and timestamp; only the
+token and amount differ. A sell quoted with [`payout_chain`](trading.md#payout-chain) is the exception:
+`sending` is the sale on the entry's `chain` and `receiving` is the payout, its own transaction on the
+chain the USDC landed on (the sale's own `chain` if the payout was returned there). The top-level
+`chain` and `tx_hash` are the sale's, as on `/trades`; `token_out_address` and `amount` still mirror
+`receiving`. Use `tokens` rather than assuming a decimal scale;
 token precision is not part of the contract. Loop with `while (has_more)`, passing `next_cursor`.
 
 `price_usd` is per *token*, matching `amount`/`tokens` on the same leg; `price_usd_per_share` is the
