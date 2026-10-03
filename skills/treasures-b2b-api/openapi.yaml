@@ -1111,10 +1111,10 @@ paths:
           description: Protocols to include; omit for all. Values are lowercase, matched exactly.
           schema:
             type: array
-            maxItems: 5
+            maxItems: 6
             items:
               type: string
-              enum: [ondo, xstocks, robinhood, coinbase, reality]
+              enum: [ondo, xstocks, robinhood, coinbase, reality, backpack]
           example: [ondo, xstocks]
         - name: ticker
           in: query
@@ -1621,7 +1621,9 @@ components:
 
     Protocol:
       type: string
-      enum: [ondo, xstocks, robinhood, coinbase, reality]
+      description: >-
+        Issuer/venue. `backpack` pairs only with `chain: sol` (Solana-only mints).
+      enum: [ondo, xstocks, robinhood, coinbase, reality, backpack]
 
     PayoutChain:
       type: string
@@ -2194,6 +2196,22 @@ components:
         robinhood: { $ref: "#/components/schemas/RobinhoodListing" }
         coinbase: { $ref: "#/components/schemas/CoinbaseListing" }
         reality: { $ref: "#/components/schemas/RealityListing" }
+        backpack: { $ref: "#/components/schemas/BackpackListing" }
+
+    BackpackListing:
+      description: >
+        Backpack Securities venue listing on Solana. Same shape as the `ondo` and `xstocks`
+        blocks; Backpack deploys on Solana only, so `eth_address` is always `null` and the
+        `eth_*` fields never appear.
+
+        **Optional, and absent while the venue is not offered.** When the key is present, a
+        cell is listed only once its token has real supply: until then `sol_address` and
+        `token_ticker` are `null`, `sol` is not added to `available_chains` on its account,
+        and `sol_min_trade_size_usd` and the `sol_` warn trio are gated with them. A ticker
+        only this venue carries is not served at all while its cell is unlisted. `token_ticker`
+        is the bare stock symbol (Backpack tokens carry no on/x suffix).
+      allOf:
+        - $ref: "#/components/schemas/StockProtocolListing"
 
     CoinbaseListing:
       type: object
@@ -2327,9 +2345,9 @@ components:
       description: >
         One real (protocol, chain, address) token deployment for this ticker: the tuple you forward
         to the quote routes as `protocol` + `chain`. Combos the ticker does not list are simply
-        absent, and a supply-gated `coinbase` or `reality` cell publishes no entry at all until its
-        token is minted (`reality` additionally stays absent while the venue flag is off). Token
-        decimals stay internal; read them on-chain.
+        absent, and a supply-gated `coinbase`, `reality` or `backpack` cell publishes no entry at all
+        until its token is minted (`backpack` additionally stays absent while that venue is switched
+        off). Token decimals stay internal; read them on-chain.
       required: [protocol, chain, address, share_multiplier, token_ticker]
       properties:
         protocol: { $ref: "#/components/schemas/Protocol" }
@@ -2955,8 +2973,8 @@ components:
             `priority:"speed"` buy for a cell you are not funded on, reaching its destination
             through a cross-chain hop. Names the chain your stable actually left; `chain` above
             stays the destination cell (never the origin), consistent with every other field on
-            this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, and `base` on an
-            unpinned or multi-chain request are reachable cross-chain; a single-chain
+            this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, and
+            `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain
             `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and
             `eth/xstocks` are never cross-chain destinations. `cross_chain_cost_bps` and
             `cross_chain_cost_usdc` disclose the hop's own cost. Absent on every same-chain leg.
@@ -3111,7 +3129,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3179,7 +3197,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3217,8 +3235,9 @@ components:
             position you hold is planned on its own terms:
             - a position on `payout_chain` sells on that chain as usual (under `priority: "speed"`
               it keeps the speed filter, so an `eth` position is left out when paying out on `eth`);
-            - a `sol/xstocks`, `base/coinbase` or `eth/ondo` position on another chain sells
-              cross-chain as one leg, marked by `payout_chain` on that leg, whatever the `priority`;
+            - a `sol/xstocks`, `sol/backpack`, `base/coinbase` or `eth/ondo` position on another
+              chain sells cross-chain as one leg, marked by `payout_chain` on that leg, whatever
+              the `priority`;
             - any other position (`sol/ondo`, `eth/xstocks`, `robinhood`, `arbitrum`) is left out
               and named by a `cross_chain_route_unavailable` warning. It is never sold on its own
               chain instead, because that would pay out somewhere you did not ask for.
@@ -3281,7 +3300,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3385,7 +3404,8 @@ components:
             gas for it. Carries `chain`, and no `reason`. Advisory: price the gas yourself before
             choosing this leg over a gasless one.
             `cross_chain_route_unavailable`: a `priority:"speed"` cell you were not funded on,
-            and that can be reached cross-chain (`eth/ondo`, `sol/xstocks`, `base/coinbase`),
+            and that can be reached cross-chain (`eth/ondo`, `sol/xstocks`, `sol/backpack`,
+            `base/coinbase`),
             could not be served cross-chain and **fell back** to today's plan for that cell instead
             (a dropped same-chain speed leg, a sol leg you could not fund, or (on eth) no leg at
             all, since eth is never served on its gasless route under `"speed"`). Carries `chain`, `protocol` and
@@ -4447,8 +4467,8 @@ components:
             The fee in the settlement currency, derived as `percentage` applied to the
             entry's `amount_usd`, not read back from the venue's own fee event. Treat it
             as a close estimate rather than a reconciled figure: the recorded settlement
-            notional is already net of the fee on an Ethereum sell and on a sell paid out on
-            another chain, and on a buy the fee
+            notional is already net of the fee on an Ethereum sell, on a sell paid out on
+            another chain and on a Solana buy, and on other buys the fee
             is taken in the token received rather than in the settlement currency. Same
             caveat applies to reconstructing a gross notional from it. Both entries carry
             this caveat identically.
