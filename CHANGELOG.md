@@ -16,6 +16,56 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## Unreleased: b2b `1.17.0`, wallet `1.4.0`
+
+Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills.
+Additive on the request. Two **⚠ Action** items:
+
+- **Strict response parsers:** `backpack` can appear as a `protocol` or `issuer` on response rows for
+  any wallet that holds the tokens, whatever skill version you run. Both skills now state that
+  `chain`, `protocol` and `issuer` are open vocabularies: never fail a parse on an unlisted value.
+- **Unpinned Solana buys widen:** while the venue is offered, a request that names no `protocol` can
+  now route to a listed Backpack cell. To keep the old routing, send `protocol` as an array of the
+  protocols you want.
+
+### treasures-b2b-api `1.17.0`: Backpack, a third stock protocol on Solana
+
+- **`protocol: "backpack"`** on `/quote/buy`, `/quote/sell` and `/quote/preview`, alone or in a
+  `protocol` array (arrays now take one to six values). Solana only: it pairs with `chain: "sol"`,
+  and there is no Ethereum cell.
+- **Co-ranked, not opt-in.** An unpinned Solana buy ranks a listed `backpack` cell against `ondo`
+  and `xstocks`, and an unpinned sell fills from a held `backpack` position like any other.
+- **Discovery.** `/stocks` and `/stocks/tickers` gain an optional `backpack` listing block
+  (`BackpackListing`: the `ondo`/`xstocks` shape, `eth_address` always `null`). The key is absent,
+  not `null`, while the venue is not offered, and a cell is listed only once its token has supply.
+  `/stocks/{ticker}` lists a `backpack` entry in `listings[]` on the same terms. `/stocks/prices`
+  carries no `onchain.backpack`: compare a Backpack leg against `tradfi`.
+- **Bare `token_ticker`.** Backpack positions report the plain stock symbol (`"MU"`, no suffix) on
+  `/portfolio`, `/trades` and `/settlements`, with `protocol: "backpack"` and `chain: "sol"`. A bare
+  symbol no longer implies a single-cell venue: branch on `protocol` and `chain`.
+- **Cross-chain, like `sol/xstocks`.** Under `priority: "speed"`, a `sol/backpack` cell you are not
+  funded for on Solana can be bought from your USDC on another chain as one leg (marked by
+  `origin_chain`), and a held Backpack position sells cross-chain with `payout_chain`.
+- New refusal: `422 no_routes` on a buy pinned to a `backpack` cell that is not listed.
+- `/settlements` filters list every value: `chain` adds `arbitrum`, `protocol` adds `reality` and
+  `backpack`.
+- `SettlementFeeCost.amount_usd`: the note on which recorded notionals are already net of the fee
+  now includes a Solana buy.
+
+### treasures-wallet `1.4.0`: Backpack on the wallet API
+
+- **`protocol: "backpack"`** on `GET /wallets/:id/quotes` and `POST /wallets/:id/trades`. Solana
+  only: pair it with `chain: "solana"` or omit `chain`; with `ethereum` it is `400 invalid_request`.
+- An unpinned buy resolves across `{solana, ethereum} × {ondo, xstocks}` plus `solana × backpack`
+  when that venue lists the asset. A sell fans out across every venue the wallet holds, Backpack
+  included.
+- **`/balances`:** `issuer` adds `backpack` and `reality`, `chain` and `native` add `arbitrum`, and
+  `needs_funding` is true only when every `native` entry is zero. Only `sol`/`eth` positions with
+  issuer `ondo`, `xstocks` or `backpack` trade on this plane; the rest are reported for
+  completeness. A Backpack position carries the bare ticker as its token symbol on the reads routes.
+
+---
+
 ## 2026-09-29: b2b `1.16.0`
 
 Folds in b2b `1.15.0`, which did not ship standalone, and publishes integrator fees and payouts for

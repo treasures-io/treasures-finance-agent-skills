@@ -4,11 +4,11 @@ description: >
   Operate a Treasures delegated wallet over the HTTP API: onboard (provision a wallet + mint a
   scoped API key), get quotes, execute buys/sells (async, server-signed — the agent NEVER signs),
   read balances/portfolio/trade-history, and manage API keys. Trigger whenever an agent needs to
-  trade tokenized equities (xStocks / Ondo) vs USDC on a Treasures wallet, check a Treasures wallet
+  trade tokenized equities (xStocks / Ondo / Backpack) vs USDC on a Treasures wallet, check a Treasures wallet
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
 tags:
   - treasures
   - delegated-wallet
@@ -17,6 +17,7 @@ tags:
   - ethereum
   - xstocks
   - ondo
+  - backpack
   - tokenized-equities
   - api-key
 ---
@@ -29,7 +30,8 @@ on-chain; the agent only submits **intents** with a scoped API key. ⇒ No web3 
 ## When to use
 
 - Buy/sell tokenized equities (e.g. NVDA, TSLA) as **xStocks** or **Ondo** tokens vs **USDC** on
-  Solana or Ethereum, from a Treasures wallet.
+  Solana or Ethereum, or as **Backpack** tokens (Backpack Securities, Solana only), from a Treasures
+  wallet.
 - Preview a trade price (quote), check a wallet's balances/positions, or read its trade history / P&L.
 - Onboard an agent: provision a wallet + mint a scoped (`trade`/`quote`) API key with optional caps.
 - Manage API keys for a wallet (owner-side: create / list / revoke).
@@ -54,19 +56,27 @@ agent to hold a private key — the whole point of this design is that it doesn'
     `POST` that created the job — it exposes the trade intent + outcome, so it is not keyless.
   - **Reads** (balances, history, portfolio, `GET /wallets/:id`, delegation state) need **no key** —
     public + IP-rate-limited, scoped by the address/id in the request.
-- **Chain/protocol naming maps between layers:** balances/positions report `chain: "sol"|"eth"` and
-  `issuer: "ondo"|"xstocks"`; quote/trade params take `chain: "solana"|"ethereum"` and
-  `protocol: "ondo"|"xstocks"`. **Map `sol→solana`, `eth→ethereum`** when feeding a held position
-  back into a quote/trade. (Responses echo `solana`/`ethereum`.)
+- **Chain/protocol naming maps between layers:** a tradeable position reports `chain: "sol"|"eth"` and
+  `issuer: "ondo"|"xstocks"|"backpack"`; quote/trade params take `chain: "solana"|"ethereum"` and
+  `protocol: "ondo"|"xstocks"|"backpack"`. **Map `sol→solana`, `eth→ethereum`** when feeding a held
+  position back into a quote/trade. (Responses echo `solana`/`ethereum`.) `backpack` exists on Solana
+  only: pair it with `chain: "solana"` or omit `chain`; with `ethereum` it is `400 invalid_request`.
+  `/balances` can also list positions on other chains (`robinhood`, `base`, `arbitrum`) that this
+  plane reads but does not trade; full unions in [`references/endpoints.md`](references/endpoints.md).
+- **`chain`, `issuer` and `protocol` are open vocabularies.** New values are added whenever Treasures
+  supports a new chain, issuer or protocol, and they can reach `/balances` and trade reads before you
+  upgrade this skill. Never fail a parse on an unlisted value: report the position as-is, and don't
+  trade it until this skill documents it.
 - **Amounts are atomic integer strings — never JS `number`.** USDC = 6 dp. Stock tokens vary
   (reads expose both `shares` (human) and `raw_token` (on-chain)). Parse with a big-decimal lib.
 - **Trading is async + route-first.** `POST /trades` → **202 + job**, then **poll** to terminal.
   Routing runs *before* the 202, so no-route / cap breach / unwhitelisted come back **synchronously**
   as 4xx (no job row).
 - **Auto-routing is single-cell for a BUY, multi-leg for a SELL.** Omit `chain`/`protocol` and a buy
-  resolves to the *one* best cell by net deliverable across `{solana,ethereum} × {ondo,xstocks}` — it
-  never splits. A sell fans out across every venue the wallet holds and returns N legs in one
-  response (see the **Sell playbook**). Pinning `chain`+`protocol` narrows either side to one cell.
+  resolves to the *one* best cell by net deliverable across `{solana,ethereum} × {ondo,xstocks}` plus
+  `solana × backpack` (when that venue is listed for the asset) — it never splits. A sell fans out
+  across every venue the wallet holds and returns N legs in one response (see the **Sell playbook**).
+  Pinning `chain`+`protocol` narrows either side to one cell.
 
 ## Config (the agent supplies)
 
@@ -306,7 +316,7 @@ const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
 
 const SKILL_NAME = 'treasures-wallet';
-const SKILL_VERSION = '1.3.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.4.0'; // = SKILL.md metadata.version
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
   const res = await fetch(url, {
