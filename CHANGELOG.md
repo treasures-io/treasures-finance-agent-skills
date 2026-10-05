@@ -18,8 +18,9 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ## Unreleased: b2b `1.17.0`, wallet `1.4.0`
 
-Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills.
-Additive on the request. Two **⚠ Action** items:
+Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills, and
+an optional `origin_chain` on b2b buy quotes and previews. Additive on the request. Two
+**⚠ Action** items:
 
 - **Strict response parsers:** `backpack` can appear as a `protocol` or `issuer` on response rows for
   any wallet that holds the tokens, whatever skill version you run. Both skills now state that
@@ -51,6 +52,25 @@ Additive on the request. Two **⚠ Action** items:
   `backpack`.
 - `SettlementFeeCost.amount_usd`: the note on which recorded notionals are already net of the fee
   now includes a Solana buy.
+
+### treasures-b2b-api `1.17.0`: rank by where your money is (`origin_chain`)
+
+- **`origin_chain`** (`sol`, `eth`, `robinhood` or `base`) on `/quote/buy` and `/quote/preview`
+  names the chain the stable you will pay with sits on. Optional: omit it for today's behaviour
+  exactly. `/quote/sell` rejects it as an unknown field.
+- **Default route: ranking only.** Every leg on another chain ranks as if it also paid the measured
+  cost of moving your money there, so `quotes[0]` is the cheapest leg for money held on that chain.
+  No leg is added, dropped or repriced, and a leg on another chain is still a same-chain leg: fund
+  that chain (for example through `/bridge/quote`) before you submit it. The transfer cost excludes
+  the gas you pay to send the transfer, which matters most on `eth`.
+- **Under `priority: "speed"` it also picks the origin.** A cross-chain leg spends only from
+  `origin_chain`, so its `origin_chain` field always equals the value you sent. A cell already
+  funded on its own chain still trades there; if `origin_chain` does not cover the amount, no
+  cross-chain leg is offered.
+- **`/quote/preview`** reads no balance, so under `"speed"` it prices as if the whole amount sits on
+  `origin_chain` (`sol` when you omit it, as before).
+- New refusal: `400 invalid_request` (`origin_chain "eth" requires eth_wallet`) when `/quote/buy`
+  names an `origin_chain` whose wallet the request does not carry.
 
 ### treasures-wallet `1.4.0`: Backpack on the wallet API
 

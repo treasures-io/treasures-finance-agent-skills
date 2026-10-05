@@ -2971,9 +2971,9 @@ components:
           description: >-
             **Present only on a cross-chain leg, and its presence is what marks one**: a
             `priority:"speed"` buy for a cell you are not funded on, reaching its destination
-            through a cross-chain hop. Names the chain your stable actually left; `chain` above
-            stays the destination cell (never the origin), consistent with every other field on
-            this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, and
+            through a cross-chain hop. Names the chain your stable actually left (the request's
+            `origin_chain` whenever it sent one); `chain` above stays the destination cell (never
+            the origin), consistent with every other field on this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, and
             `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain
             `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and
             `eth/xstocks` are never cross-chain destinations. `cross_chain_cost_bps` and
@@ -3103,6 +3103,27 @@ components:
         thin_since:
           $ref: '#/components/schemas/ThinSince'
 
+    QuoteOriginChain:
+      type: string
+      enum: [sol, eth, robinhood, base]
+      description: >-
+        Where the stable you will pay with sits (USDC; USDG on `robinhood`). Buy and preview only;
+        `/quote/sell` refuses it. On the default route it changes the **ranking only**: a leg on
+        any other chain ranks as if it cost the measured transfer from this chain, so
+        `quote_index: 0` is the cheapest leg for money held here. That transfer cost is the
+        route's measured fee only; it excludes the gas you pay to send the transfer on this chain,
+        which matters most on `eth`. No leg is added, dropped or repriced, and a leg off this chain
+        is still a same-chain leg: fund its chain (for example through `/bridge/quote`) before you
+        submit it. Under `priority:"speed"` it is also the
+        **only** chain a cross-chain leg may spend from (`origin_chain` on such a leg is always this
+        value); a cell already funded on its own chain still trades there (`eth` aside: it has no
+        `"speed"` route of its own, so an `eth`-funded speed request returns no `eth` leg), and when
+        this chain does not cover the amount no cross-chain leg is offered at all. A single-chain
+        `base` or `robinhood` pin is never cross-chain, so there it is inert. On `/quote/buy` the
+        wallet for this chain must be in the request (`sol_wallet` for `sol`, `eth_wallet`
+        otherwise), else `400 invalid_request`. Absent or `null` = today's ranking and origin
+        choice.
+
     QuoteBuyRequest:
       type: object
       required: [ticker, amount_usdc, max_slippage_bps, ownership_proof]
@@ -3149,6 +3170,10 @@ components:
             one of the chains named in `chain` whenever `chain` is sent; a contradiction is
             `400 invalid_request`, never a silent fallback. Absent, or naming a chain the plan has
             no leg on, leaves the ordering exactly as it is today (cheapest first).
+        origin_chain:
+          oneOf:
+            - { $ref: "#/components/schemas/QuoteOriginChain" }
+            - { type: "null" }
         priority: { $ref: "#/components/schemas/Priority" }
         execution: { $ref: "#/components/schemas/Execution" }
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
@@ -3316,6 +3341,17 @@ components:
             A preference, not a pin: the leg on this chain becomes `quote_index: 0` when the
             preview has one, and the rest keep their price order. Must be one of the chains named
             in `chain` whenever `chain` is sent (`400 invalid_request` otherwise).
+        origin_chain:
+          oneOf:
+            - { $ref: "#/components/schemas/QuoteOriginChain" }
+            - { type: "null" }
+          description: >-
+            As on `/quote/buy`, except that the preview reads no balance: under
+            `priority:"speed"` it prices as if the whole amount sits on this chain and nowhere
+            else, so a leg on it is same-chain and a cross-chain-capable leg off it comes back
+            cross-chain from it. `eth` is the exception on the first half: it has no `"speed"`
+            route of its own, so a `"speed"` preview funded on `eth` returns no `eth` leg. Absent,
+            a `"speed"` preview assumes `sol`, and the default route ranks exactly as it does today.
         priority:
           allOf: [{ $ref: "#/components/schemas/Priority" }]
           description: >-
