@@ -16,7 +16,7 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
-## Unreleased: b2b `1.17.0`, wallet `1.4.0`
+## 2026-10-06: b2b `1.17.0`, wallet `1.4.0`
 
 Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills, and
 an optional `origin_chain` on b2b buy quotes and previews. Additive on the request. Two
