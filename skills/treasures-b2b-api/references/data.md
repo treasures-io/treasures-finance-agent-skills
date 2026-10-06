@@ -15,12 +15,15 @@ Catalog: every tradable ticker with chain availability, per-protocol token addre
     "ondo":    { "sol_address": "...", "eth_address": "0x...", "share_multiplier": "0.4818", "token_ticker": "AAPLon" },
     "xstocks": { "sol_address": null, "eth_address": null, "share_multiplier": null, "token_ticker": null },
     "robinhood": { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" },
-    "coinbase":  { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" }
+    "coinbase":  { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" },
+    "backpack":  { "sol_address": "...", "eth_address": null, "share_multiplier": "1", "token_ticker": "AAPL" }  // optional, see below
   }]
 }
 ```
 
-A listing block with all its fields `null` means that protocol/venue doesn't list this ticker. `available_chains` is the union across all four (`sol` · `eth` · `robinhood` · `base`). **The `robinhood` and `coinbase` blocks have a different shape** — Robinhood Chain (4663) and Base (8453) are single-cell venues, so each carries one `address` (decimals stay internal) instead of the `sol_address`/`eth_address` pair. `token_ticker` is the symbol that appears on `/portfolio` + `/trades` rows — Ondo `<TICKER>on`, xStocks `<TICKER>x`, Robinhood and Coinbase the **bare** `<TICKER>` — you never derive it yourself.
+A listing block with all its fields `null` means that protocol/venue doesn't list this ticker. `available_chains` is the union across every listing block (`sol` · `eth` · `robinhood` · `base` · `arbitrum`). **The `robinhood` and `coinbase` blocks have a different shape** — Robinhood Chain (4663) and Base (8453) are single-cell venues, so each carries one `address` (decimals stay internal) instead of the `sol_address`/`eth_address` pair. `token_ticker` is the symbol that appears on `/portfolio` + `/trades` rows — Ondo `<TICKER>on`, xStocks `<TICKER>x`, Robinhood, Coinbase and Backpack the **bare** `<TICKER>` — you never derive it yourself.
+
+**The `backpack` block is optional; model it as an optional key, not a nullable one.** Backpack Securities tokenized stocks (Solana) use the `ondo`/`xstocks` shape, but the venue is Solana-only, so `eth_address` is always `null` and the `eth_*` keys never appear. The key is **absent** from the item while the venue is switched off. When it is present, a cell is listed only once its token has real supply: until then `sol_address` and `token_ticker` are `null` and it adds nothing to `available_chains`. A ticker that only this venue carries is omitted from this endpoint, `/stocks` and `/stocks/prices` (and is a `404` on `/stocks/{ticker}`) while its cell is unlisted. Trading rules: [`trading.md`](trading.md#backpack).
 
 **This endpoint is the authority on where a ticker trades — especially for `base`.** The Coinbase B20 contracts were deployed unminted, and Treasures hides a cell until real supply exists: an unminted ticker shows `coinbase.address: null`, omits `base` from `available_chains`, and returns `422 no_routes` if you quote it anyway. The listed set therefore **grows over time** as Coinbase mints. Re-read this endpoint (5-min cache) instead of hardcoding a venue list.
 
@@ -55,6 +58,7 @@ Which keys appear where:
 | Grain | Where | Keys |
 | --- | --- | --- |
 | cell | `ondo`, `xstocks` blocks — each spans **two** cells (sol + eth) | chain-suffixed: `sol_min_trade_size_usd`, `sol_tradability`, `sol_warn_reason`, `sol_thin_since`, and the four `eth_*` twins |
+| cell | `backpack` block (when present): one Solana cell | the four `sol_*` keys only, published only while the cell is listed |
 | cell | `robinhood`, `coinbase` blocks — one cell each | bare: `min_trade_size_usd`, `tradability`, `warn_reason`, `thin_since` |
 | ticker | top level of the item, beside `ticker`/`name` | `min_trade_size_usd`, `tradability`, `warn_reason` — **no `thin_since`** (one stamp cannot date several cells' warnings) |
 
@@ -90,7 +94,7 @@ Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. 
 }
 ```
 
-`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. A venue whose on-chain price sits more than 1.5× from the tradfi price, in either direction, reads `share_price_usd: null` (with null premiums) while `volume_24h_usd` is still reported: a thin pool can price one venue's listing far off the underlying, and a missing price is safer to act on than a wrong one. Use for quote-time comparison, P&L marks, "current price" UX.
+`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. There is no `onchain.backpack`: Backpack cells carry no on-chain price here, so compare them against `tradfi`. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. A venue whose on-chain price sits more than 1.5× from the tradfi price, in either direction, reads `share_price_usd: null` (with null premiums) while `volume_24h_usd` is still reported: a thin pool can price one venue's listing far off the underlying, and a missing price is safer to act on than a wrong one. Use for quote-time comparison, P&L marks, "current price" UX.
 
 - **`premium_vs_anchor_pct`** (negative = on-chain cheaper) — the premium against the reference named by `anchor_source`. `null`, with `anchor_source` absent, when no reference resolves at all.
 - **`anchor_source`** — `"tradfi_live"` (the regular-session print), `"tradfi_extended"` (the aftermarket print while it is still printing) or `"tradfi_frozen"` (the frozen regular-session close). Never the on-chain mark: the premium measures an on-chain price, so anchoring it there would measure that price against itself.
@@ -137,7 +141,7 @@ Everything the catalog knows about one ticker, in one call — the route behind 
 
 - **Every block may be `null`, independently.** The blocks are assembled in parallel and each is fault-isolated, so `tradfi`, `extended_hours`, the `market_session`/`is_holiday`/`holiday_name` trio, `analyst`, `analyst_grades`, `earnings` and `news` degrade one at a time — any of them can be null purely because its fetch failed. **For `tradfi`, `extended_hours`, `analyst`, `analyst_grades` and `earnings`, null also means "there is no such value for this ticker right now"**: no analyst coverage, no report inside the 30-day horizon, no extended print (or a regular session, when the extended feed is deliberately withheld), no reference price. The response does not tell you which of the two it was, so do not render "unavailable" and "none" differently off these fields.
 - **`news` is the one block that separates the two.** `[]` means we hold no headlines for the ticker; `null` means the read failed. It is therefore the only block worth re-reading on an empty answer rather than caching the absence. Each item carries `title`, `url`, `publisher`, `published_at`, `type` and `snippet` — **no image field**: the story image is served from the news vendor's own host, which this plane does not publish.
-- **`listings[]` is per cell, and its `chain` is the quote vocabulary.** Each entry is one real `(protocol, chain, address)` deployment — forward `protocol` + `chain` straight to `/quote/buy` / `/quote/sell`. A combination the ticker does not list is simply absent from the array, so treat it as the authoritative "where can I trade this". The advisory `min_trade_size_usd` / `tradability` / `warn_reason` / `thin_since` fields ride each entry with the same rules as everywhere else (absent ≠ null; advisory, never a gate).
+- **`listings[]` is per cell, and its `chain` is the quote vocabulary.** Each entry is one real `(protocol, chain, address)` deployment — forward `protocol` + `chain` straight to `/quote/buy` / `/quote/sell`. A combination the ticker does not list is simply absent from the array, so treat it as the authoritative "where can I trade this". A `backpack` entry is always `chain: "sol"` and appears only while that venue is on and the cell has supply. The advisory `min_trade_size_usd` / `tradability` / `warn_reason` / `thin_since` fields ride each entry with the same rules as everywhere else (absent ≠ null; advisory, never a gate).
 - **No `onchain` block here.** This route is the profile + reference-price view. For per-protocol on-chain prices and premiums, call `GET /stocks/prices` (section above) — the two are meant to be used together.
 - **`logo_url` is ours to serve**, an absolute `https` URL you can hot-link or cache. `null` means no logo has been mirrored for this ticker yet.
 - **`extended_hours` is a sibling of `tradfi`, never a replacement.** `tradfi` stays anchored to the regular session; the extended print is null during `regular`, and it holds its last value overnight and at weekends — label staleness from its `as_of` rather than assuming it is live. `market_session` is global (US-equity, holiday/half-day aware), not per-ticker: overnight it reads `closed` while `extended_hours.session` still says `post`.
@@ -227,6 +231,8 @@ History for the wallet pair: Treasures-executed (`source: "internal"`) + reconci
 Robinhood-Chain trades appear here too — `chain: "robinhood"`, `protocol: "robinhood"`, bare `token_ticker`, `tx_hash` = the settlement hash (in-flight rows carry `order_hash` instead) — but only once you submit them (`/trade/submit`); there is no reconciler to backfill an unsubmitted Robinhood trade (see the `/portfolio` note above).
 
 Base trades behave identically — `chain: "base"`, `protocol: "coinbase"`, bare `token_ticker`, amounts in Base-native USDC — and carry the same submit-or-it-never-exists rule, for the same reason (no external-row reconciler on a single-cell venue).
+
+Backpack rows are the exception to "bare `token_ticker` means a single-cell venue": `chain: "sol"`, `protocol: "backpack"`, bare `token_ticker`. They are ordinary Solana cells, so they reconcile like `ondo`/`xstocks` on `sol`, `external` rows included, on `/trades` and `/portfolio` alike.
 
 ## `GET /settlements?limit=50&cursor=...` — your own settled trades, filterable
 
@@ -345,8 +351,8 @@ GET /settlements?chain=sol,eth&ticker=AAPL,MSFT&side=buy&settled_from=1785412800
 
 reads as "AAPL or MSFT, bought on Solana or Ethereum, settled in that 24-hour window".
 
-`chain` accepts `sol` · `eth` · `robinhood` · `base`; `protocol` accepts `ondo` · `xstocks` ·
-`robinhood` · `coinbase`. The two axes are ANDed, so an impossible pair (`?chain=base&protocol=ondo`)
+`chain` accepts `sol` · `eth` · `robinhood` · `base` · `arbitrum`; `protocol` accepts `ondo` · `xstocks` ·
+`robinhood` · `coinbase` · `reality` · `backpack`. The two axes are ANDed, so an impossible pair (`?chain=base&protocol=ondo`)
 is a valid request that simply matches nothing — it is not a `400`.
 
 - **Repeating a parameter is not additive.** `?chain=sol&chain=eth` is read as `sol` alone — always

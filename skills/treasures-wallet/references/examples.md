@@ -28,6 +28,12 @@ curl -s "$API/wallets/$WID/quotes?side=buy&asset=NVDA&notional_usdc=10&slippage_
 # pinned cell, sell quote
 curl -s "$API/wallets/$WID/quotes?chain=ethereum&protocol=xstocks&side=sell&asset=NVDA&shares=0.047&slippage_bps=100" -H "x-api-key: $KEY"
 # → {"chain":"ethereum","protocol":"xstocks",...,"min_amount_out":"9302939",...}   (USDC atomic, 6dp)
+
+# pinned Backpack cell (Solana only). Response SHAPE, not a captured call: this one was not run live.
+curl -s "$API/wallets/$WID/quotes?chain=solana&protocol=backpack&side=buy&asset=MU&notional_usdc=10&slippage_bps=100" -H "x-api-key: $KEY"
+# → {"chain":"solana","protocol":"backpack","side":"buy","asset":"MU","max_amount_in":"…","min_amount_out":"…","route_type":"dex_aggregator",...}
+#   a 422 means no listed Backpack cell for this asset right now (the venue may be switched off, or
+#   the token not yet listed); omit `protocol` to let the route pick among the listed cells
 ```
 
 ## Buy + poll (X-API-Key, scope trade)
