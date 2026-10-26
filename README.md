@@ -8,10 +8,10 @@ A skill is a folder of plain-Markdown instructions (`SKILL.md`) that a coding ag
 
 | Skill | What it does |
 | ----- | ------------ |
-| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC, and read portfolio + trade history for a single end-user wallet pair, plus, for integrators, your fee settlements and payouts. Covers US and Hong Kong listings across Solana, Ethereum, Base and Robinhood Chain, including the opt-in speed route on Base and Robinhood Chain, cross-chain speed buys, and sells that pay out USDC on another chain. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
+| [`treasures-b2b-api`](skills/treasures-b2b-api/SKILL.md) | Build an agent on the Treasures public B2B API: discover tokenized stocks, quote/execute trades, bridge USDC, and read portfolio + trade history for a single end-user wallet pair, plus, for integrators, your fee settlements and payouts. Covers US and Hong Kong listings across Solana, Ethereum, Base, Robinhood Chain and BNB Smart Chain, including the opt-in speed route on Base and Robinhood Chain, cross-chain speed buys, sells that pay out USDC on another chain, USDC bridging between any two supported chains, and SOL fees paid by a wallet you fund. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling. |
 | [`treasures-wallet`](skills/treasures-wallet/SKILL.md) | Operate a Treasures delegated wallet over HTTP: onboard (provision a wallet + mint a scoped API key), quote, execute async buys/sells (non-custodial — the agent never signs; Treasures signs as a delegated signer scoped strictly to RWA trades), read balances/portfolio/trade history, and manage API keys. Trades tokenized equities (xStocks / Ondo / Backpack) vs USDC on Solana or Ethereum with only HTTPS + an API key — no web3 libraries, keys, or RPC. |
 
-**BNB Chain support is coming soon.**
+**BNB Smart Chain** is documented from b2b `1.18.0`, but the venue is not open to every caller yet: check `available_chains` on `/stocks/tickers` before quoting it.
 
 ## Install
 
