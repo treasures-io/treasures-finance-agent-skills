@@ -54,8 +54,9 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
   "ticker": "AAPL",
   "amount_usdc": "100",                  // exactIn, string, 6 decimals max
   "chain": "sol" | "eth" | "robinhood" | "base" | "arbitrum" | ["sol", "eth"] | null,  // one chain = pin; an array (one or more, unique) = auto-route within those chains only (["x"] ≡ "x"); null = every chain the ticker lists, robinhood/base included (see #robinhood, #base)
-  "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | "reality" | ["ondo", "xstocks"] | null, // one protocol = pin; an array (one or more, unique) = auto-route within those protocols only (["x"] ≡ "x"); null = every protocol the ticker lists. To exclude one, send the others. "robinhood" only pairs with chain:"robinhood", "coinbase" only with chain:"base", "reality" only with chain:"arbitrum"
+  "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | "reality" | "backpack" | ["ondo", "xstocks"] | null, // one protocol = pin; an array (one to six, unique) = auto-route within those protocols only (["x"] ≡ "x"); null = every protocol the ticker lists. To exclude one, send the others. "robinhood" only pairs with chain:"robinhood", "coinbase" only with chain:"base", "reality" only with chain:"arbitrum", "backpack" only with chain:"sol" (see #backpack)
   "preferred_chain": "sol" | null,       // put this chain first — a PREFERENCE, not a filter: it reorders, it never narrows. Buy: that chain's leg becomes quote_index 0. Sell: it is filled from first, then the rest. Must be one of the chains in `chain` when you send `chain` (else 400); a chain with nothing to offer falls back to normal ordering. Sell guarantee: preferred-chain holdings that cannot be priced on the first attempt rejoin the rest of the fill, so the preference can never leave a sell short — see POST /quote/sell
+  "origin_chain": "sol" | "eth" | "robinhood" | "base" | null, // buy + preview only: where the stable you'll pay with sits — see "Ranking by where your money is" below. null/omitted = today's ranking
   "priority": "speed" | null,            // null/omitted = today's routing. "speed" asks for the speed route on robinhood/base — see below
   "max_slippage_bps": 50,                // 10 ≤ value ≤ 5000
   "integrator_fee_bps": 25,              // optional, needs your X-API-Key (tik_): YOUR fee on this quote in net bps, overriding your configured default up to your ceiling; omit to use the default. A quote carrying it must be submitted with the same key (403 quote_integrator_mismatch). Paid out via /payouts (see data.md)
@@ -110,6 +111,14 @@ USDC → shares. Returns up to one quote per chain the ticker lists (or per chai
 ```
 
 **Buy submission rule.** Each `quote_index` is a **mutually-exclusive alternative** — sign + submit one index only. >1 leg → `400 quote_index_mismatch`. No chain preference → just take `quotes[0]` (best rate) or re-quote with the `chain` you want. To favour a chain **without** excluding the others, send `preferred_chain`: `quotes[0]` is then that chain's leg when the plan has one, and the remaining legs stay in price order behind it — so you can still fall back to a cheaper chain by reading `quotes[1]`.
+
+<a id="origin-chain"></a>
+**Ranking by where your money is (`origin_chain`).** By default the legs are ranked as if your stable already sat on each leg's own chain, so `quotes[0]` can be a leg on a chain you hold nothing on. Send `origin_chain` with the chain your USDC (USDG on `robinhood`) actually sits on, and every leg on another chain is ranked as if it also paid the measured cost of moving the money there — `quotes[0]` becomes the cheapest leg **for money held on that chain**. It is buy- and preview-only (`/quote/sell` rejects it as an unknown field), and on `/quote/buy` the wallet for that chain must be in the request (`sol_wallet` for `sol`, `eth_wallet` otherwise) or it is `400 invalid_request`.
+
+- **Ranking only, on the default route.** The transfer cost used for ranking is the route's measured fee; it excludes the gas you pay to send the transfer on your origin chain, which matters most on `eth`. No leg is added, dropped or repriced: `price_usdc_per_share` and every other per-leg figure are unchanged, and a leg on another chain is still a same-chain leg. To submit it, fund its chain first (for example via [`/bridge/quote`](bridging.md)), then re-quote.
+- **Under `priority:"speed"` it also picks the origin.** It is the only chain a [cross-chain leg](#cross-chain-speed) may spend from, so `origin_chain` on such a leg always equals the value you sent. A cell already funded on its own chain still trades there. If `origin_chain` doesn't cover the amount, no cross-chain leg is offered at all — you never get a leg spending from a different chain.
+- **`/quote/preview`** reads no balance, so under `"speed"` it prices as if the whole amount sits on `origin_chain` (`sol` when you omit it).
+- A single-chain `base` or `robinhood` pin is never cross-chain, so `origin_chain` changes nothing there.
 
 <a id="gas-on-a-leg"></a>
 **Gas on a quote leg (`gasless`, `estimated_gas_usd`).** Every leg carries `gasless`. `true` = you sign an order, a settlement network broadcasts it, and the trade costs you **no native gas** — that is every `eth`, `robinhood` and `base` leg by default. `false` appears only on a [**speed-route** leg](#speed) (`priority:"speed"`), which you sign as a whole transaction that is then broadcast against **your own** native balance; those legs also carry `estimated_gas_usd`, the estimated USD cost of that broadcast (`null` when no USD gas price was available). The key can be **absent** on a Solana leg, where nothing upstream reports it — **absent is not `false`**; read `signable_payloads[0].type` when you need certainty. Note `price_impact_bps` reads `0` on a speed-route leg: that route reports no impact, and `0` is already this field's "favorable or unreported" value, not a measured zero.
@@ -235,7 +244,7 @@ Shares → USDC. Server reads holdings across every chain × protocol — sol/et
 
 Prices a buy with **no wallet and no ownership proof** — the route for a screen, a watchlist, or "what would this cost?". Unlike every other quote route it **requires your integrator key**: send `X-API-Key: tik_…`. No key is `401 invalid_api_key`; a read-only `trk_` reporting key is `403 insufficient_scope` (it reaches the reporting routes and nothing else).
 
-- **Body = the `/quote/buy` body minus `sol_wallet`, `eth_wallet`, `ownership_proof` and `quote_only`.** All four are rejected as unknown fields (`400 invalid_request`) — there is no wallet to bind, so there is nothing to prove and nothing to execute. `ticker`, `amount_usdc` and `max_slippage_bps` are required; `chain`, `protocol` and `preferred_chain` behave exactly as on `/quote/buy`.
+- **Body = the `/quote/buy` body minus `sol_wallet`, `eth_wallet`, `ownership_proof` and `quote_only`.** All four are rejected as unknown fields (`400 invalid_request`) — there is no wallet to bind, so there is nothing to prove and nothing to execute. `ticker`, `amount_usdc` and `max_slippage_bps` are required; `chain`, `protocol` and `preferred_chain` behave exactly as on `/quote/buy`, and so does [`origin_chain`](#origin-chain), except that under `"speed"` the preview assumes the whole amount sits on it (`sol` when omitted).
 - **Response = the `/quote/buy` shape minus `quote_id`, `expires_at`, every leg's `signable_payloads`, and `warnings_ack_token`.** Everything else is there, including `warnings[]` (always present, `[]` when clean) and each leg's `chain`, `protocol`, `base_asset` and `cost_breakdown_bps` — so read a preview leg's amounts with the same `chain` + `base_asset` care as a real one.
 - **Nothing is stored and nothing is executable.** No `/quote/{quote_id}/status` to poll, nothing to submit, and no `expires_at` to race. **Use this for indicative prices; use `/quote/buy` for anything you intend to sign** — the price you preview is not a price you hold.
 - **10-second cache + a shared ceiling.** Identical requests inside a 10-second window are answered from one upstream fan-out; a refusal is never cached. "Identical" is judged on the request's meaning, not its bytes: `amount_usdc` is matched **exactly**, so a one-cent change is a different request, while `chain` and `protocol` are compared as **sets** — a single value and its one-element array (`"sol"` and `["sol"]`) are the same request. On top of the usual per-IP and per-organisation limits this route carries a **global ceiling shared by every caller**, so a `429` here can be someone else's traffic rather than your own quota — honour `Retry-After` and re-check, don't assume you are throttled for the minute.
@@ -312,7 +321,7 @@ Aggregate + per-leg view. Poll at `poll_after_ms`: `1250` while a [speed-route](
   "poll_after_ms": 1250,                 // while in_progress: the window, or what is left of a cached one; null once terminal (stop polling)
   "legs": [{
     "quote_index": 0, "trade_id": "trd_...", "ticker": "AAPL",
-    "chain": "sol" | "eth" | "robinhood" | "base", "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase", "side": "buy" | "sell",
+    "chain": "sol" | "eth" | "robinhood" | "base" | "arbitrum", "protocol": "ondo" | "xstocks" | "robinhood" | "coinbase" | "reality" | "backpack", "side": "buy" | "sell",
     "tx_hash": "...", "order_hash": null,   // see tx_hash/order_hash split at top of file
     "status": "pending" | "completed" | "failed" | "broadcast_failed",
     "error_code": null,
@@ -423,6 +432,18 @@ The single quote leg (`chain:"base"`, `protocol:"coinbase"`):
 }
 ```
 
+<a id="backpack"></a>
+## Backpack (`protocol:"backpack"`): a third stock protocol on Solana
+
+**Backpack Securities tokenized stocks (Solana)** trade as a third protocol on `sol`, beside `ondo` and `xstocks`. A `backpack` leg is an ordinary `sol` leg: same USDC, same signing, same submit and status flow, same `/portfolio` and `/trades` behaviour as the other Solana cells. What differs:
+
+1. **Solana only.** `backpack` pairs only with `chain:"sol"`. There is no Ethereum cell, so a `backpack` listing never carries an `eth_address`, and `chain:"eth"` with `protocol:"backpack"` has nothing to quote.
+2. **Co-ranked, not opt-in.** An unpinned request (or a `protocol` array that includes it) ranks a listed `backpack` cell against `ondo` and `xstocks` on Solana, and an unpinned sell fills from a held `backpack` position like any other. Pin `protocol:"backpack"` to force it; to exclude it, send the other protocols as an array.
+3. **The venue can be switched off as a whole.** While it is, the `backpack` key is **absent** from `/stocks` and `/stocks/tickers` (not present with nulls) and `/stocks/{ticker}` has no `backpack` entry in `listings[]`. While it is on, a ticker's cell is listed only once its token has real supply ([`data.md`](data.md#get-stockstickers)). An unlisted cell, for either reason, is not quotable for a buy: a buy pinned to it returns `422 no_routes`, an unpinned buy ranks the other protocols, and a ticker that only this venue carries is not served on the read routes at all. **Sells are never gated this way:** a held `backpack` position can always be quoted and sold.
+4. **Bare `token_ticker`.** Backpack tokens carry no suffix, so `/portfolio` and `/trades` report e.g. `"token_ticker": "MU"` with `protocol: "backpack"` and `chain: "sol"` (and `/settlements` the same bare `token.symbol`). A bare `token_ticker` therefore does not mean a single-cell venue: branch on `protocol` and `chain`, never on the symbol's shape.
+5. **No on-chain price cell.** `/stocks/prices` carries no `onchain.backpack`; compare a `backpack` leg against `tradfi` (or the quote's `tradfi_reference`).
+6. **Cross-chain, like `sol/xstocks`.** Under `priority:"speed"`, a `backpack` cell you are not funded for on Solana can be reached from your USDC on another chain as one leg (it carries `origin_chain`, see [Servable cells](#speed)), and a held `backpack` position sells cross-chain with `payout_chain`.
+
 <a id="speed"></a>
 ## `priority: "speed"` — one on-chain swap on Robinhood Chain or Base
 
@@ -473,7 +494,7 @@ The speed route's chain-local scope ([above](#speed)) has one extension: when yo
 
 **Only when you're not funded on the destination.** A cell you ARE funded on always routes the normal way — same-chain sol / gasless / speed as documented above. Only a cell that fails that first check becomes a cross-chain candidate, sized from the first chain in your funding preference order (`sol` → `eth` → `robinhood` → `base`) among the wallets you supplied that actually covers the amount. No pooling across origins, and no origin at all means the cell is dropped exactly as it would be today (undisclosed — the same outcome an unfunded cell already gets).
 
-**Servable cells.** Not every destination is reachable this way — check for `origin_chain` on the leg you got back rather than assuming. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, and `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and `eth/xstocks` are never cross-chain destinations. `eth` enters the `"speed"` candidate set **only** as a cross-chain destination: it never returns on its own gasless route under `"speed"`, and a cross-chain failure drops it rather than falling back to gasless.
+**Servable cells.** Not every destination is reachable this way — check for `origin_chain` on the leg you got back rather than assuming. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, and `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and `eth/xstocks` are never cross-chain destinations. `eth` enters the `"speed"` candidate set **only** as a cross-chain destination: it never returns on its own gasless route under `"speed"`, and a cross-chain failure drops it rather than falling back to gasless.
 
 **New leg fields.**
 
@@ -514,7 +535,7 @@ The speed route's chain-local scope ([above](#speed)) has one extension: when yo
 
 **Status and errors.** `/status` and `/trade/submit` work exactly as documented above — same aggregate/per-leg shape, same `poll_after_ms` cadence. Two new disclosures and five new per-leg codes:
 
-- **`cross_chain_route_unavailable {chain, protocol, reason}`** in `warnings[]` — a cell that can go cross-chain (`eth/ondo`, `sol/xstocks`, `base/coinbase`) could not be served cross-chain and fell back to today's plan for it (dropped, or its existing same-chain outcome). `reason` ∈ `no_routes | over_max | fee_unavailable | disabled | provider_error | wallet_not_delegated` (`wallet_missing` is declared but not observed in practice — treat it as reserved). Distinct from `speed_route_unavailable`, which means your SAME-chain speed leg fell back.
+- **`cross_chain_route_unavailable {chain, protocol, reason}`** in `warnings[]` — a cell that can go cross-chain (`eth/ondo`, `sol/xstocks`, `sol/backpack`, `base/coinbase`) could not be served cross-chain and fell back to today's plan for it (dropped, or its existing same-chain outcome). `reason` ∈ `no_routes | over_max | fee_unavailable | disabled | provider_error | wallet_not_delegated` (`wallet_missing` is declared but not observed in practice — treat it as reserved). Distinct from `speed_route_unavailable`, which means your SAME-chain speed leg fell back.
 - **`cross_chain_price_deviation {chain, protocol, deviation_bps, threshold_bps}`** in `warnings[]` — advisory, never a refusal; the leg is fully executable regardless.
 - **`400 incomplete_submit`** at `/trade/submit` on ANY validation failure on a cross-chain leg's signed payload (a mismatched instruction, a wrong spender, a bad signature) — **nothing is broadcast, no row is created**, unlike a same-chain speed leg's failure mode (which can leave a per-leg `broadcast_failed` row). Re-sign and resubmit the same `quote_id`.
 - **`409 leg_already_submitted`** on a duplicate signature/hash — same idempotency contract as every other leg.
@@ -538,7 +559,7 @@ Send `payout_chain` (`"sol"`, `"eth"` or `"base"`) on `POST /quote/sell` and the
 **How each position you hold is planned:**
 
 - a position already on `payout_chain` sells there as usual (under `priority:"speed"` it keeps the speed filter, so an `eth` position is left out when paying out on `eth`);
-- a `sol/xstocks`, `base/coinbase` or `eth/ondo` position on another chain sells **cross-chain as one leg**, marked by `payout_chain` on that leg, whatever the `priority`. The sale and the payout are one leg, with no separate payout step to submit;
+- a `sol/xstocks`, `sol/backpack`, `base/coinbase` or `eth/ondo` position on another chain sells **cross-chain as one leg**, marked by `payout_chain` on that leg, whatever the `priority`. The sale and the payout are one leg, with no separate payout step to submit;
 - any other position (`sol/ondo`, `eth/xstocks`, `robinhood`, `arbitrum`) is **left out** and named by a `cross_chain_route_unavailable` warning. It is never sold on its own chain instead, because that would pay out somewhere you did not ask for.
 
 With a payout on another chain, `chain: ["eth"]` together with `priority:"speed"` is accepted: the `eth/ondo` position sells cross-chain.

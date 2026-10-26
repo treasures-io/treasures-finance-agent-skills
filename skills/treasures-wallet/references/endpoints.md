@@ -14,13 +14,19 @@ policies:[{chain,scope,owner_quorum_id}], created_at }`. Use once to resolve + c
 `wallet_not_found`.
 
 ### `GET API/wallets/:id/balances` — auth `none`
-→ `{ native:{sol,eth,robinhood,base}, stablecoins:[{chain,asset,amount}],
+→ `{ native:{sol,eth,robinhood,base,arbitrum}, stablecoins:[{chain,asset,amount}],
 positions:[{issuer,asset,chain,token_address,raw_token,shares,usd_per_token,usd_per_share,notional_usd}],
-needs_funding, as_of }`. `chain` ∈ `sol|eth|robinhood|base`, `issuer` ∈ `ondo|xstocks|robinhood|coinbase`.
-`native.robinhood` (4663 Orbit L2) and `native.base` (8453 OP-Stack L2) are native ETH held by the
-same EOA as `native.eth` — raw amounts only, no USD (for gas valued in USD see the B2C portfolio
-reads, D-NativeInPortfolio).
-`needs_funding` is true only when **all four** are zero, so a 4663-only funded wallet is not
+needs_funding, as_of }`. `chain` ∈ `sol|eth|robinhood|base|arbitrum`, `issuer` ∈
+`ondo|xstocks|backpack|robinhood|coinbase|reality`. Only `sol`/`eth` positions with issuer
+`ondo`/`xstocks`/`backpack` are tradeable on this plane (`backpack` on `sol` only); the rest are
+reported for completeness. A `backpack` position carries the bare ticker as its token symbol on the
+`READS` routes (no `on`/`x` suffix), so branch on `issuer`, never on the symbol's shape.
+Both unions, and the `native` keys, are open: each new chain or issuer adds a value, so never fail a
+parse on one you don't recognise.
+`native.robinhood` (4663 Orbit L2), `native.base` (8453 OP-Stack L2) and `native.arbitrum` (42161
+Arbitrum One) are native ETH held by the same EOA as `native.eth` — raw amounts only, no USD (for gas
+valued in USD see the B2C portfolio reads, D-NativeInPortfolio).
+`needs_funding` is true only when **every** `native` entry is zero, so a 4663-only funded wallet is not
 "needs funding" — the flag is coarse by design; per-chain readiness is derivable from `native`.
 
 **Freshness:** positions/stablecoins and the `native` AMOUNTS are served from the reconciler's result
@@ -34,7 +40,9 @@ staleness cannot un-gas a wallet.)
 → `{ app_enabled, signers:[{role,app_enabled}] }`. Is delegated trading enabled.
 
 ### `GET API/wallets/:id/quotes` — auth `key:quote` (or `owner`)
-Query (`.strict`): `chain?` (`solana|ethereum`), `protocol?` (`ondo|xstocks`), `side` (`buy|sell`),
+Query (`.strict`): `chain?` (`solana|ethereum`), `protocol?` (`ondo|xstocks|backpack`; `backpack` is
+Solana-only, so pair it with `solana` or omit `chain`; with `ethereum` it is `400 invalid_request`),
+`side` (`buy|sell`),
 `asset`, **exactly one of** `notional_usdc` (buy) / `shares` (sell), `slippage_bps` (int, ≤ 500).
 Omit `chain`/`protocol` → auto-route (single best cell). **Buy** →
 `{ chain, protocol, side, asset, max_amount_in, min_amount_out, route_type:"dex_aggregator" }` —
