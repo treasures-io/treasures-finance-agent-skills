@@ -2,6 +2,17 @@
 
 Load when reading `/stocks/*`, `/portfolio`, `/trades`, `/settlements` or `/payouts`. None of them takes an `ownership_proof`. All are unauthenticated public reads **except** `GET /stocks/{ticker}` and `GET /settlements`, which require your integrator key (`X-API-Key`), and the `/payouts` routes, which require a general `tik_` key.
 
+## `GET /stocks`
+
+The whole catalog, each item carrying the `/stocks/tickers` listing blocks plus a `tradfi` and an `onchain` price block, in ticker order. Four optional query parameters turn it into a search:
+
+- `q`: case-insensitive substring of the ticker, the name or any venue's `token_ticker` (`apple`, `TSLA`, `AAPLx`), 1 to 100 characters.
+- `sort`: `market_cap`, `volume_1d`, `change_24h`, `price`, `pe` or `ticker`. A stock missing the metric sorts last in both directions.
+- `order`: `asc` or `desc`; defaults to `asc` for `ticker` and `desc` otherwise. Without `sort` it orders by ticker. Ticker order, either way, is the same order the plain read returns.
+- `page`: 1-based, 25 rows a page, written as a plain integer (`2`, not `2.0` or `0x2`). Only `page` adds `page`, `next_page` (null on the last page) and `total` (rows matching `q`); without it every matching row comes back.
+
+Without any of them the response is unchanged: `{ stocks }`, the whole catalog.
+
 ## `GET /stocks/tickers`
 
 Catalog: every tradable ticker with chain availability, per-protocol token addresses, and share multipliers. Cached 5 min server-side; cheap to poll. Use it to populate pickers, validate symbols, decide `chain`/`protocol` options, and recover token addresses for `approve()`.

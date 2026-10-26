@@ -80,6 +80,48 @@ paths:
       description: |
         Catalog with tradfi snapshot and onchain aggregate.
         Cached server-side for 30 s.
+
+        Without query parameters this is the whole catalog in ticker order. `q`, `sort` and
+        `order` search and reorder it; `page` splits the result into pages of 25 and adds
+        `page`, `next_page` and `total` to the response. Search, sort and paging run over the
+        same cached snapshot, so they add no provider calls.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: >-
+            Case-insensitive substring match on `ticker`, `name` or a venue's `token_ticker`
+            (e.g. `AAPLx`), 1 to 100 characters after trimming.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+            example: apple
+        - name: sort
+          in: query
+          required: false
+          description: Sort key. Omitted with `order` also omitted, the catalog's ticker order stands.
+          schema:
+            $ref: "#/components/schemas/StockSortKey"
+        - name: order
+          in: query
+          required: false
+          description: >-
+            `asc` or `desc`. Defaults to `asc` for `ticker` and `desc` for every metric. Sent
+            without `sort`, it orders by `ticker`. Ticker order is always the catalog's own
+            (`desc` reverses it), so it matches the unparameterised read row for row.
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: page
+          in: query
+          required: false
+          description: >-
+            1-based page of 25 rows. Omitted, the response carries every matching row and no
+            paging fields.
+          schema:
+            type: integer
+            minimum: 1
       responses:
         "200":
           description: OK
@@ -2616,6 +2658,23 @@ components:
         stocks:
           type: array
           items: { $ref: "#/components/schemas/StockListItem" }
+        page:
+          type: integer
+          description: The page served. Present only when the request sent `page`.
+        next_page:
+          type: [integer, "null"]
+          description: The next page, or null on the last. Present only when the request sent `page`.
+        total:
+          type: integer
+          description: >-
+            Rows matching `q` across all pages. Present only when the request sent `page`.
+
+    StockSortKey:
+      type: string
+      description: >-
+        List sort key. All but `ticker` read the `tradfi` block; a stock missing the metric sorts
+        last in both directions, and ties break by ticker.
+      enum: [market_cap, volume_1d, change_24h, price, pe, ticker]
 
     StocksTickersResponse:
       type: object

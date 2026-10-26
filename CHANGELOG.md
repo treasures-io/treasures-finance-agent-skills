@@ -16,6 +16,25 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## 2026-10-26: b2b `1.17.0` (content update, version unchanged)
+
+A documentation-only refresh of the `1.17.0` skill: the parameters below are already live on the
+API, and the skill text now says so. No `metadata.version` bump, so no gate signal fires: read this
+entry.
+
+### treasures-b2b-api: search, sort and paging on `GET /stocks`
+
+- Four optional query parameters: `q` (case-insensitive substring of the ticker, the name or any
+  venue's `token_ticker`, 1 to 100 characters), `sort` (`market_cap`, `volume_1d`, `change_24h`,
+  `price`, `pe` or `ticker`; a stock missing the metric sorts last), `order` (`asc` or `desc`) and
+  `page` (1-based, 25 rows a page). New `StockSortKey` schema.
+- Only `page` changes the response shape: it adds `page`, `next_page` (`null` on the last page) and
+  `total`. Without any of the four, the response is the whole catalog, as before.
+- These four are the only query parameters `/stocks` takes; any other is still
+  `400 invalid_request`.
+
+---
+
 ## 2026-10-06: b2b `1.17.0`, wallet `1.4.0`
 
 Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills, and
