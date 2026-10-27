@@ -12,15 +12,21 @@ info:
     decimals are JSON **strings** to avoid float drift. Integer fields
     (`expires_at`, `*_bps`, `quote_index`, timestamps in seconds) are JSON numbers.
 
-    **Auth.** Only `POST /quote/buy`, `POST /quote/sell` and `POST /bridge/quote`
-    require `ownership_proof` (wallet-key signature over a canonical challenge,
-    see `OwnershipProof`). `POST /trade/submit` is gated by the per-leg signed
+    **Auth.** Only `POST /quote/buy`, `POST /quote/sell`, `POST /bridge/quote` and
+    the four `/signals-orders` routes (`POST /signals-orders/exit/plan`,
+    `POST /signals-orders/exit`, `POST /signals-orders/rebalance/plan` and
+    `POST /signals-orders/rebalance`) require `ownership_proof` (wallet-key
+    signature over a canonical challenge, see `OwnershipProof`). `POST /trade/submit` is gated by the per-leg signed
     payload itself. These routes **require** an integrator API key in `X-API-Key`
     (see `IntegratorApiKey`): `GET /settlements`, the `/payouts` routes (your
     integrator fees and their payouts), `POST /quote/preview` (which binds
-    no wallet, so the key is what identifies the caller) and `GET /stocks/{ticker}`
+    no wallet, so the key is what identifies the caller), `GET /stocks/{ticker}`
     (whose profile, analyst, earnings and news blocks are served to contracted
-    integrators only). Every other route may be called anonymously.
+    integrators only), the `/signals` routes (strategy target-weight books,
+    served to contracted integrators), the `/signals-orders` routes (the orders
+    that exit a book from your wallet, or rebalance it to the book) and
+    `POST /trade/submit/batch` (many signed submits in one request). Every other
+    route may be called anonymously.
 
     **Integrator API keys are optional on every route but those, and never
     ignored.** If you send `X-API-Key` on any route, a key beginning `tik_`/`trk_`
@@ -70,6 +76,8 @@ tags:
     description: Your organisation's own settled trade ledger, for reporting.
   - name: Payouts
     description: What you are owed in integrator fees, and the payouts that paid them.
+  - name: Signals
+    description: Current and historical target-weight books of the copy-trading strategies published to integrators.
 
 paths:
   /stocks:
@@ -294,8 +302,10 @@ paths:
       summary: Quote USDC → stock token (one leg per chain the ticker lists, better first)
       description: |
         Requires `ownership_proof` for each wallet provided. Returns one best leg per
-        chain the ticker lists (up to five today: sol, eth, robinhood, base, arbitrum): the
-        signable quote legs (one per chain). Cache the returned `quote_id`;
+        chain the ticker lists (up to six: sol, eth, robinhood, base, arbitrum, bnb): the
+        signable quote legs (one per chain). On `bnb` (BNB Smart Chain, 56) three
+        protocols compete for that one leg, so a pinned bnb request should carry
+        `protocol` as well as `chain`. Cache the returned `quote_id`;
         every signed leg is submitted together at `/trade/submit`.
         Set `quote_only: true` for a non-executable price preview (the wallet need
         not be funded; `quote_id`, `expires_at`, and `signable_payloads` are omitted).
@@ -896,15 +906,117 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/ScreeningUnavailable" }
 
+  /trade/submit/batch:
+    post:
+      operationId: submitTradeBatch
+      tags: [Trade]
+      summary: Submit up to 25 signed quotes in one request
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Runs each submission exactly as `POST /trade/submit` would and answers every one, in
+        request order. `http_status` is the status that submit would have answered and `response`
+        its body; headers (`Retry-After`, the rate-limit counts) belong to the batch response
+        only. One submission's outcome never affects another's, so the batch's `200` says nothing
+        about any item: read each `http_status`.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+
+        Refused as a whole, with nothing read or broadcast:
+
+        - The same `quote_id` in more than one submission: `400 invalid_request`. A buy's legs
+          are alternatives, so splitting one quote across submissions would buy twice. Send each
+          quote once, with all of the legs you sign for it in one submission.
+        - No submissions, more than 25, an unknown field, or any submission `POST /trade/submit`
+          would refuse as malformed: `400 invalid_request`.
+        - A body over 100 KB (100,000 bytes): `413 { error: "Payload too large" }`, answered before
+          the request reaches this operation. The limit of 25 assumes about one signed Solana leg
+          per submission; submissions that sign several legs (a sell quoted with several legs)
+          leave room for fewer, so size such batches smaller.
+        - The rate limit: `429`. Every submission counts once against a per-organisation budget
+          (600 a minute) and a per-IP budget (300 a minute), on top of the per-request limits of
+          every trade route. The batch is charged before any submission runs, and a batch refused
+          with `429` still counts in full against the per-organisation budget, and against the
+          per-IP budget too when that is the one that refused. A batch refused with `400` costs
+          nothing against these two budgets. Size each batch to the budget you have left, and
+          after a `429` wait for `Retry-After`. On a `200` the `X-RateLimit-*` headers describe
+          the last of the two budgets charged (the per-IP one in production), counted in
+          submissions.
+
+        Per submission, beside every answer `POST /trade/submit` can give:
+
+        - `422 batch_leg_unsupported` with that `quote_index`: a batch carries same-chain Solana
+          legs only (`chain: sol`, quoted without `origin_chain` or `payout_chain`). Submit any
+          other leg through `POST /trade/submit`. Nothing was sent. This check runs before the
+          checks `POST /trade/submit` makes, so such a submission answers `422` even when it is
+          also stale, bound to another organisation's fee or refused by screening; submitting it
+          alone gives those answers.
+        - `503 batch_deadline_exceeded`: the batch ran long enough that this submission was not
+          started, so nothing was sent and the batch could answer in time. Submit it again, alone
+          or in a new batch, while its quote is live.
+        - `500 internal_error`: the submission failed unexpectedly. It may have been sent before
+          it failed, so read `GET /quote/{quote_id}/status` before re-quoting. The single route's
+          500 body reads `Internal server error`; inside a batch it is `internal_error`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TradeSubmitBatchRequest"
+      responses:
+        "200":
+          description: One result per submission, in request order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradeSubmitBatchResponse"
+              example:
+                results:
+                  - quote_id: 7Kp3mQxT9vLw2nRb5cYd8FhJ
+                    http_status: 200
+                    response:
+                      results:
+                        - quote_index: 0
+                          trade_id: trd_9vLw2nRb5cYd8FhJ7Kp3mQxT
+                          status: completed
+                          tx_hash: 5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW
+                          order_hash: null
+                          user_op_hash: null
+                          error_code: null
+                      failed_legs: []
+                  - quote_id: 3nRb5cYd8FhJ7Kp3mQxT9vLw
+                    http_status: 410
+                    response: { error: quote_stale }
+                  - quote_id: 9vLw2nRb5cYd8FhJ7Kp3mQxT
+                    http_status: 422
+                    response: { error: batch_leg_unsupported, quote_index: 0 }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
   /bridge/quote:
     post:
       operationId: quoteBridge
       tags: [Bridge]
       summary: Quote a cross-chain USDC bridge
       description: |
-        Returns a Treasures-issued `bridge_quote_id` plus a signable payload the
-        agent must broadcast themselves. Both `sol_wallet` and `eth_wallet` (and
-        their matching `ownership_proof` signatures) are mandatory.
+        Returns a Treasures-issued `bridge_quote_id` plus a signable payload. By default
+        (`delivery: self_broadcast`) you sign it and broadcast it yourself. With
+        `delivery: submit` you sign it and hand it to `POST /bridge/{bridge_quote_id}/submit`
+        instead; it can be executed no other way. From an EVM origin that payload is typed data
+        (`evm_permit_typed_data`): no transaction, no nonce and no native gas on the origin.
+        Any two distinct chains in `BridgeChain` (with `delivery: submit`, the origin must be
+        `sol`, `eth`, `base` or `arbitrum` for now). `eth_wallet` and its proof are always
+        required; `sol_wallet` and its proof only when either side is `sol`.
       requestBody:
         required: true
         content:
@@ -982,6 +1094,106 @@ paths:
               example: { error: bridge_quote_not_found }
         "429": { $ref: "#/components/responses/RateLimited" }
         "502": { $ref: "#/components/responses/ProviderUnavailable" }
+
+  /bridge/{bridge_quote_id}/submit:
+    post:
+      operationId: submitBridge
+      tags: [Bridge]
+      summary: Submit a signed bridge for execution
+      description: |
+        For a `delivery: submit` quote only (a `self_broadcast` quote answers
+        `400 quote_not_submittable`). Treasures checks the signatures recover to your wallet
+        over exactly the payload `/bridge/quote` issued, then runs it: an EVM origin's typed data
+        is executed by the upstream bridge (its gas taken from the amount); a Solana origin's
+        signed transaction is broadcast by Treasures. One submission per quote: the same body may
+        be resubmitted (idempotent) for up to an hour. After a `502` it may have gone through, so
+        resubmit the SAME body, never a new one; a resubmission that still cannot tell answers
+        `502` again, so poll status rather than re-quote. Track the fill with
+        `GET /bridge/{bridge_quote_id}/status`.
+      parameters:
+        - name: bridge_quote_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^brq_[A-Za-z0-9_-]{21}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BridgeSubmitRequest"
+      responses:
+        "200":
+          description: Broadcast.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeSubmitResponse"
+        "400":
+          description: |
+            Malformed body; signatures or a signed transaction that do not match the quote
+            (`signed_tx_mismatch`, `field` names the part); or a `self_broadcast` quote
+            (`quote_not_submittable`).
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - type: object
+                    required: [error, field]
+                    properties:
+                      error: { type: string, enum: [signed_tx_mismatch] }
+                      field: { type: string }
+                  - $ref: "#/components/schemas/SimpleError"
+              examples:
+                signed_tx_mismatch: { value: { error: signed_tx_mismatch, field: "signatures[0]" } }
+                quote_not_submittable: { value: { error: quote_not_submittable } }
+        "403": { $ref: "#/components/responses/AddressBlocked" }
+        "404":
+          description: Unknown `bridge_quote_id`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: bridge_quote_not_found }
+        "409":
+          description: |
+            `bridge_already_submitted`: this quote already holds a submission, or its retry
+            window has passed. Poll status; never sign a second deposit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: bridge_already_submitted }
+        "410":
+          description: The quote expired (or its Solana blockhash did), or the bridge refused an EVM permit that can no longer run. Re-quote.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: bridge_quote_expired }
+        "422":
+          description: Refused before anything moved (for example, too little balance). Fix it, then re-quote. Solana origins only; a refused EVM permit answers 410.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimpleError"
+              example: { error: broadcast_rejected }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: The outcome is unknown. Resubmit the same body.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, source_tx_hash]
+                properties:
+                  error: { type: string, enum: [broadcast_unavailable] }
+                  source_tx_hash:
+                    type: [string, "null"]
+                    description: The Solana signature; null from an EVM origin.
+        "503": { $ref: "#/components/responses/ScreeningUnavailable" }
 
   /portfolio:
     get:
@@ -1141,10 +1353,10 @@ paths:
             USDC landed, filter `token_out_address` on that chain's USDC.
           schema:
             type: array
-            maxItems: 5
+            maxItems: 6
             items:
               type: string
-              enum: [sol, eth, robinhood, base, arbitrum]
+              enum: [sol, eth, robinhood, base, arbitrum, bnb]
           example: [sol, eth]
         - name: protocol
           in: query
@@ -1153,10 +1365,10 @@ paths:
           description: Protocols to include; omit for all. Values are lowercase, matched exactly.
           schema:
             type: array
-            maxItems: 6
+            maxItems: 7
             items:
               type: string
-              enum: [ondo, xstocks, robinhood, coinbase, reality, backpack]
+              enum: [ondo, xstocks, robinhood, coinbase, reality, backpack, bstocks]
           example: [ondo, xstocks]
         - name: ticker
           in: query
@@ -1473,6 +1685,565 @@ paths:
               example: { error: "payout_not_found" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
+  /signals/strategies:
+    get:
+      operationId: listSignalStrategies
+      tags: [Signals]
+      summary: The strategies whose target-weight books you may read
+      security:
+        - IntegratorApiKey: []
+      description: |
+        One page, newest first; `truncated` says whether the page cap of 100 cut it short (today
+        the catalog is a handful of rows). Only strategies published to integrators appear, so a
+        strategy visible in the Treasures app may be absent here. The catalog lists `active` and
+        `paused` strategies only; a `halted` strategy leaves the catalog but stays readable by id
+        or slug on the detail and history routes, with its last book.
+
+        `replication` is the honesty block for each book: a book is the source portfolio cut down
+        to the names Treasures can trade on chain and renormalised, so `names_replicated` of
+        `names_total` are in it and `skipped_source_weight` of the source's weight is not.
+
+        `strategy_id` is the stable key. `slug` is a convenience that may be renamed; the detail
+        and history routes accept either.
+
+        Each row carries its latest book's `book_hash`, `book_as_of` and `signal_id` (all `null`
+        when the strategy has no book yet), the same values `GET /signals/strategies/{id}` serves,
+        so one catalog read tells you which books changed since you last looked.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalStrategiesResponse" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "429": { $ref: "#/components/responses/SignalReadsRateLimited" }
+
+  /signals/strategies/{id}:
+    get:
+      operationId: getSignalStrategy
+      tags: [Signals]
+      summary: One strategy and its current target-weight book
+      security:
+        - IntegratorApiKey: []
+      description: |
+        `book` is the newest book the source produced that Treasures has finished acting on, or
+        `null` when there is none yet (or the newest one cannot be read; an older book is never
+        substituted). `as_of` is when Treasures ingested the book, not the date of the underlying
+        filing or disclosure.
+
+        `book_hash` identifies the book's contents (the set of `ticker: weight` pairs). Sources
+        that restate an unchanged portfolio daily produce a new `signal_id` with the same
+        `book_hash`, so compare hashes to know whether the weights moved.
+
+        Weights are decimal strings that sum to at most one; `cash_weight` is the remainder.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      parameters:
+        - $ref: "#/components/parameters/SignalStrategyIdPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalStrategyDetail" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "404":
+          description: >-
+            No such strategy for you. A strategy that exists but is not published to integrators
+            answers the same, so the response never reveals whether an id exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              example: { error: "strategy_not_found" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /signals/strategies/{id}/history:
+    get:
+      operationId: listSignalStrategyHistory
+      tags: [Signals]
+      summary: The strategy's past books, newest first
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Every book the source produced that Treasures finished acting on, as full weight vectors,
+        newest first. Treasures' own weekly restatements of an unchanged book are not rows here;
+        a source that re-publishes an unchanged portfolio daily is, so consecutive rows often share
+        a `book_hash`.
+
+        Pass `next_cursor` back as `cursor` to page; `has_more` tells you whether another page
+        exists. `data` may be shorter than `limit` while `has_more` is `true`.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      parameters:
+        - $ref: "#/components/parameters/SignalStrategyIdPath"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque; from a previous page's `next_cursor`.
+          schema:
+            type: string
+            maxLength: 256
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalBookHistoryResponse" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Missing, malformed or unknown `X-API-Key`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "403":
+          description: "`insufficient_scope`, `key_revoked` or `integrator_suspended`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "404":
+          description: No such strategy for you (see the detail route).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              example: { error: "strategy_not_found" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /signals-orders/exit/plan:
+    post:
+      operationId: planSignalOrdersExit
+      tags: [Signals]
+      summary: The sells that exit a strategy book from your wallet, with no quotes
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Returns one full-share sell per name your Solana wallet holds in the strategy's current
+        book (plus any `tickers` you add). Nothing is quoted and nothing expires, so this is the
+        default flow: show the orders, then call `POST /quote/sell` per order when the signer is
+        ready, and submit each quote through `POST /trade/submit` unchanged. Human and
+        hardware-wallet flows should use this route; `POST /signals-orders/exit` is for
+        programmatic signers.
+
+        Solana only for now: a body carrying `eth_wallet` is refused with `400 invalid_request`.
+        `strategy_id` accepts the id or the slug; the response always carries the canonical id.
+        `as_of` is when Treasures ingested the book (unix seconds), not the filing date.
+
+        `nav_usdc` counts the priced names you hold in scope only; an unpriced holding is still
+        an order, with `notional_usdc: null`, ranked after the priced ones. Shares are floored to
+        18 decimal places, never rounded up. A holding worth under $0.01 reads as not held. A
+        holding that could not be read is skipped as `holdings_unknown`, never assumed absent,
+        with one exception: a token account found but not decodable into a balance reads as zero,
+        so that name is `not_held`. At most 25 orders are returned and their upstream quote calls
+        are capped at 30 (see `POST /signals-orders/exit`); the overflow (the smallest by
+        notional, unpriced first) is skipped as `leg_cap`, so `POST /signals-orders/exit` answers
+        the same split. With `protocol` sent, only the pinned venues are read and sold: a name
+        also held on another venue gets no `skipped` entry, so repeat the call per venue.
+
+        **Quoting each order.** Send one `POST /quote/sell` per order, with the same wallet and a
+        fresh proof:
+        `{ "ticker": <ticker>, "amount_shares": <shares>, "chain": "sol", "protocol": <the protocol you sent here, if any>, "sol_wallet": <sol_wallet>, "ownership_proof": <proof>, "max_slippage_bps": <bps> }`.
+        To submit several quotes in one request, send them together through
+        `POST /trade/submit/batch`.
+
+        **One wallet per strategy.** Your holdings are not tracked per strategy: every name of the
+        book you hold in this wallet counts, whichever strategy (or none) you bought it for. Two
+        strategies sharing a name in one wallet will sell or resize each other's position, so give
+        each strategy its own wallet.
+
+        `expected_book_hash`, when sent, must equal the served book's `book_hash`, or the call is
+        refused with `409 book_changed` before the wallet is read or anything is quoted: re-read the
+        book and decide again.
+
+        `max_slippage_bps` is optional here (nothing is quoted) and range-checked when sent.
+        Requires your general (`tik_`) key; a reporting key is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignalOrdersRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalOrderPlan" }
+        "400":
+          description: >-
+            Invalid request body (including `eth_wallet`, or a `protocol` with no Solana
+            protocol), or slippage out of range.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+              example:
+                error: invalid_request
+                message: eth_wallet is not supported on this route yet
+        "401": { $ref: "#/components/responses/SignalOrdersUnauthorized" }
+        "403": { $ref: "#/components/responses/SignalOrdersForbidden" }
+        "404": { $ref: "#/components/responses/SignalOrdersStrategyNotFound" }
+        "409": { $ref: "#/components/responses/SignalOrdersBookChanged" }
+        "422":
+          description: "`book_unavailable`: the strategy has no book yet."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              examples:
+                book_unavailable: { value: { error: book_unavailable } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/SignalOrdersUnavailable" }
+
+  /signals-orders/exit:
+    post:
+      operationId: quoteSignalOrdersExit
+      tags: [Signals]
+      summary: The sells that exit a strategy book, each with its signable quote
+      security:
+        - IntegratorApiKey: []
+      description: |
+        The same orders as `POST /signals-orders/exit/plan`, each carrying `quote`: exactly the
+        `POST /quote/sell` answer for that order, signable payloads included. Sign and submit each
+        quote through `POST /trade/submit` unchanged.
+
+        **For programmatic signers only.** A Solana leg is signable for about 45 s after this
+        response. Each quote's own `expires_at` binds; the top-level `expires_at` is the earliest
+        of them and `signing_window_sec` is the seconds left until it. Human and hardware-wallet
+        flows should call `POST /signals-orders/exit/plan`, then `POST /quote/sell` per order when
+        ready.
+
+        A partial result is normal: an order whose quote is refused is moved to `skipped` with
+        the error code `POST /quote/sell` would have answered (for example `no_routes`, which on
+        a sub-minimum leg carries no minimum, or `holdings_insufficient`), and the response is
+        still `200`. An order whose quote expired before the response was sent is skipped as
+        `quote_stale`. `max_slippage_bps` is required here and applies to every leg.
+        To submit several quotes in one request, send them together through
+        `POST /trade/submit/batch`.
+
+        **One call at a time per wallet and strategy.** While a quote from an earlier `/exit` for
+        the same wallet and strategy is neither final (`GET /quote/{quote_id}/status`) nor
+        five minutes past its `expires_at`, a new call is refused with `409 orders_in_flight` naming those `quote_ids` (an
+        empty list while the earlier call is still quoting), with `Retry-After` in seconds. A
+        submitted quote counts as final once its status has been read as final, so poll every
+        quote you submit. The plan route is never refused this way.
+
+        Limits on this route count upstream quote calls, not requests: an order held on one
+        Solana venue costs 1 point, on two venues 3, on three 6 (each pass re-quotes the venues
+        not yet filled). Points come from a per-integrator bucket (30 a minute) and from a bucket
+        shared by every caller (90 a minute), charged only after the wallet is admitted and only
+        when there is something to quote. The plan never costs more than 30 points: orders past
+        that are skipped as `leg_cap`, so an exit of more than ten names held on two venues each
+        exits the rest on the next call. A plan costing more than the points left is refused
+        whole with `429` before any order is quoted. A `429` from the shared bucket can be another
+        integrator's traffic and does not spend your own points. The `X-RateLimit-*` headers
+        describe the shared bucket.
+        **One wallet per strategy.** Your holdings are not tracked per strategy: every name of the
+        book you hold in this wallet counts, whichever strategy (or none) you bought it for. Two
+        strategies sharing a name in one wallet will sell or resize each other's position, so give
+        each strategy its own wallet.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignalOrdersRequest"
+                - required: [max_slippage_bps]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalOrdersResponse" }
+        "400":
+          description: >-
+            Invalid request body (including `eth_wallet`, a missing `max_slippage_bps` or a
+            `protocol` with no Solana protocol), or slippage out of range.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401": { $ref: "#/components/responses/SignalOrdersUnauthorized" }
+        "403": { $ref: "#/components/responses/SignalOrdersForbidden" }
+        "404": { $ref: "#/components/responses/SignalOrdersStrategyNotFound" }
+        "409": { $ref: "#/components/responses/SignalOrdersConflict" }
+        "422":
+          description: "`book_unavailable`: the strategy has no book yet."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+              examples:
+                book_unavailable: { value: { error: book_unavailable } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/SignalOrdersUnavailable" }
+
+  /signals-orders/rebalance/plan:
+    post:
+      operationId: planSignalOrdersRebalance
+      tags: [Signals]
+      summary: The sells and buys that bring your strategy positions to its book, with no quotes
+      security:
+        - IntegratorApiKey: []
+      description: |
+        Returns the orders that move your Solana wallet's positions in the strategy's names to the
+        strategy's current book. Nothing is quoted and nothing expires, so this is the default
+        flow: show the orders, then call `POST /quote/sell` (send `shares` as `amount_shares`) or
+        `POST /quote/buy` (send `notional_usdc` as `amount_usdc`) per order when the signer is
+        ready, and submit each quote through `POST /trade/submit` unchanged.
+
+        **Quoting each order.** With the same wallet and a fresh proof, a sell is
+        `POST /quote/sell` with
+        `{ "ticker": <ticker>, "amount_shares": <shares>, "chain": "sol", "sol_wallet": <sol_wallet>, "ownership_proof": <proof>, "max_slippage_bps": <bps> }`
+        and a buy is `POST /quote/buy` with
+        `{ "ticker": <ticker>, "amount_usdc": <notional_usdc>, "chain": "sol", "sol_wallet": <sol_wallet>, "ownership_proof": <proof>, "max_slippage_bps": <bps> }`.
+        Send no `protocol`: the plan reads every Solana venue.
+        To submit several quotes in one request, send them together through
+        `POST /trade/submit/batch`.
+
+        **Without `amount_usdc` the book's cash weight is sold on every call.** nav is then only
+        what you hold in scope, and the targets sum to the book's deployed weight of it, so a book
+        that is 10% cash sells about 10% of your held value each time it is called without
+        `amount_usdc`. Carry `funding.next_amount_usdc` into the next call to keep that cash in nav.
+
+        **Buy-in.** To buy into a strategy from cash, call with `amount_usdc` on a wallet that
+        holds none of its names: every order is a buy, sized by its book weight of `amount_usdc`.
+        One call orders at most 25 names and 30 upstream quote calls (a buy costs one per Solana
+        venue it can buy on), so a book of 20 names on two venues each takes more than one round:
+        submit the buys, wait for them to settle, and call again with `funding.next_amount_usdc`.
+
+        **Scoped nav.** The plan sizes every name against `nav_usdc`: the value of what you hold in
+        the book's names (plus any `tickers` you add), plus `amount_usdc`. Each name's target is its
+        book weight times that nav; the book's unweighted remainder stays as USDC and is never
+        ordered. A `tickers` name outside the book has weight zero and is sold in full. Holdings
+        outside the scope and the rest of your USDC are never touched. Every sol venue counts, so
+        `protocol` is not accepted here.
+
+        **Funding.** Buys spend only `amount_usdc`, never the rest of the wallet's USDC, and are
+        never larger than it: when the buys need more, each is scaled down pro rata and rounded
+        down (`funding.buys_scaled`). Scaling is pro rata and a scaled buy under $1 is skipped, so
+        a small `amount_usdc` spread over many buys (for example under $1 per buy when they are
+        equal) can deploy nothing that round; the whole shortfall stays in
+        `funding.buys_deferred_usdc`. A buy that cannot be funded is skipped as
+        `awaiting_sell_proceeds` when the plan also sells, or `insufficient_balance` when it does
+        not. A rebalance that only reshuffles what you hold is therefore two rounds:
+
+        1. Call with `amount_usdc` omitted. Submit the sells.
+        2. Once they settle, call again with `amount_usdc` set to the smaller of
+           `funding.next_amount_usdc` and `usdc_available` (proceeds land net of fees and
+           slippage). Omit `amount_usdc` when that is zero: `"0"` is refused with `400`. Submit the
+           buys.
+
+        Use `funding.next_amount_usdc`, not `funding.buys_deferred_usdc`: it is the strategy's cash
+        after this round (`amount_usdc` plus the sells, less the buys), so it keeps the book's
+        unweighted remainder and the weight of any `not_tradable` name in nav. Calling round 2
+        without `amount_usdc`, or with only the deferred buys, shrinks nav, and the plan sells
+        again.
+
+        **Wait for every order to finish before calling again.** Each order from the previous
+        round must have reached a final status (`GET /quote/{quote_id}/status`) before any new call.
+        The plan reads your holdings as they stand and this route never refuses an early or retried
+        call, so it returns the same sells again and both sets can execute.
+        (`POST /signals-orders/rebalance` refuses such a call with `409 orders_in_flight`.)
+        **One wallet per strategy.** Your holdings are not tracked per strategy: every name of the
+        book you hold in this wallet counts, whichever strategy (or none) you bought it for. Two
+        strategies sharing a name in one wallet will sell or resize each other's position, so give
+        each strategy its own wallet.
+
+        `expected_book_hash`, when sent, must equal the served book's `book_hash`, or the call is
+        refused with `409 book_changed` before the wallet is read or anything is quoted.
+
+        Sells are floored to 18 decimal places and buys to 6, never rounded up. A gap under $1 is
+        skipped as `below_min_notional`. A book name Treasures cannot buy on Solana is skipped as
+        `not_tradable` and its weight stays in USDC. At most 25 orders are returned and their
+        upstream quote calls are capped at 30 (see `POST /signals-orders/rebalance`): sells are
+        admitted first, then buys, each side largest first; the first order that does not fit and
+        every one after it is skipped as `leg_cap`.
+
+        Unlike `/exit`, which skips a name it cannot read, a rebalance refuses the whole request
+        when any name in scope cannot be read (`holdings_unknown`) or a held one cannot be priced
+        (`price_unavailable`), because one mis-sized name would mis-size every other order. The
+        refusal lists the `tickers` to retry or remove.
+
+        `max_slippage_bps` is optional here (nothing is quoted) and range-checked when sent.
+        Requires your general (`tik_`) key; a reporting key is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignalRebalanceRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalRebalancePlan" }
+        "400":
+          description: >-
+            Invalid request body (including `eth_wallet`, `protocol` or `amount_usdc: "0"`), or
+            slippage out of range.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401": { $ref: "#/components/responses/SignalOrdersUnauthorized" }
+        "403": { $ref: "#/components/responses/SignalOrdersForbidden" }
+        "404": { $ref: "#/components/responses/SignalOrdersStrategyNotFound" }
+        "409": { $ref: "#/components/responses/SignalOrdersBookChanged" }
+        "422":
+          description: >-
+            `book_unavailable`: the strategy has no book yet. `holdings_unknown` or
+            `price_unavailable` with `tickers`: those names could not be read or priced, so no
+            plan is offered. A read or price failure is usually transient and can be retried, but
+            a book name that is no longer tradable (an inactive listing) refuses every rebalance on
+            this strategy until its next book, so do not retry blindly; `POST /signals-orders/exit`
+            skips that name and serves the rest. `insufficient_balance`: `amount_usdc` is more than
+            the wallet's Solana USDC. `strategy_halted`: the strategy is halted, so no rebalance
+            is offered and nothing is read; `POST /signals-orders/exit/plan` still serves it.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/SignalOrderRefusal"
+                  - $ref: "#/components/schemas/SimpleError"
+              examples:
+                book_unavailable: { value: { error: book_unavailable } }
+                price_unavailable: { value: { error: price_unavailable, tickers: [AAPL] } }
+                insufficient_balance: { value: { error: insufficient_balance } }
+                strategy_halted: { value: { error: strategy_halted } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/SignalOrdersUnavailable" }
+
+  /signals-orders/rebalance:
+    post:
+      operationId: quoteSignalOrdersRebalance
+      tags: [Signals]
+      summary: The sells and buys that bring your strategy positions to its book, each with its signable quote
+      security:
+        - IntegratorApiKey: []
+      description: |
+        The same orders as `POST /signals-orders/rebalance/plan`, each carrying `quote`: exactly the
+        `POST /quote/sell` or `POST /quote/buy` answer for that order, signable payloads included.
+        Sign and submit each quote through `POST /trade/submit` unchanged. The two-round funding
+        flow is the plan route's: in round 1, submit the sells; once they settle, call again with
+        `amount_usdc` set to the smaller of `funding.next_amount_usdc` and `usdc_available`
+        (omitted when that is zero) for the buys.
+
+        Without `amount_usdc` the book's cash weight is sold on every call, and a buy-in from cash
+        is `amount_usdc` on a wallet holding none of the names; see
+        `POST /signals-orders/rebalance/plan`.
+        To submit several quotes in one request, send them together through
+        `POST /trade/submit/batch`.
+
+        **One call at a time per wallet and strategy.** While a quote from an earlier `/rebalance`
+        for the same wallet and strategy is neither final (`GET /quote/{quote_id}/status`) nor
+        five minutes past its `expires_at`, a new call is refused with `409 orders_in_flight` naming those `quote_ids` (an
+        empty list while the earlier call is still quoting), with `Retry-After` in seconds, so a
+        retry never mints the same sells twice. A submitted quote counts as final once its status
+        has been read as final, so poll every quote you submit. The plan route is never refused this way: wait for every order
+        there yourself.
+        **One wallet per strategy.** Your holdings are not tracked per strategy: every name of the
+        book you hold in this wallet counts, whichever strategy (or none) you bought it for. Two
+        strategies sharing a name in one wallet will sell or resize each other's position, so give
+        each strategy its own wallet.
+
+        **For programmatic signers only.** A Solana leg is signable for about 45 s after this
+        response. Each quote's own `expires_at` binds; the top-level `expires_at` is the earliest
+        of them and `signing_window_sec` is the seconds left until it. Human and hardware-wallet
+        flows should call `POST /signals-orders/rebalance/plan`, then quote each order when ready.
+
+        A partial result is normal: an order whose quote is refused is moved to `skipped` with the
+        error code its quote route would have answered (for example `no_routes`, also what a buy
+        the wallet cannot fund at quote time answers), and the response is still `200`. A buy
+        skipped here is counted in `funding.buys_deferred_usdc` and spends nothing from
+        `funding.next_amount_usdc`; a sell skipped here adds nothing to it, so the next call never
+        spends USDC that no sell freed. When no sell is quoted, a buy
+        the plan held as `awaiting_sell_proceeds` is skipped as `insufficient_balance` instead,
+        since no proceeds are coming. An order whose quote expired
+        before the response was sent is skipped as `quote_stale`. `max_slippage_bps` is required
+        here and applies to every leg.
+
+        Limits count upstream quote calls, from the same buckets as `POST /signals-orders/exit`: a
+        sell held on one Solana venue costs 1 point, on two 3, on three 6; a buy costs at most 1
+        point per Solana venue it can buy on. The plan never costs more than 30 points (orders past
+        that are skipped as `leg_cap`), so it always fits an empty per-integrator bucket; a plan
+        costing more than the points left this minute is refused whole with `429` before any order
+        is quoted. A `429` from the shared bucket does not spend your own points.
+
+        Requires your general (`tik_`) key; a reporting key is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SignalRebalanceRequest"
+                - required: [max_slippage_bps]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalRebalanceResponse" }
+        "400":
+          description: >-
+            Invalid request body (including `eth_wallet`, `protocol`, `amount_usdc: "0"` or a
+            missing `max_slippage_bps`), or slippage out of range.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/InvalidRequestError"
+                  - $ref: "#/components/schemas/InvalidSlippageError"
+        "401": { $ref: "#/components/responses/SignalOrdersUnauthorized" }
+        "403": { $ref: "#/components/responses/SignalOrdersForbidden" }
+        "404": { $ref: "#/components/responses/SignalOrdersStrategyNotFound" }
+        "409": { $ref: "#/components/responses/SignalOrdersConflict" }
+        "422":
+          description: >-
+            As on `POST /signals-orders/rebalance/plan`, including `strategy_halted`; nothing is
+            quoted.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/SignalOrderRefusal"
+                  - $ref: "#/components/schemas/SimpleError"
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/SignalOrdersUnavailable" }
+
 components:
   securitySchemes:
     IntegratorApiKey:
@@ -1485,7 +2256,8 @@ components:
         third party, and accepted **only** on the reporting routes: today just
         `GET /settlements`. Every other route in this spec answers
         `insufficient_scope`). Required by `GET /settlements`, by the `/payouts` routes,
-        by `POST /quote/preview` and by `GET /stocks/{ticker}` (all but `/settlements` take a
+        by `POST /quote/preview`, by `GET /stocks/{ticker}`, by the `/signals` routes, by the
+        `/signals-orders` routes and by `POST /trade/submit/batch` (all but `/settlements` take a
         general `tik_` key only, being non-reporting routes); accepted on every other
         route for attribution and a per-organisation rate bucket. Send it on `POST /trade/submit` too; that is what makes a trade
         appear in your `GET /settlements` reporting.
@@ -1517,6 +2289,15 @@ components:
       required: false
       schema:
         $ref: "#/components/schemas/EvmAddress"
+    SignalStrategyIdPath:
+      name: id
+      in: path
+      required: true
+      description: The strategy's `strategy_id` (stable) or its `slug` (may be renamed).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
 
   responses:
     InvalidRequest:
@@ -1560,6 +2341,94 @@ components:
           schema:
             $ref: "#/components/schemas/SimpleError"
           example: { error: screening_unavailable }
+    SignalOrdersUnauthorized:
+      description: Missing, malformed or unknown `X-API-Key`, or an ownership-proof failure.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/OwnershipProofError"
+              - $ref: "#/components/schemas/SimpleError"
+    SignalOrdersForbidden:
+      description: >-
+        `address_blocked` (sanctions screening flagged the wallet), or `insufficient_scope`,
+        `key_revoked` or `integrator_suspended`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SimpleError" }
+    SignalOrdersStrategyNotFound:
+      description: No such strategy for you (see `GET /signals/strategies/{id}`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SimpleError" }
+          example: { error: "strategy_not_found" }
+    SignalOrdersUnavailable:
+      description: >-
+        Transient; retry. `screening_unavailable` or `integrator_fee_misconfigured` (see
+        `POST /quote/sell`); `balance_unavailable`: the wallet's Solana USDC could not be read,
+        and is never reported as zero; `holdings_unavailable`: the wallet's holdings could not be
+        read. When the reads behind the plan (screening, the strategy and its book, holdings,
+        prices and USDC) did not answer within 15 seconds, the call answers `holdings_unavailable`,
+        or `screening_unavailable` when screening was the read still pending, with `Retry-After: 15`.
+      headers:
+        Retry-After:
+          description: >-
+            Delta-seconds, 15, sent when the reads passed their deadline. Wait that long before
+            retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SimpleError" }
+          examples:
+            holdings_unavailable: { value: { error: holdings_unavailable } }
+            balance_unavailable: { value: { error: balance_unavailable } }
+            screening_unavailable: { value: { error: screening_unavailable } }
+    SignalOrdersBookChanged:
+      description: >-
+        `book_changed`: `expected_book_hash` is not the book served now. The wallet was not read
+        and nothing was quoted; re-read the book (`book_hash` is the served one) and decide again.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SignalOrdersBookChangedError" }
+    SignalOrdersConflict:
+      description: >-
+        `book_changed`: `expected_book_hash` is not the book served now; the wallet was not read
+        and nothing was quoted. `orders_in_flight`: a quote from an earlier call for the same
+        wallet and strategy is neither final nor five minutes past its `expires_at` (`quote_ids`;
+        empty while that call is still quoting). Nothing was quoted; poll
+        `GET /quote/{quote_id}/status` for the quotes you submitted, and call again after
+        `Retry-After` seconds or once each is final. A quote you never submitted has no status to
+        poll: `Retry-After` is how long until the earliest listed quote is five minutes past its
+        `expires_at` (60 while the earlier call is still quoting). If an earlier call's response was
+        lost, its quotes hold the wallet and strategy until the latest one's `expires_at` plus five
+        minutes: wait out `Retry-After`, or submit the quotes you do hold.
+      headers:
+        Retry-After:
+          description: >-
+            Delta-seconds, sent with `orders_in_flight` only: until the earliest listed quote is
+            five minutes past its `expires_at` (at least 1), or 60 while the earlier call is still
+            quoting. Other listed quotes may still hold after it, and the next call says so.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/SignalOrdersBookChangedError"
+              - $ref: "#/components/schemas/SignalOrdersInFlightError"
+    SignalReadsRateLimited:
+      description: >-
+        A bucket of the `/signals` reads is spent: 1200 calls a minute per organisation (shared by
+        all of your keys) and 600 a minute per key. There is no per-IP bucket on these routes.
+        `Retry-After` carries delta-seconds.
+      headers:
+        Retry-After:
+          description: Delta-seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SimpleError"
+          example: { error: "Too many requests" }
     PortfolioBusy:
       description: |
         The server is already computing as many fresh snapshots as it safely can
@@ -1659,21 +2528,31 @@ components:
 
     Chain:
       type: string
-      enum: [sol, eth, robinhood, base, arbitrum]
+      description: >-
+        Settlement chain. `robinhood` = Robinhood Chain (4663, base currency USDG); `base` = Base
+        (8453); `arbitrum` = Arbitrum One (42161); `bnb` = BNB Smart Chain (56). `bnb` carries several
+        protocols (`ondo`, `xstocks`, `bstocks`), as `sol` and `eth` do, so `chain` alone does NOT
+        identify a cell there: pin `protocol` too. `bnb` is always ACCEPTED as an input (a quote
+        `chain` pin, a `/settlements` filter), because historical rows must stay queryable and a pin
+        must not become a `400`; it appears on `/stocks*` RESPONSES only while the venue is open.
+        With the venue closed, a `chain: "bnb"` buy answers `422 no_routes`, exactly as it would for a
+        ticker that never listed on 56, and a position you already hold on `bnb` still sells.
+      enum: [sol, eth, robinhood, base, arbitrum, bnb]
 
     Protocol:
       type: string
       description: >-
-        Issuer/venue. `backpack` pairs only with `chain: sol` (Solana-only mints).
-      enum: [ondo, xstocks, robinhood, coinbase, reality, backpack]
+        Issuer/venue. `backpack` pairs only with `chain: sol` (Solana-only mints) and `bstocks`
+        only with `chain: bnb`. `ondo` and `xstocks` list on `sol`, `eth` and `bnb`.
+      enum: [ondo, xstocks, robinhood, coinbase, reality, backpack, bstocks]
 
     PayoutChain:
       type: string
       enum: [sol, eth, base]
       description: >-
         A chain a sell can pay out on: USDC on that chain, paid to your own wallet there
-        (`sol_wallet` on `sol`, `eth_wallet` on `eth` and `base`). `robinhood` and `arbitrum` are
-        not payout chains.
+        (`sol_wallet` on `sol`, `eth_wallet` on `eth` and `base`). `robinhood`, `arbitrum` and
+        `bnb` are not payout chains.
 
     SlippageBps:
       type: integer
@@ -1698,7 +2577,8 @@ components:
         `estimated_gas_usd: "0"`. Only meaningful with `priority: "speed"`; sending
         `"user_operation"` without it is `400 invalid_request`. Served on `base` and `robinhood`
         (a chain whose bundler is not configured answers `422 no_routes` pinned, or drops that chain
-        with `speed_route_unavailable` / `disabled` unpinned). An undelegated
+        with `speed_route_unavailable` / `disabled` unpinned). Not served on `bnb`: a bStocks leg
+        there is always a `SignableEvmTx`, so under `"user_operation"` it is dropped the same way. An undelegated
         wallet is `400 wallet_not_delegated` when pinned, or a `wallet_not_delegated` drop reason.
 
     Priority:
@@ -1712,8 +2592,11 @@ components:
         that has not approved the router gets an `approve` payload bundled before the `swap` (see
         `SignableEvmTx` `role`). Absent/`null` = today's
         routing, unchanged. A **filter, not a preference**: under `"speed"` the same-chain
-        candidates are `sol` (unchanged; its route is already fast) and the `robinhood`/`base`
-        speed routes, and a `robinhood`/`base` leg the speed route cannot serve is **absent**
+        candidates are `sol` (unchanged; its route is already fast), the `robinhood`/`base`
+        speed routes and the `bnb` + `bstocks` cell (a bStocks leg is a speed-route transaction at
+        every priority, so `"speed"` changes nothing for it; `bnb` + `ondo` and `bnb` + `xstocks`
+        have no speed route and are absent under `"speed"`). A `robinhood`/`base` leg the speed
+        route cannot serve is **absent**
         from the response (never returned on its relayed route), with a
         `speed_route_unavailable` warning naming the chain and the reason. `eth` is never quoted
         on its own route under `"speed"`. On `/quote/buy` and `/quote/preview` it can still come
@@ -1724,7 +2607,12 @@ components:
         set that also names other chains simply loses `eth`, unless the sell pays out on another
         chain (`payout_chain`), where an `eth/ondo` position sells cross-chain whatever the
         `priority`. A pin on any other chain with no speed route (for example `arbitrum`) is
-        refused the same way on every endpoint.
+        refused the same way on every endpoint. A `bnb` pin whose `protocol` names only `ondo` /
+        `xstocks` is refused the same way on `/quote/sell` (unless it pays out on another chain);
+        on `/quote/buy` and `/quote/preview` it passes the check, as an `eth` pin does, and answers
+        `422 no_routes` because neither cell has a speed or cross-chain route. The `bnb` + `bstocks`
+        cell can also come back as a cross-chain leg (`origin_chain` present) when you are not
+        funded on `bnb` and another chain covers the amount.
 
     # ------------ Errors --------------------------------------------------
     SimpleError:
@@ -1783,8 +2671,9 @@ components:
             Present only when your order was below a known minimum for this
             listing: the actionable answer to a refusal that would otherwise
             carry no reason at all. Retry at or above this size. The number is
-            the venue's own floor when it states one (then `reason` is
-            `amount_too_small`), otherwise a minimum we measured for the ticker.
+            the venue's own floor when it states one or it is known in advance
+            (then `reason` is `amount_too_small`), otherwise a minimum we measured
+            for the ticker.
 
             Read AFTER the venue refused, never before: this never causes a
             refusal, it only explains one.
@@ -1806,6 +2695,16 @@ components:
           description: |
             Present only when a strict majority of dropped cells share the same
             actionable reason; otherwise omitted.
+
+            **This enum is deliberately smaller than the set of internal refusals.**
+            A refusal with no published counterpart yields a bare `no_routes` with
+            no `reason` at all: notably an unlisted cell, whether its venue is
+            switched off or it is a supply-gated token (a Coinbase B20 or bStocks
+            token) that is deployed but not yet minted. The read side already
+            carries the remedy, since such a cell reports `address: null` (or no
+            key at all), omits its chain from `available_chains`, and publishes no
+            `min_trade_size_usd`. Re-read `/stocks/tickers` rather than retrying
+            at another size.
 
             `price_off_reference` covers both non-caller-tunable price refusals:
             an outright refusal against the asset's reference market price (a
@@ -1949,6 +2848,15 @@ components:
       properties:
         sol_address: { type: [string, "null"] }
         eth_address: { type: [string, "null"] }
+        bnb_address:
+          type: [string, "null"]
+          description: >
+            Token address on BNB Smart Chain (56), Ondo's and xStocks' third deployment.
+            **Optional, and absent (not null) while the bnb venue is closed**: the key
+            itself is withheld, so the block is byte-identical to its pre-bnb shape.
+            `null` while the key IS present means the usual thing: this protocol does not
+            list this ticker on 56. Treat "absent" and "null" identically; do not branch on
+            the difference. Never present on the `backpack` block.
         share_multiplier: { type: [string, "null"] }
         sol_min_trade_size_usd:
           type: integer
@@ -1960,6 +2868,14 @@ components:
         eth_min_trade_size_usd:
           type: integer
           description: Per-cell measured minimum for this protocol on Ethereum. See `sol_min_trade_size_usd`.
+        bnb_min_trade_size_usd:
+          type: integer
+          description: >
+            Per-cell minimum for this protocol on BNB Smart Chain (56): measured, or the
+            venue's own floor where it is known before measurement, whichever is higher. See
+            `sol_min_trade_size_usd`. Rides the same conditional as
+            `bnb_address`: always absent while the bnb venue is closed, and while this
+            protocol has no 56 deployment for the ticker.
         sol_tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
@@ -2171,6 +3087,17 @@ components:
           oneOf:
             - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
             - { type: "null" }
+        bstocks:
+          description: >-
+            bStocks on BNB Smart Chain (56). Carries the same supply gate as the listing:
+            an unminted cell prices `null`.
+
+            **Optional, and absent (not null) while bStocks is not offered** (the bnb venue
+            or bStocks switched off): the same key-dark contract as `bnb_address` on the
+            listing blocks. When present it is emitted last.
+          oneOf:
+            - { $ref: "#/components/schemas/StockOnchainProtocolLeg" }
+            - { type: "null" }
 
     StockTickerItem:
       type: object
@@ -2239,6 +3166,55 @@ components:
         coinbase: { $ref: "#/components/schemas/CoinbaseListing" }
         reality: { $ref: "#/components/schemas/RealityListing" }
         backpack: { $ref: "#/components/schemas/BackpackListing" }
+        bstocks: { $ref: "#/components/schemas/BstocksListing" }
+
+    BstocksListing:
+      type: object
+      description: >
+        bStocks venue listing on BNB Smart Chain (56). Single-chain, so one `address`
+        instead of the sol/eth pair; token decimals stay internal.
+
+        **The whole block is OPTIONAL and is ABSENT while bStocks is not offered** (the bnb
+        venue or bStocks switched off), not present-with-nulls. bStocks lists on no other
+        chain, so a dark venue leaves nothing for the block to describe. This is the same
+        key-dark rule as `bnb_address` on the ondo/xstocks blocks and `onchain.bstocks` on
+        `/stocks/prices`.
+
+        **Supply-gated**, exactly like `CoinbaseListing`: a cell stays hidden until real
+        supply exists. `address` and `token_ticker` are `null`, `bnb` is not added to
+        `available_chains` on its account, and a quote returns `422 no_routes`.
+        `min_trade_size_usd` and the warn trio (`tradability`, `warn_reason`,
+        `thin_since`) are gated with them, so a hidden cell never publishes a minimum or a
+        warning for a venue the same response says does not exist.
+
+        **Listing is not tradeability here.** Many minted, priced bStocks cells carry no
+        price feed at the execution venue and refuse permanently (`422 no_routes`,
+        `reason: "no_price_feed"`). Read `tradability` / `min_trade_size_usd` before quoting.
+      required: [address, share_multiplier, token_ticker]
+      properties:
+        address: { type: [string, "null"] }
+        share_multiplier:
+          type: [string, "null"]
+          description: >
+            Shares per token, read live on chain each catalog refresh from the token's own
+            scaled-UI-amount multiplier (ERC-8056 as adopted for BEP-20 by BEP-677). Not a
+            static 1:1: it moves on splits and dividends.
+        min_trade_size_usd:
+          type: integer
+          description: >
+            Measured minimum for this single-cell venue, in whole USDC. **Absent means no
+            minimum is known**, never zero, and it is advisory rather than a gate.
+        tradability:
+          $ref: '#/components/schemas/Tradability'
+          description: Probe warning for this cell. See `CoinbaseListing.tradability`.
+        warn_reason:
+          $ref: '#/components/schemas/WarnReason'
+          description: Why the cell is warned. See `CoinbaseListing.warn_reason`.
+        thin_since:
+          $ref: '#/components/schemas/ThinSince'
+        token_ticker:
+          type: [string, "null"]
+          description: Issuer's token symbol (`<TICKER>B`, e.g. `TSLAB`; a share class drops its dot, so `BRK.B` is `BRKBB`). Null when not listed.
 
     BackpackListing:
       description: >
@@ -2400,8 +3376,9 @@ components:
         min_trade_size_usd:
           type: integer
           description: >
-            Smallest order size, in whole USDC, measured filling on THIS cell. **Absent means no
-            minimum is known**, never zero, and it is advisory rather than a gate.
+            Smallest order size, in whole USDC, measured filling on THIS cell, or the venue's
+            own floor where it is known before measurement, whichever is higher. **Absent means
+            no minimum is known**, never zero, and it is advisory rather than a gate.
         tradability:
           $ref: '#/components/schemas/Tradability'
           description: >
@@ -2725,7 +3702,11 @@ components:
         tables, and a sponsor's recompile may reference only those quoted tables. The bind
         accepts every quoted instruction unchanged and in its quoted order, plus at most four
         extra compute-budget, token-account-creation and sponsor-paid rent-transfer
-        instructions, and the signed transaction must fit Solana's 1232-byte limit.
+        instructions, and the signed transaction must fit Solana's 1232-byte limit. On a
+        same-chain `sol` leg that carries `sol_fee_payer`, the transaction has two required
+        signers, the `sol_fee_payer` (the fee payer) and your sol wallet: both sign it **as
+        issued**, and it must never be recompiled. Any other same-chain `sol` leg is signed by
+        your sol wallet alone.
       required: [type, tx_base64]
       properties:
         type: { type: string, enum: [solana_versioned_tx] }
@@ -2738,14 +3719,25 @@ components:
       type: object
       description: >-
         EIP-712 typed data for a gasless EVM order: the **default** payload on every EVM leg. eth
-        (Ethereum mainnet), robinhood (Robinhood Chain / 4663), base (Base / 8453) and arbitrum
-        (Arbitrum One / 42161), which all share the same sign-only model. Exactly one payload per
-        leg; sign it with `eth_signTypedData_v4` and return the signature to `/trade/submit`. A
-        resolver settles the signed order on-chain, so the caller broadcasts nothing and pays no
-        native gas. The one exception is `priority: "speed"`, under which a robinhood or base leg
-        carries `SignableEvmTx` instead: a complete transaction, and not gasless. eth and arbitrum
-        always carry this shape: eth is never quoted under `priority: "speed"` at all, and arbitrum
-        (Reality) has no speed-route alternative to carry instead.
+        (Ethereum mainnet), robinhood (Robinhood Chain / 4663), base (Base / 8453), arbitrum
+        (Arbitrum One / 42161) and bnb (BNB Smart Chain / 56), which all share the same sign-only
+        model. Exactly one payload per leg; sign it with `eth_signTypedData_v4` and return the
+        signature to `/trade/submit`. A resolver settles the signed order on-chain, so the caller
+        broadcasts nothing and pays no native gas for the trade. The one on-chain step is the
+        wallet's own one-time ERC-20 allowance of the spent token to that chain's settlement
+        contract, sent with that chain's native gas. Two exceptions carry `SignableEvmTx` instead (a
+        complete transaction, and not gasless): a robinhood or base leg under `priority: "speed"`,
+        and a `bnb` + `bstocks` leg at **every** priority (bStocks has no gasless route; you pay BNB
+        gas and Treasures broadcasts). eth, arbitrum and the other bnb cells always carry this
+        shape: eth is never quoted under `priority: "speed"` at all, and arbitrum (Reality),
+        bnb + `ondo` and bnb + `xstocks` have no speed-route alternative to carry instead.
+
+        **On a gasless `bnb` leg the signing deadline is much shorter: about 17 seconds**, against about 60 s
+        on eth (the venue's auction starts sooner). The leg's own `expires_at` is that deadline:
+        read it per leg, not off the response's top-level value. Sign a bnb leg immediately; do
+        not batch it behind a human confirmation or a hardware-wallet round trip. Past the
+        deadline the order is not dead: the auction is live and still fillable along its decay
+        curve, at a worse price.
       required: [type, typed_data]
       properties:
         type: { type: string, enum: [evm_eip712_typed_data] }
@@ -2759,14 +3751,15 @@ components:
       type: object
       description: >-
         A **complete unsigned EVM transaction**. Three producers share this shape. **(1)** The
-        speed-route payload, returned on a `priority: "speed"` leg (robinhood / base): `role`
+        speed-route payload, returned on a `priority: "speed"` leg (robinhood / base) and on every
+        `bnb` + `bstocks` leg whatever the `priority` (`evm_legacy_tx`, BNB gas): `role`
         is `"approve"` then `"swap"`. **(2)** A `priority:"speed"` **cross-chain** leg's EVM
         origin under `execution:"transaction"` (`origin_chain` present on the leg):
         `role` is `"approve"` then `"deposit"`: the swap happens off-chain via the destination
         fill, this transaction only moves your stable off the origin chain, and the `approve` is
         **exact-amount**, not max-uint256 (a deliberate departure from the same-chain speed
         route's unlimited approval, since this arm targets a bridge depository, not a swap router).
-        **(3)** A **cross-chain sell** leg on `eth` or `base` (`payout_chain` present on the leg):
+        **(3)** A **cross-chain sell** leg on `eth`, `base` or `bnb` (`payout_chain` present on the leg):
         always both payloads, on the leg's own `chain`: an **exact-amount** `approve` of the
         tokens sold, served every time whatever allowance the wallet already has, then the
         `deposit`, which sells them on that chain and sends the USDC to `payout_chain`.
@@ -2922,7 +3915,7 @@ components:
       # Flip it to required once partners have rolled forward.
       required: [treasures_fee_bps, dex_swap_fee_bps, estimated_slippage_bps]
       properties:
-        treasures_fee_bps: { type: integer, description: Treasures' own fee, net. }
+        treasures_fee_bps: { type: integer, description: "Treasures' own fee, net." }
         dex_swap_fee_bps:
           type: [integer, "null"]
           description: >-
@@ -2972,9 +3965,12 @@ components:
         wallet pays the SOL network fee. A cross-chain sell leg (`payout_chain` present) is
         `false` whatever the `priority`: you pay the gas on the leg's own `chain`, where the
         sale is sent. The exception to both is the `execution: "user_operation"` lane, where
-        your paymaster pays and any cross-chain leg is `true`. Rides **every** kind of leg, not only speed ones; **absent** where the
-        upstream never reported it (some Solana legs), which is not the same claim as `false`; read
-        the payload `type` when it matters.
+        your paymaster pays and any cross-chain leg is `true`. A same-chain `sol` leg carrying
+        `sol_fee_payer` is `false`: no native gas leaves your user's wallet, but your
+        `sol_fee_payer` pays it, so read `false` as "you or your `sol_fee_payer` pay". Rides
+        **every** kind of leg, not only speed ones; **absent** where the upstream never reported
+        it (some Solana legs), which is not the same claim as `false`; read the payload `type`
+        when it matters.
 
     LegEstimatedGasUsd:
       type: [string, "null"]
@@ -2992,8 +3988,43 @@ components:
         the `priority`: on `eth` or `base` it prices the `approve` and the sale on the leg's
         `chain` and is what the ranking charges; it is `null`, with no warning, on `sol`, under
         `execution: "user_operation"` (your paymaster pays), or when no USD gas price was
-        available. An estimate over a live gas market: the signed
-        transaction bounds what you can actually spend, this string does not.
+        available. A same-chain `sol` leg carrying `sol_fee_payer` carries what that sponsor pays:
+        the network fees plus the rent of any token account the trade opens for your user's
+        wallet, or `null` when no USD price for SOL was available. It is not ranked. An estimate
+        over a live gas market: the signed transaction bounds what you can actually spend, this
+        string does not.
+
+    LegSolFeePayer:
+      allOf: [{ $ref: "#/components/schemas/SolAddress" }]
+      description: >-
+        **Same-chain `sol` legs quoted with `sol_fee_payer` only.** Echoes the request's
+        `sol_fee_payer` on a leg whose transaction it must co-sign and pay for: sign that leg's
+        `solana_versioned_tx` with both the `sol_fee_payer` and your sol wallet, as issued.
+        Absent on every other leg, including a `sol` leg filled by a market maker, which pays
+        its own fee: sign that one with your sol wallet alone.
+
+    SolFeePayer:
+      allOf: [{ $ref: "#/components/schemas/SolAddress" }]
+      description: >-
+        A sol wallet you fund that pays the SOL network fees, and the rent of any token account
+        the trade opens, on every same-chain `sol` leg it can. Lets a wallet holding no SOL trade
+        on `sol`: without it, such a wallet is refused there with `422 no_routes`. Each `sol`
+        leg is then either a market-maker fill (no `sol_fee_payer` on the leg; the maker pays
+        the fee) or a leg carrying `sol_fee_payer`, which this wallet co-signs. Every `ondo` leg
+        is a market-maker fill, so this wallet never pays for one: a first buy of an `ondo`
+        token opens your user's token account at the user's own cost (about 0.01 SOL), and a
+        wallet short of it loses the `ondo` leg. Once sent, a `sol` leg that is not a
+        market-maker fill is only ever the sponsored one, so a sponsor that cannot pay fails
+        the leg even when your user's wallet holds SOL. It must be **one fixed address** that signs from quote to submit: a fee payer whose address changes between
+        the two cannot sign the transaction it was quoted for. Requires `sol_wallet` and must
+        differ from it; refused with `quote_only: true`, which has nothing to sponsor. Naming it
+        proves nothing about it and grants nothing: the transaction does nothing until it signs.
+        It is screened like your wallets. A first buy of a token opens your user's token account
+        for roughly 0.0016 to 0.0021 SOL of rent, paid by this wallet and kept by your user's
+        wallet, so fund it for rent as well as fees: when it cannot cover them, its `sol` legs
+        are refused and the quote reads `422 no_routes`. Cross-chain `sol` legs are unaffected.
+        It covers only the quote it rides on: send it on `/quote/sell` as well, because a
+        sponsored buy does not sponsor the later sell of the same position.
 
     QuoteBuyLeg:
       type: object
@@ -3016,15 +4047,27 @@ components:
           type: string
           enum: [usdc, usdg]
           description: >-
-            Base currency the caller spends; `usdc` on sol/eth legs, `usdg` on robinhood legs.
-            Disambiguates the `_usdc`-named fields (`price_usdc_per_share`, `amount_usdc`) when
-            the base is USDG, which shares USDC's 6-decimal scale. **On a cross-chain leg
+            Base currency the caller spends; `usdc` on sol/eth/base/arbitrum/bnb legs, `usdg` on
+            robinhood legs. Disambiguates the `_usdc`-named fields (`price_usdc_per_share`,
+            `amount_usdc`) when the base is USDG, which shares USDC's 6-decimal scale. **`usdc` is a
+            wire enum, not a fungibility signal**: on `bnb` it is 18-decimal Binance-Peg USDC, not a
+            Circle deploy, and converting it to Circle USDC costs roughly 31 bps in and 7 to 9 bps
+            out. Read `chain` alongside it before treating two legs as the same money. **On a cross-chain leg
             (`origin_chain` present) this names the ORIGIN's currency, not the
             destination cell's**. For example, a robinhood-origin leg into an eth-priced cell still
             carries `"usdg"`, because that is what actually left your wallet.
         amount_base:
           allOf: [{ $ref: "#/components/schemas/DecimalString" }]
           description: Base amount spent, human-decimal, as the base-asset alias of `amount_usdc`.
+        expires_at:
+          type: integer
+          description: >-
+            Unix seconds: **this leg's** signing deadline, and the one `/trade/submit` enforces
+            when you sign this leg. Expiry is per leg because the venues' auction clocks differ:
+            a `bnb` leg runs about 17 s where an `eth` leg runs about 60 s. The response's
+            top-level `expires_at` is the EARLIEST leg's, safe for any leg but pessimistic for the
+            longer-lived ones, so read this field once you have picked a leg. Omitted on
+            `quote_only` previews and on `POST /quote/preview`.
         origin_chain:
           allOf: [{ $ref: "#/components/schemas/Chain" }]
           description: >-
@@ -3032,10 +4075,11 @@ components:
             `priority:"speed"` buy for a cell you are not funded on, reaching its destination
             through a cross-chain hop. Names the chain your stable actually left (the request's
             `origin_chain` whenever it sent one); `chain` above stays the destination cell (never
-            the origin), consistent with every other field on this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, and
+            the origin), consistent with every other field on this leg. `eth` (including a `chain:["eth"]` pin), `sol/xstocks`, `sol/backpack`, `bnb/bstocks`, and
             `base` on an unpinned or multi-chain request are reachable cross-chain; a single-chain
-            `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo` and
-            `eth/xstocks` are never cross-chain destinations. `cross_chain_cost_bps` and
+            `base`/`robinhood` pin always routes same-chain; `robinhood`, `sol/ondo`,
+            `eth/xstocks`, `bnb/ondo` and `bnb/xstocks` are never cross-chain destinations. `bnb` is a
+            destination only: it is never an `origin_chain`. `cross_chain_cost_bps` and
             `cross_chain_cost_usdc` disclose the hop's own cost. Absent on every same-chain leg.
         cross_chain_cost_bps:
           allOf: [{ $ref: "#/components/schemas/BridgeCostBreakdownBps" }]
@@ -3051,6 +4095,7 @@ components:
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
         gasless: { $ref: "#/components/schemas/LegGasless" }
         estimated_gas_usd: { $ref: "#/components/schemas/LegEstimatedGasUsd" }
+        sol_fee_payer: { $ref: "#/components/schemas/LegSolFeePayer" }
         signable_payloads:
           type: array
           minItems: 1
@@ -3100,15 +4145,23 @@ components:
           type: string
           enum: [usdc, usdg]
           description: >-
-            Base currency the caller receives; `usdc` on sol/eth legs, `usdg` on robinhood legs.
-            Disambiguates the `_usdc`-named fields (`price_usdc_per_share`, `estimated_output_usdc`)
-            when the base is USDG, which shares USDC's 6-decimal scale. On a cross-chain leg
-            (`payout_chain` present) it names the payout chain's currency, always `usdc`.
+            Base currency the caller receives; `usdc` on sol/eth/base/arbitrum/bnb legs, `usdg` on
+            robinhood legs. Disambiguates the `_usdc`-named fields (`price_usdc_per_share`,
+            `estimated_output_usdc`) when the base is USDG, which shares USDC's 6-decimal scale. On
+            a cross-chain leg (`payout_chain` present) it names the payout chain's currency, always
+            `usdc`. A same-chain `bnb` sell pays out **18-decimal Binance-Peg USDC**, a different
+            token from Circle USDC; see `QuoteBuyLeg.base_asset`.
         amount_base:
           allOf: [{ $ref: "#/components/schemas/DecimalString" }]
           description: >-
             Base amount received, human-decimal: the base-asset alias of `estimated_output_usdc`
             (equal value, base-denominated).
+        expires_at:
+          type: integer
+          description: >-
+            Unix seconds: this leg's signing deadline. See `QuoteBuyLeg.expires_at` for why it is
+            per leg. A **sell** submit must sign EVERY leg, so the deadline that actually binds a
+            sell is the earliest of them, i.e. the top-level `expires_at`.
         payout_chain:
           allOf: [{ $ref: "#/components/schemas/PayoutChain" }]
           description: >-
@@ -3137,6 +4190,7 @@ components:
         cost_breakdown_bps: { $ref: "#/components/schemas/CostBreakdownBps" }
         gasless: { $ref: "#/components/schemas/LegGasless" }
         estimated_gas_usd: { $ref: "#/components/schemas/LegEstimatedGasUsd" }
+        sol_fee_payer: { $ref: "#/components/schemas/LegSolFeePayer" }
         signable_payloads:
           type: array
           minItems: 1
@@ -3195,7 +4249,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Chain" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3209,7 +4263,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 6
+              maxItems: 7
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3241,6 +4295,7 @@ components:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
           $ref: "#/components/schemas/EvmAddress"
+        sol_fee_payer: { $ref: "#/components/schemas/SolFeePayer" }
         ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
         quote_only:
           type: boolean
@@ -3267,7 +4322,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Chain" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3281,7 +4336,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 6
+              maxItems: 7
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3319,10 +4374,11 @@ components:
             position you hold is planned on its own terms:
             - a position on `payout_chain` sells on that chain as usual (under `priority: "speed"`
               it keeps the speed filter, so an `eth` position is left out when paying out on `eth`);
-            - a `sol/xstocks`, `sol/backpack`, `base/coinbase` or `eth/ondo` position on another
+            - a `sol/xstocks`, `sol/backpack`, `base/coinbase`, `eth/ondo` or `bnb/bstocks` position on another
               chain sells cross-chain as one leg, marked by `payout_chain` on that leg, whatever
               the `priority`;
-            - any other position (`sol/ondo`, `eth/xstocks`, `robinhood`, `arbitrum`) is left out
+            - any other position (`sol/ondo`, `eth/xstocks`, `bnb/ondo`, `bnb/xstocks`, `robinhood`,
+              `arbitrum`) is left out
               and named by a `cross_chain_route_unavailable` warning. It is never sold on its own
               chain instead, because that would pay out somewhere you did not ask for.
 
@@ -3332,7 +4388,9 @@ components:
             `chain: ["eth"]` with `protocol: "xstocks"`). Under `execution: "user_operation"` a
             `base` or `eth` position pays out cross-chain as ONE `evm_calls` payload (an `approve` of
             the stock, then a `deposit`) that your `eth_wallet` sends on the position's chain; a
-            `sol` position keeps its `solana_versioned_tx`. With a payout elsewhere, `chain: ["eth"]` together with `priority: "speed"` is accepted:
+            `sol` position keeps its `solana_versioned_tx`; a `bnb/bstocks` position has no
+            `user_operation` lane and is left out with a `cross_chain_route_unavailable` warning
+            (`disabled`). With a payout elsewhere, `chain: ["eth"]` together with `priority: "speed"` is accepted:
             the `eth/ondo` position sells cross-chain.
 
             `422 holdings_insufficient` when your holdings in scope fall short, wherever they sit.
@@ -3345,6 +4403,7 @@ components:
           $ref: "#/components/schemas/SolAddress"
         eth_wallet:
           $ref: "#/components/schemas/EvmAddress"
+        sol_fee_payer: { $ref: "#/components/schemas/SolFeePayer" }
         ownership_proof: { $ref: "#/components/schemas/OwnershipProof" }
       additionalProperties: false
       description: At least one of `sol_wallet` / `eth_wallet` is required, with the matching signature in `ownership_proof`.
@@ -3353,8 +4412,9 @@ components:
       type: object
       description: >-
         `QuoteBuyRequest` minus every wallet-bound field. `sol_wallet`, `eth_wallet`,
-        `ownership_proof` and `quote_only` are all rejected here as unknown keys; a preview binds
-        no wallet, so there is nothing to prove ownership of and nothing that could be executed.
+        `sol_fee_payer`, `ownership_proof` and `quote_only` are all rejected here as unknown keys;
+        a preview binds no wallet, so there is nothing to prove ownership of and nothing that
+        could be executed.
         `amount_usdc` is additionally capped at 1000000 on this route (unbounded on `/quote/buy`,
         which settles against a real balance): above it the request is a 400.
       required: [ticker, amount_usdc, max_slippage_bps]
@@ -3370,7 +4430,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Chain" }
               minItems: 1
-              maxItems: 5
+              maxItems: 6
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3384,7 +4444,7 @@ components:
             - type: array
               items: { $ref: "#/components/schemas/Protocol" }
               minItems: 1
-              maxItems: 6
+              maxItems: 7
               uniqueItems: true
             - { type: "null" }
           description: >-
@@ -3500,7 +4560,7 @@ components:
             choosing this leg over a gasless one.
             `cross_chain_route_unavailable`: a `priority:"speed"` cell you were not funded on,
             and that can be reached cross-chain (`eth/ondo`, `sol/xstocks`, `sol/backpack`,
-            `base/coinbase`),
+            `base/coinbase`, `bnb/bstocks`),
             could not be served cross-chain and **fell back** to today's plan for that cell instead
             (a dropped same-chain speed leg, a sol leg you could not fund, or (on eth) no leg at
             all, since eth is never served on its gasless route under `"speed"`). Carries `chain`, `protocol` and
@@ -3529,8 +4589,9 @@ components:
             leg is fully executable and you fund your own gas, so fund that wallet before you sell.
             A balance that could not be read is not warned. Also sent on `quote_only`; never sent by
             `POST /quote/preview`, which quotes no wallet of yours.
-            `cross_chain_route_unavailable` and `exit_gas_unfunded` appear once per affected
-            `chain`/`protocol` pair; every other code appears at most once per response.
+            `cross_chain_route_unavailable` and `exit_gas_unfunded` appear once
+            per affected `chain`/`protocol` pair; every other code appears at most once per
+            response.
             Every other `code` value is the routed cell's own `WarnReason`.
       additionalProperties: true
 
@@ -3559,8 +4620,13 @@ components:
         expires_at:
           type: integer
           description: >-
-            Unix seconds. Re-quote after this time. Omitted on `quote_only` previews and on
-            `POST /quote/preview`; neither has an executable quote to expire.
+            Unix seconds: the EARLIEST leg's deadline, so it is safe for any leg. Each leg also
+            carries its own `expires_at`, which is what `/trade/submit` enforces for the leg you
+            sign; on a multi-chain quote the longer-lived legs stay submittable past this value.
+            A leg already past its own deadline when the response is built is dropped, so
+            `quote_index` values can skip; always echo `quotes[].quote_index`, never the array
+            position. Omitted on `quote_only` previews and on `POST /quote/preview`; neither has an
+            executable quote to expire.
         tradfi_reference:
           # Null when we had no reference to price-check against; the quote then carries a
           # `no_reference` entry in `warnings[]`. Always present as a key.
@@ -3594,7 +4660,11 @@ components:
         quote_id: { type: string }
         side: { type: string, enum: [sell] }
         ticker: { $ref: "#/components/schemas/Ticker" }
-        expires_at: { type: integer }
+        expires_at:
+          type: integer
+          description: >-
+            Unix seconds: the EARLIEST leg's deadline. A sell submit signs every leg, so this is
+            the deadline that binds it; each leg's own `expires_at` is never later.
         tradfi_reference:
           # Null when we had no reference to price-check against; the quote then carries a
           # `no_reference` entry in `warnings[]`. Always present as a key.
@@ -3664,10 +4734,11 @@ components:
         status: { $ref: "#/components/schemas/PublicLegStatus" }
         error_code: { type: [string, "null"] }
         payout_chain:
-          allOf: [{ $ref: "#/components/schemas/PayoutChain" }]
+          allOf: [{ $ref: "#/components/schemas/Chain" }]
           description: >-
             **Cross-chain sell legs only** (quoted with `payout_chain`; absent on every other leg):
-            the chain the leg's USDC lands on. `tx_hash` stays the sale on `chain` (under
+            the chain the leg's USDC lands on: the `PayoutChain` you asked for, or the leg's own
+            `chain` after a return there (below), which can be `bnb`, not itself a payout chain. `tx_hash` stays the sale on `chain` (under
             `execution: "user_operation"`, null until the leg completes, then the bundle that sold
             it). On `completed`
             it names where the USDC actually landed: if the cross-chain payout could not be made,
@@ -3726,9 +4797,9 @@ components:
       description: >-
         Signed gasless EVM order: the caller's EIP-712 signature over the quote leg's
         typed data. Used by **every** EVM leg: eth (mainnet), robinhood (Robinhood Chain /
-        4663), base (Base / 8453) and arbitrum (Arbitrum One / 42161). The server relays the
-        signed order to that chain's own resolver network; the caller never broadcasts an
-        on-chain tx.
+        4663), base (Base / 8453), arbitrum (Arbitrum One / 42161) and bnb (BNB Smart Chain /
+        56). The server relays the signed order to that chain's own resolver network; the
+        caller never broadcasts an on-chain tx.
       required: [type, signature]
       properties:
         type: { type: string, enum: [evm_eip712_signature] }
@@ -3962,10 +5033,72 @@ components:
           description: Empty on the full-success path; populated only when a partial broadcast hit an invariant break.
           items: { $ref: "#/components/schemas/FailedLeg" }
 
+    TradeSubmitBatchRequest:
+      type: object
+      required: [submissions]
+      properties:
+        submissions:
+          type: array
+          minItems: 1
+          maxItems: 25
+          description: One `POST /trade/submit` body each. No `quote_id` may appear twice.
+          items: { $ref: "#/components/schemas/TradeSubmitRequest" }
+      additionalProperties: false
+
+    TradeSubmitBatchUnsupportedLeg:
+      type: object
+      description: "`422`, `error` is `batch_leg_unsupported`."
+      required: [error, quote_index]
+      properties:
+        error: { type: string, enum: [batch_leg_unsupported] }
+        quote_index: { type: integer, minimum: 0 }
+
+    TradeSubmitBatchNotStarted:
+      type: object
+      description: "`503`, `error` is `batch_deadline_exceeded`. Nothing was sent."
+      required: [error]
+      properties:
+        error: { type: string, enum: [batch_deadline_exceeded] }
+
+    TradeSubmitBatchResult:
+      type: object
+      required: [quote_id, http_status, response]
+      properties:
+        quote_id: { type: string }
+        http_status:
+          type: integer
+          description: The status `POST /trade/submit` would have answered for this submission.
+        response:
+          description: >-
+            The body `POST /trade/submit` would have answered (body only, never headers), or
+            `TradeSubmitBatchUnsupportedLeg` (422), `TradeSubmitBatchNotStarted` (503), or
+            `{ "error": "internal_error" }` (500).
+          anyOf:
+            - $ref: "#/components/schemas/TradeSubmitResponse"
+            - $ref: "#/components/schemas/TradeSubmitBatchUnsupportedLeg"
+            - $ref: "#/components/schemas/TradeSubmitBatchNotStarted"
+            - $ref: "#/components/schemas/LegAlreadySubmittedError"
+            - $ref: "#/components/schemas/InvalidRequestError"
+            - $ref: "#/components/schemas/SimpleErrorWithMessage"
+            - $ref: "#/components/schemas/SimpleError"
+
+    TradeSubmitBatchResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          description: One per submission, in request order.
+          items: { $ref: "#/components/schemas/TradeSubmitBatchResult" }
+
     # ------------ Bridge --------------------------------------------------
     BridgeChain:
       type: string
-      enum: [sol, eth]
+      description: |
+        Any pair of distinct chains. `bnb` answers `400 unsupported_route` on a deployment
+        without a BNB Chain endpoint. `robinhood` settles in USDG, so a bridge to or from it
+        is a USDC↔USDG swap as well as a bridge.
+      enum: [sol, eth, robinhood, base, arbitrum, bnb]
 
     BridgeQuoteRequest:
       type: object
@@ -3974,7 +5107,6 @@ components:
         - to_chain
         - amount_usdc
         - max_slippage_bps
-        - sol_wallet
         - eth_wallet
         - ownership_proof
       properties:
@@ -3985,12 +5117,28 @@ components:
             - $ref: "#/components/schemas/UsdcHumanAmount"
             - description: Capped at the server-configured `BRIDGE_MAX_AMOUNT_USDC`.
         max_slippage_bps: { $ref: "#/components/schemas/SlippageBps" }
-        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
-        eth_wallet: { $ref: "#/components/schemas/EvmAddress" }
+        sol_wallet:
+          allOf:
+            - $ref: "#/components/schemas/SolAddress"
+            - description: Required when either side is `sol`; omit it on an EVM-to-EVM bridge.
+        eth_wallet:
+          allOf:
+            - $ref: "#/components/schemas/EvmAddress"
+            - description: The wallet on every EVM side (one address serves all EVM chains).
         ownership_proof:
           allOf:
             - $ref: "#/components/schemas/OwnershipProof"
-            - description: Both `sol_signature` and `eth_signature` are mandatory on this endpoint.
+            - description: |
+                `eth_signature` is always required; `sol_signature` is required whenever
+                `sol_wallet` is sent.
+        delivery:
+          type: string
+          enum: [self_broadcast, submit]
+          default: self_broadcast
+          description: |
+            `self_broadcast`: you broadcast what you sign. `submit`: you hand it to
+            `POST /bridge/{bridge_quote_id}/submit`, the only way to execute it; from an EVM
+            origin the payload is `evm_permit_typed_data` and needs no native gas.
       additionalProperties: false
 
     BridgeCostBreakdownBps:
@@ -4036,15 +5184,60 @@ components:
         blockhash: { type: string }
         last_valid_block_height: { type: integer }
 
+    BridgeSignablePermitPayload:
+      type: object
+      description: |
+        `delivery: submit` from an EVM origin. Sign each `typed_data` (as
+        `eth_signTypedData_v4` takes it) in order and send the signatures to
+        `POST /bridge/{bridge_quote_id}/submit`. Each authorizes moving `amount_in_usdc` of the
+        origin's base token once, to the bridge's settlement contract, for about ten minutes; sign
+        it as given (its domain or type names may name that contract).
+      required: [type, chain_id, approval_tx, signatures]
+      properties:
+        type: { type: string, enum: [evm_permit_typed_data] }
+        chain_id: { type: integer }
+        approval_tx:
+          description: |
+            A one-time token approval your own wallet sends before signing, on tokens without a
+            built-in permit. Null on every origin offered today.
+          oneOf:
+            - type: object
+              required: [to, data, value, chain_id]
+              properties:
+                to: { $ref: "#/components/schemas/EvmAddress" }
+                data: { type: string }
+                value: { type: string }
+                chain_id: { type: integer }
+              additionalProperties: false
+            - { type: "null" }
+        signatures:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [typed_data]
+            properties:
+              typed_data:
+                type: object
+                required: [domain, types, primaryType, message]
+                properties:
+                  domain: { type: object }
+                  types: { type: object }
+                  primaryType: { type: string }
+                  message: { type: object }
+            additionalProperties: false
+
     BridgeSignablePayload:
       oneOf:
         - $ref: "#/components/schemas/BridgeSignableEvmPayload"
         - $ref: "#/components/schemas/BridgeSignableSolanaPayload"
+        - $ref: "#/components/schemas/BridgeSignablePermitPayload"
       discriminator:
         propertyName: type
         mapping:
           evm_eip1559_tx: "#/components/schemas/BridgeSignableEvmPayload"
           solana_versioned_tx: "#/components/schemas/BridgeSignableSolanaPayload"
+          evm_permit_typed_data: "#/components/schemas/BridgeSignablePermitPayload"
 
     BridgeQuoteResponse:
       type: object
@@ -4090,6 +5283,38 @@ components:
         source_tx_hash: { type: [string, "null"] }
         destination_tx_hash: { type: [string, "null"] }
         updated_at: { type: integer }
+
+    BridgeSubmitRequest:
+      type: object
+      description: Exactly one of `signatures` (EVM origin) or `signed_tx` (Solana origin).
+      properties:
+        signatures:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items: { type: string, maxLength: 132 }
+          description: |
+            One 65-byte signature (0x-hex) per `signable_payload.signatures[]` item, in the same
+            order, by `eth_wallet`.
+        signed_tx:
+          type: string
+          maxLength: 65536
+          description: |
+            The `signable_payload` Solana transaction signed by `sol_wallet`, as base64, with its
+            message byte-for-byte unchanged (a wallet that adds instructions is refused).
+      additionalProperties: false
+
+    BridgeSubmitResponse:
+      type: object
+      required: [bridge_quote_id, status, source_tx_hash]
+      properties:
+        bridge_quote_id: { type: string }
+        status: { type: string, enum: [submitted] }
+        source_tx_hash:
+          type: [string, "null"]
+          description: |
+            The Solana signature. Null from an EVM origin: the deposit is sent moments later and
+            appears in `GET /bridge/{bridge_quote_id}/status`.
 
     # ------------ Portfolio ----------------------------------------------
     PortfolioPosition:
@@ -4191,6 +5416,12 @@ components:
             **Idle cash on these two venues (`usdc.base`, `usdg.robinhood`) is never
             gated**; it still reads live even for an unknown wallet, so a wallet
             holding only cash still reports it.
+
+            BNB Smart Chain (56) positions are read the same way, off the same EOA. On
+            `bnb` a position's `protocol` is one of `ondo`, `xstocks` or `bstocks`: like
+            `sol` and `eth`, 56 carries more than one, so do not infer `protocol` from
+            `chain`. Positions and `usdc.bnb` are reported **even while the bnb venue is
+            closed**: a portfolio reports what a wallet holds.
           items: { $ref: "#/components/schemas/PortfolioPosition" }
         usdc:
           type: object
@@ -4200,12 +5431,26 @@ components:
             (keyed on `eth_wallet`) through its own 30 s snapshot that a settled trade
             invalidates (exactly like `usdg.robinhood`), not from the sol/eth reconciler.
             A failed read is never cached. `base` is `"0"` when no `eth_wallet` is supplied,
-            no B20 cell is listed in the catalog, or the 8453 read fails.
-          required: [sol, eth, base]
+            no B20 cell is listed in the catalog, or the 8453 read fails. `arbitrum` is
+            Arbitrum-native USDC on 42161, read the same way from the caller's own 42161 EOA,
+            and is `"0"` when no `eth_wallet` is supplied, no Arbitrum cell is listed, or the
+            42161 read fails.
+
+            `bnb` is **Binance-Peg USDC on BNB Smart Chain (56): 18 decimals, and not a Circle
+            deploy at all** (BSC has none). It is reported under the `usdc` name for wire
+            compatibility; converting it to Circle USDC costs roughly 31 bps inbound and 7 to 9
+            bps outbound, a cross-chain swap rather than a transfer. The value here is
+            human-decimal, so the 18-dp scale does not leak into this field. It is read the same
+            way from the caller's own 56 EOA, is `"0"` when no `eth_wallet` is supplied, no bnb
+            cell is listed, or the 56 read fails, and is reported even while the bnb venue is
+            closed. The five keys are five different tokens: never pool them.
+          required: [sol, eth, base, arbitrum, bnb]
           properties:
             sol: { $ref: "#/components/schemas/DecimalString" }
             eth: { $ref: "#/components/schemas/DecimalString" }
             base: { $ref: "#/components/schemas/DecimalString" }
+            arbitrum: { $ref: "#/components/schemas/DecimalString" }
+            bnb: { $ref: "#/components/schemas/DecimalString" }
         usdg:
           type: object
           description: >-
@@ -4222,9 +5467,10 @@ components:
           type: boolean
           description: >-
             `true` when a balance read failed on this pass, so `positions` omits cells the
-            wallet may hold and any sum over `usd_value` undercounts. Covers **all three**
-            position sources: an unreadable sol/eth cell, and an unreadable cell on either
-            single-cell venue (Robinhood Chain 4663 or Base 8453). Cash is not covered;
+            wallet may hold and any sum over `usd_value` undercounts. Covers **every**
+            position source: an unreadable sol/eth cell, and an unreadable cell on any
+            EOA-read venue chain (Robinhood Chain 4663, Base 8453, Arbitrum One 42161, BNB Smart
+            Chain 56). Cash is not covered;
             `usdc`/`usdg` fault-isolate to `"0"` independently, since a failed read there is
             indistinguishable from a real zero.
             Retry for a complete answer; the response is otherwise a normal 200. May be `true`
@@ -4279,10 +5525,11 @@ components:
         tx_hash: { type: [string, "null"] }
         order_hash: { type: [string, "null"] }
         payout_chain:
-          allOf: [{ $ref: "#/components/schemas/PayoutChain" }]
+          allOf: [{ $ref: "#/components/schemas/Chain" }]
           description: >-
             **Cross-chain sells only** (quoted with `payout_chain`; absent on every other row): the
-            chain this sale's USDC lands on, as on the `/quote/{quote_id}/status` leg. `tx_hash`
+            chain this sale's USDC lands on, as on the `/quote/{quote_id}/status` leg (so `bnb` when a
+            `bnb/bstocks` sale's USDC was returned on `bnb`). `tx_hash`
             stays the sale on `chain`, and `usdc_amount` is the USDC that landed.
         payout_tx_hash:
           type: [string, "null"]
@@ -4367,8 +5614,8 @@ components:
           description: >-
             The same realized fill priced per equity share rather than per token;
             `amount_usd ÷ shares`, truncated to 12 decimal places. Prefer this when
-            comparing against a market or tradfi reference: on the rebase venue (xStocks
-            on Ethereum) `price_usd` is a price per conserved internal unit and so matches
+            comparing against a market or tradfi reference: on the rebase venues (xStocks
+            on Ethereum and BNB Smart Chain) `price_usd` is a price per conserved internal unit and so matches
             no market quote, while this figure is comparable across venues and chains.
             The two coincide wherever the share multiplier is 1. `null` on the stablecoin
             leg, which has no share denomination, and on the rare fill whose `shares`
@@ -4407,7 +5654,7 @@ components:
           description: >-
             Raw integer base units as they appear in the on-chain transfer: the figure a
             block explorer renders. Equal to `amount` on every venue except xStocks on
-            Ethereum, whose token rebases: there the contract emits BOTH a standard ERC-20
+            Ethereum and BNB Smart Chain, whose token rebases: there the contract emits BOTH a standard ERC-20
             `Transfer` (carrying this value) and a shares-transfer event (carrying
             `amount`, the conserved internal unit). Both are on-chain; they differ by the
             share multiplier, and an explorer shows only the first. Reconcile
@@ -4530,6 +5777,577 @@ components:
         has_more:
           type: boolean
 
+    SignalSourceKind:
+      type: string
+      enum: [congressional_disclosure, institutional_13f, media_inverse, social_account, manager_published]
+      description: >-
+        What the strategy's book is derived from. `congressional_disclosure`: a legislator's
+        periodic transaction reports. `institutional_13f`: an institution's quarterly 13F holdings.
+        `media_inverse`: the inverse of a broadcast pundit's calls. `social_account`: a public
+        social-media account's posts. `manager_published`: a fund manager publishes the book to
+        Treasures directly. New values may be added; treat an unknown value as opaque.
+
+    SignalReplication:
+      type: object
+      additionalProperties: false
+      required: [as_of, names_total, names_replicated, skipped_source_weight, universe]
+      description: >-
+        How much of the source portfolio the book carries. A book is the source cut down to the
+        names Treasures can trade on chain and renormalised to them.
+      properties:
+        as_of:
+          type: [integer, "null"]
+          description: Unix seconds of the pass that produced these numbers.
+        names_total:
+          type: integer
+          description: Positions in the source portfolio.
+        names_replicated:
+          type: integer
+          description: Positions carried into the book.
+        skipped_source_weight:
+          type: string
+          description: Decimal share of the source portfolio's weight that the book leaves out.
+        universe:
+          type: object
+          additionalProperties: false
+          required: [chains, buyable_by_chain]
+          properties:
+            chains:
+              type: array
+              items: { type: string }
+              description: The chains the book was cut against.
+            buyable_by_chain:
+              type: object
+              additionalProperties: { type: integer }
+              description: How many of the source's names each chain could buy.
+
+    SignalStrategy:
+      type: object
+      additionalProperties: false
+      required:
+        [strategy_id, slug, name, tagline, description, portrait_url, status, source_kind, listed_at, replication]
+      properties:
+        strategy_id: { type: string }
+        slug: { type: [string, "null"] }
+        name: { type: [string, "null"] }
+        tagline: { type: [string, "null"] }
+        description: { type: [string, "null"] }
+        portrait_url: { type: [string, "null"] }
+        status:
+          type: string
+          enum: [active, paused, halted]
+          description: >-
+            `active`: new books are expected. `paused` and `halted`: no new books for now; the
+            last one stays readable.
+        source_kind: { $ref: "#/components/schemas/SignalSourceKind" }
+        listed_at:
+          type: integer
+          description: Unix seconds.
+        replication:
+          oneOf:
+            - $ref: "#/components/schemas/SignalReplication"
+            - type: "null"
+
+    SignalBookWeight:
+      type: object
+      additionalProperties: false
+      required: [ticker, weight]
+      properties:
+        ticker: { type: string }
+        weight:
+          type: string
+          description: Decimal fraction of the book, at most 8 decimals.
+
+    SignalBook:
+      type: object
+      additionalProperties: false
+      required:
+        [signal_id, as_of, book_hash, position_count, deployed_weight, cash_weight, weights]
+      properties:
+        signal_id: { type: string }
+        as_of:
+          type: integer
+          description: Unix seconds. When Treasures ingested the book, not the filing or disclosure date.
+        book_hash:
+          type: string
+          description: >-
+            Hex SHA-256 of the book's contents. Two books with the same weights have the same hash
+            whatever their `signal_id`; compare hashes to detect a change.
+        position_count: { type: integer }
+        deployed_weight:
+          type: string
+          description: Decimal sum of the weights.
+        cash_weight:
+          type: string
+          description: Decimal remainder (one minus `deployed_weight`), never negative.
+        weights:
+          type: array
+          items: { $ref: "#/components/schemas/SignalBookWeight" }
+
+    SignalBookHistoryEntry:
+      type: object
+      additionalProperties: false
+      required:
+        [signal_id, as_of, trading_day, book_hash, position_count, deployed_weight, cash_weight, weights]
+      properties:
+        signal_id: { type: string }
+        as_of:
+          type: integer
+          description: Unix seconds. When Treasures ingested the book.
+        trading_day:
+          type: string
+          description: The US trading day (`YYYY-MM-DD`) the book was acted on.
+        book_hash: { type: string }
+        position_count: { type: integer }
+        deployed_weight: { type: string }
+        cash_weight: { type: string }
+        weights:
+          type: array
+          items: { $ref: "#/components/schemas/SignalBookWeight" }
+
+    SignalCatalogStrategy:
+      type: object
+      description: A catalog row, `SignalStrategy` plus its latest book's identity.
+      additionalProperties: false
+      required:
+        [strategy_id, slug, name, tagline, description, portrait_url, status, source_kind, listed_at, replication, book_hash, book_as_of, signal_id]
+      properties:
+        strategy_id: { type: string }
+        slug: { type: [string, "null"] }
+        name: { type: [string, "null"] }
+        tagline: { type: [string, "null"] }
+        description: { type: [string, "null"] }
+        portrait_url: { type: [string, "null"] }
+        status:
+          type: string
+          enum: [active, paused, halted]
+          description: As on `SignalStrategy`.
+        source_kind: { $ref: "#/components/schemas/SignalSourceKind" }
+        listed_at:
+          type: integer
+          description: Unix seconds.
+        replication:
+          oneOf:
+            - $ref: "#/components/schemas/SignalReplication"
+            - type: "null"
+        book_hash:
+          type: [string, "null"]
+          pattern: "^[0-9a-f]{64}$"
+          description: The latest book's `book_hash`; `null` when the strategy has no book yet.
+        book_as_of:
+          type: [integer, "null"]
+          description: The latest book's `as_of` (unix seconds); `null` with no book.
+        signal_id:
+          type: [string, "null"]
+          description: The latest book's `signal_id`; `null` with no book.
+
+    SignalStrategiesResponse:
+      type: object
+      additionalProperties: false
+      required: [data, truncated]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/SignalCatalogStrategy" }
+        truncated:
+          type: boolean
+          description: "`true` when the page cap of 100 cut the catalog short."
+
+    SignalStrategyDetail:
+      type: object
+      additionalProperties: false
+      required: [strategy, book]
+      properties:
+        strategy: { $ref: "#/components/schemas/SignalStrategy" }
+        book:
+          oneOf:
+            - $ref: "#/components/schemas/SignalBook"
+            - type: "null"
+
+    SignalBookHistoryResponse:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/SignalBookHistoryEntry" }
+        next_cursor:
+          type: [string, "null"]
+        has_more:
+          type: boolean
+
+    SignalOrdersRequest:
+      type: object
+      additionalProperties: false
+      required: [strategy_id, sol_wallet, ownership_proof]
+      properties:
+        strategy_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: The strategy's `strategy_id` (stable) or its `slug` (may be renamed).
+        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
+        ownership_proof:
+          $ref: "#/components/schemas/OwnershipProof"
+          description: The `sol_signature` over the canonical challenge is required.
+        tickers:
+          type: array
+          items: { $ref: "#/components/schemas/Ticker" }
+          minItems: 1
+          maxItems: 25
+          uniqueItems: true
+          description: >-
+            Names to exit beside the book's own, for a position you hold that has since left the
+            book. Each is sold only if held.
+        max_slippage_bps:
+          $ref: "#/components/schemas/SlippageBps"
+          description: Optional on `/exit/plan`, required on `/exit`.
+        expected_book_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: >-
+            The `book_hash` you planned against. When sent and the served book differs, the call
+            is refused with `409 book_changed` before the wallet is read or anything is quoted.
+        protocol:
+          oneOf:
+            - { $ref: "#/components/schemas/Protocol" }
+            - type: array
+              items: { $ref: "#/components/schemas/Protocol" }
+              minItems: 1
+              maxItems: 7
+              uniqueItems: true
+            - { type: "null" }
+          description: >-
+            Narrows which holdings are read and sold, as on `POST /quote/sell`. null/omitted = every
+            protocol. Must include a Solana protocol (`ondo`, `xstocks` or `backpack`), or the
+            request is refused with `400 invalid_request`. A pinned exit covers the pinned venues
+            only: a name also held on another venue is sold from the pinned one alone, with no
+            `skipped` entry for the rest, so repeat the call per venue to exit fully.
+
+    SignalOrderSkipReason:
+      type: string
+      enum: [leg_cap, not_held, holdings_unknown, below_min_notional, awaiting_sell_proceeds, not_tradable, insufficient_balance]
+      description: >-
+        `leg_cap`: more orders than fit: past 25 orders or 30 upstream quote calls. On `/exit` the
+        smallest by notional, unpriced first, are skipped; on `/rebalance` sells are admitted
+        first.
+        `not_held`: no Solana position, or one worth under $0.01, or one that floors to zero
+        shares, or a token account that cannot be decoded into a balance (read as zero).
+        `holdings_unknown`: the holding could not be read, so it is never assumed absent (`/exit`
+        only; a rebalance refuses the whole request instead).
+        `below_min_notional`: a rebalance gap under $1.
+        `awaiting_sell_proceeds`: a rebalance buy `amount_usdc` cannot fund while the plan also
+        sells; call again with the proceeds once the sells settle.
+        `not_tradable`: a book name Treasures cannot buy on Solana; its weight stays in USDC.
+        `insufficient_balance`: a rebalance buy `amount_usdc` cannot fund, with no sell to wait on.
+
+    SignalOrderSide:
+      type: string
+      enum: [buy, sell]
+      description: Every `/exit` order is a sell; a rebalance order is either.
+
+    SignalOrder:
+      type: object
+      additionalProperties: false
+      required: [ticker, side, shares, notional_usdc]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        side: { $ref: "#/components/schemas/SignalOrderSide" }
+        shares:
+          type: [string, "null"]
+          description: >-
+            A sell's share count, floored to 18 decimal places (the full position on `/exit`).
+            Send as `amount_shares`. `null` on a buy, which is sized by `notional_usdc`.
+        notional_usdc:
+          type: [string, "null"]
+          description: >-
+            On a sell, its USD value, or `null` when it could not be priced (`/exit` only). On a
+            buy, the USDC it spends, floored to 6 decimal places; send as `amount_usdc`.
+        quote:
+          anyOf:
+            - $ref: "#/components/schemas/QuoteSellResponse"
+            - $ref: "#/components/schemas/QuoteBuyResponse"
+          description: >-
+            On `/exit` and `/rebalance` only. Exactly the `POST /quote/sell` (or, for a buy,
+            `POST /quote/buy`) answer for this order.
+
+    SignalOrderSkip:
+      type: object
+      additionalProperties: false
+      required: [ticker, side, reason, detail]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        side: { $ref: "#/components/schemas/SignalOrderSide" }
+        reason:
+          anyOf:
+            - $ref: "#/components/schemas/SignalOrderSkipReason"
+            - type: string
+          description: >-
+            One of `SignalOrderSkipReason`, or, on `/exit` and `/rebalance`, the error code the
+            order's quote route would have answered for that leg.
+        detail:
+          type: [object, "null"]
+          additionalProperties: true
+          description: The rest of that order's quote route error body, or `null` when there is none.
+
+    SignalOrderPlan:
+      type: object
+      additionalProperties: false
+      required: [strategy_id, book_hash, signal_id, as_of, nav_usdc, usdc_available, orders, skipped]
+      properties:
+        strategy_id:
+          type: string
+          description: The canonical id, even when the request named the slug.
+        book_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: The book's `book_hash`, as on `GET /signals/strategies/{id}`.
+        signal_id:
+          type: string
+          description: The served book's `signal_id`, as on `GET /signals/strategies/{id}`.
+        as_of:
+          type: integer
+          description: Unix seconds. When Treasures ingested the book, not the filing date.
+        nav_usdc:
+          type: string
+          description: The USD value of the priced names you hold in scope. Unpriced names are excluded.
+        usdc_available:
+          type: string
+          description: The wallet's Solana USDC, as a decimal string.
+        orders:
+          type: array
+          maxItems: 25
+          items: { $ref: "#/components/schemas/SignalOrder" }
+          description: Largest notional first; unpriced last.
+        skipped:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderSkip" }
+
+    SignalOrdersResponse:
+      type: object
+      additionalProperties: false
+      required:
+        [strategy_id, book_hash, signal_id, as_of, nav_usdc, usdc_available, orders, skipped, expires_at, signing_window_sec]
+      properties:
+        strategy_id: { type: string }
+        book_hash: { type: string, pattern: "^[0-9a-f]{64}$" }
+        signal_id: { type: string }
+        as_of: { type: integer }
+        nav_usdc: { type: string }
+        usdc_available: { type: string }
+        orders:
+          type: array
+          maxItems: 25
+          items:
+            allOf:
+              - $ref: "#/components/schemas/SignalOrder"
+              - required: [quote]
+        skipped:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderSkip" }
+        expires_at:
+          type: [integer, "null"]
+          description: >-
+            Unix seconds. The earliest `orders[].quote.expires_at`; `null` when no order was quoted.
+            Each quote's own `expires_at` is what `/trade/submit` enforces for it.
+        signing_window_sec:
+          type: [integer, "null"]
+          description: Seconds from this response until `expires_at`; `null` when no order was quoted.
+
+    SignalRebalanceRequest:
+      type: object
+      additionalProperties: false
+      required: [strategy_id, sol_wallet, ownership_proof]
+      properties:
+        strategy_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: The strategy's `strategy_id` (stable) or its `slug` (may be renamed).
+        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
+        ownership_proof:
+          $ref: "#/components/schemas/OwnershipProof"
+          description: The `sol_signature` over the canonical challenge is required.
+        tickers:
+          type: array
+          items: { $ref: "#/components/schemas/Ticker" }
+          minItems: 1
+          maxItems: 25
+          uniqueItems: true
+          description: >-
+            Names to bring into scope beside the book's own, for a position you hold that has
+            since left the book. Each has weight zero, so it is sold in full if held.
+        max_slippage_bps:
+          $ref: "#/components/schemas/SlippageBps"
+          description: Optional on `/rebalance/plan`, required on `/rebalance`.
+        expected_book_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: >-
+            The `book_hash` you planned against. When sent and the served book differs, the call
+            is refused with `409 book_changed` before the wallet is read or anything is quoted.
+        amount_usdc:
+          $ref: "#/components/schemas/UsdcHumanAmount"
+          description: >-
+            USDC from the wallet to deploy, counted into nav and the only USDC buys may spend. At
+            most `usdc_available`. Omit it for none (`"0"` is refused); on the second round of a
+            rebalance, send the smaller of `funding.next_amount_usdc` and `usdc_available`.
+
+    SignalOrdersBookChangedError:
+      type: object
+      additionalProperties: false
+      required: [error, book_hash]
+      properties:
+        error: { type: string, enum: [book_changed] }
+        book_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: The book served now.
+
+    SignalOrdersInFlightError:
+      type: object
+      additionalProperties: false
+      required: [error, quote_ids]
+      properties:
+        error: { type: string, enum: [orders_in_flight] }
+        quote_ids:
+          type: array
+          items: { type: string }
+          description: >-
+            The earlier call's quotes that are neither final nor five minutes past their expiry;
+            empty while that call is still quoting.
+
+    SignalOrderRefusalCode:
+      type: string
+      enum: [holdings_unknown, price_unavailable]
+      description: >-
+        `holdings_unknown`: a name in scope could not be read. `price_unavailable`: a held name in
+        scope could not be priced. Either would mis-size every order, so nothing is planned.
+
+    SignalOrderRefusal:
+      type: object
+      additionalProperties: false
+      required: [error, tickers]
+      properties:
+        error: { $ref: "#/components/schemas/SignalOrderRefusalCode" }
+        tickers:
+          type: array
+          items: { $ref: "#/components/schemas/Ticker" }
+          minItems: 1
+          description: The names that caused the refusal.
+
+    SignalOrderFunding:
+      type: object
+      description: >-
+        How `amount_usdc` funds the buys. Buys are scaled pro rata and a scaled buy under $1 is
+        skipped, so a small pool spread over many buys can deploy nothing this round; the whole
+        shortfall then stays in `buys_deferred_usdc`.
+      additionalProperties: false
+      required:
+        [usdc_spendable, buys_required_usdc, buys_scaled, buys_deferred_usdc, buys_deferred_until_sells_settle, next_amount_usdc]
+      properties:
+        usdc_spendable:
+          type: string
+          description: >-
+            `amount_usdc`, or `"0"` when omitted: the only USDC this plan's buys spend. Differs
+            from `usdc_available`, the wallet's whole Solana USDC.
+        buys_required_usdc:
+          type: string
+          description: >-
+            Every buy the book asks for, ordered or not, excluding buys under the $1 minimum
+            (`below_min_notional`) and names that cannot be bought (`not_tradable`).
+        buys_scaled:
+          type: boolean
+          description: True when buys were scaled down pro rata to fit `usdc_spendable`.
+        buys_deferred_usdc:
+          type: string
+          description: >-
+            `buys_required_usdc` less the buys in `orders` (on `/rebalance`, the buys quoted). Not
+            the next round's `amount_usdc`: send `next_amount_usdc`.
+        buys_deferred_until_sells_settle:
+          type: boolean
+          description: >-
+            True when some buys are deferred and this plan sells: submit the sells, wait for them
+            to settle, then call again.
+        next_amount_usdc:
+          type: string
+          description: >-
+            The next call's `amount_usdc`. The server does not cap it at `usdc_available`, since
+            sell proceeds land net of fees and slippage: send the smaller of the two, and omit
+            `amount_usdc` when that is `"0"`. It is
+            `usdc_spendable` plus the sells in `orders`, less the buys in `orders` (on
+            `/rebalance`, only the orders quoted, so a refused sell adds nothing and a refused buy
+            spends nothing), rounded down to 6 decimal places and never below `"0"`. It is the
+            strategy's cash after this round, so the book's unweighted remainder and the weight of
+            any `not_tradable` name stay in nav and the next call does not sell again.
+
+    SignalRebalancePlan:
+      type: object
+      additionalProperties: false
+      required: [strategy_id, book_hash, signal_id, as_of, nav_usdc, usdc_available, funding, orders, skipped]
+      properties:
+        strategy_id:
+          type: string
+          description: The canonical id, even when the request named the slug.
+        book_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: The book's `book_hash`, as on `GET /signals/strategies/{id}`.
+        signal_id:
+          type: string
+          description: The served book's `signal_id`, as on `GET /signals/strategies/{id}`.
+        as_of:
+          type: integer
+          description: Unix seconds. When Treasures ingested the book, not the filing date.
+        nav_usdc:
+          type: string
+          description: The USD value of what you hold in scope, plus `amount_usdc`.
+        usdc_available:
+          type: string
+          description: The wallet's Solana USDC, as a decimal string.
+        funding: { $ref: "#/components/schemas/SignalOrderFunding" }
+        orders:
+          type: array
+          maxItems: 25
+          items: { $ref: "#/components/schemas/SignalOrder" }
+          description: Sells first, then buys, each largest notional first.
+        skipped:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderSkip" }
+
+    SignalRebalanceResponse:
+      type: object
+      additionalProperties: false
+      required:
+        [strategy_id, book_hash, signal_id, as_of, nav_usdc, usdc_available, funding, orders, skipped, expires_at, signing_window_sec]
+      properties:
+        strategy_id: { type: string }
+        book_hash: { type: string, pattern: "^[0-9a-f]{64}$" }
+        signal_id: { type: string }
+        as_of: { type: integer }
+        nav_usdc: { type: string }
+        usdc_available: { type: string }
+        funding: { $ref: "#/components/schemas/SignalOrderFunding" }
+        orders:
+          type: array
+          maxItems: 25
+          items:
+            allOf:
+              - $ref: "#/components/schemas/SignalOrder"
+              - required: [quote]
+        skipped:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderSkip" }
+        expires_at:
+          type: [integer, "null"]
+          description: >-
+            Unix seconds. The earliest `orders[].quote.expires_at`; `null` when no order was quoted.
+            Each quote's own `expires_at` is what `/trade/submit` enforces for it.
+        signing_window_sec:
+          type: [integer, "null"]
+          description: Seconds from this response until `expires_at`; `null` when no order was quoted.
+
     SettlementFeeCost:
       type: object
       additionalProperties: false
@@ -4648,7 +6466,7 @@ components:
           type: string
           description: >-
             Raw base units received. Mirrors `receiving.amount`. For the rebase venues
-            (xStocks on Ethereum) this is the conserved internal unit rather than the
+            (xStocks on Ethereum and BNB Smart Chain) this is the conserved internal unit rather than the
             wallet-visible balance; reconcile on `shares`, which is the equity measure,
             or on `receiving.transfer_amount`, which is the raw figure the on-chain
             `Transfer` event carries and a block explorer renders.
