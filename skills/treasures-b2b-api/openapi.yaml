@@ -2571,15 +2571,18 @@ components:
         mean the same) is the raw-transaction shape: one `SignableEvmTx` per transaction, signed
         whole, gas paid by the wallet. `"user_operation"` returns the same calls as ONE `evm_calls`
         payload (`SignableEvmCalls`) for you to pack into an ERC-4337 v0.7 UserOperation from the
-        wallet (which must be **EIP-7702-delegated to Alchemy Modular Account v2** on that chain),
-        sponsor with your own paymaster, sign, and return as `evm_user_operation`; Treasures submits
+        wallet (which must be **EIP-7702-delegated to Alchemy Modular Account v2** on that chain,
+        or not delegated at all: a wallet with no code delegates in that first operation through
+        `eip7702Auth`), sponsor with your own paymaster, sign, and return as `evm_user_operation`;
+        Treasures submits
         it to a bundler and tracks it. The leg is then `gasless: true` with
         `estimated_gas_usd: "0"`. Only meaningful with `priority: "speed"`; sending
         `"user_operation"` without it is `400 invalid_request`. Served on `base` and `robinhood`
         (a chain whose bundler is not configured answers `422 no_routes` pinned, or drops that chain
         with `speed_route_unavailable` / `disabled` unpinned). Not served on `bnb`: a bStocks leg
-        there is always a `SignableEvmTx`, so under `"user_operation"` it is dropped the same way. An undelegated
-        wallet is `400 wallet_not_delegated` when pinned, or a `wallet_not_delegated` drop reason.
+        there is always a `SignableEvmTx`, so under `"user_operation"` it is dropped the same way. A
+        wallet delegated to code other than Modular Account v2 is `400 wallet_not_delegated` when
+        pinned, or a `wallet_not_delegated` drop reason.
 
     Priority:
       type: [string, "null"]
@@ -2811,9 +2814,10 @@ components:
       additionalProperties: false
       description: >-
         A `chain`-pinned `priority: "speed"` + `execution: "user_operation"` request whose
-        `eth_wallet` is not EIP-7702-delegated to Alchemy Modular Account v2 on that chain. Only
-        the caller can clear it (delegate, then re-quote), or re-quote with
-        `execution: "transaction"` for the raw-transaction shape.
+        `eth_wallet` carries code on that chain other than an EIP-7702 delegation to Alchemy
+        Modular Account v2 (a wallet with no code is quoted: it delegates in its first operation
+        through `eip7702Auth`). Only the caller can clear it (re-delegate to Modular Account v2,
+        then re-quote), or re-quote with `execution: "transaction"` for the raw-transaction shape.
 
     # ------------ Ownership proof ----------------------------------------
     OwnershipProof:
@@ -3853,8 +3857,10 @@ components:
         `chain_id` and the v0.7 EntryPoint (`entry_point`; informational, the server pins it);
         return `{ type: "evm_user_operation", user_operation }`. The server decodes `callData`
         and binds every call byte-for-byte to these, plus `sender` = the quoted wallet, no
-        `factory` / `factoryData` (first-time delegation is out of scope), zero `value` on every
-        call, and a non-empty `paymaster`; any mismatch is `invalid_signature`. Exactly one per
+        `factory` / `factoryData`, zero `value` on every call, and a non-empty `paymaster`; any
+        mismatch is `invalid_signature`. A wallet with no code on the chain delegates in this
+        operation: send its signed EIP-7702 authorization as `eip7702Auth` beside the op (see
+        `SignedEvmUserOperation`). Exactly one per
         leg. `approval_spender` is the router the `swap` call pulls through: what the `approve`
         call, when present, grants (max-uint256). **Cross-chain variant** (`priority:"speed"`
         with `origin_chain` present on the leg): the SAME wire shape carries a
@@ -4546,8 +4552,8 @@ components:
             `no_routes` (no reachable pool, or the built swap failed an integrity check), and
             `provider_error` (an upstream failure, caught and downgraded, including a delegation
             read that failed under `execution: "user_operation"`), and, under
-            `execution: "user_operation"` only, `wallet_not_delegated` (the wallet is not
-            EIP-7702-delegated to Modular Account v2 on the named chain), where `disabled` then
+            `execution: "user_operation"` only, `wallet_not_delegated` (the wallet is delegated to
+            code other than Modular Account v2 on the named chain), where `disabled` then
             also carries `chain` when it means "no bundler serves this chain yet". A missing router
             allowance is not a reason: the quote bundles the approve instead (`SignableEvmTx`).
             The list is **open**: this object does not restrict its properties, and a future release
@@ -4837,7 +4843,13 @@ components:
       description: >-
         The reply to a `SignableEvmCalls` leg: the sponsored, signed ERC-4337 **v0.7**
         UserOperation (unpacked fields, `factory`/`factoryData` absent). Numeric fields as decimal
-        or `0x` hex strings; hex fields `0x`-prefixed. The server binds it to the quote (see
+        or `0x` hex strings; hex fields `0x`-prefixed. A wallet with no code on the chain adds
+        `eip7702Auth`, its signed EIP-7702 authorization, which the bundler applies in the same
+        transaction; it must name a Modular Account v2 delegate as `address`, the leg's `chain_id`
+        (never `0`, which would delegate the wallet on every chain), and be signed by `sender`,
+        else `invalid_signature`. It does not change the op hash. An authorization the chain then
+        skips (a stale `nonce`) leaves the wallet without code, and the simulation refuses it as
+        `swap_reverted`. The server binds it to the quote (see
         `SignableEvmCalls`), dedupes on its hash, re-checks balance (and allowance on a
         single-call leg), simulates it on the bundler (`eth_estimateUserOperationGas`; a refusal
         never reached the mempool: `nonce_conflict`, `sponsorship_rejected`, `swap_reverted`,
@@ -4879,6 +4891,31 @@ components:
             paymasterData: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
             factory: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
             factoryData: { type: string, pattern: "^0x[0-9a-fA-F]*$" }
+            eip7702Auth:
+              type: object
+              description: >-
+                A first-operation EIP-7702 delegation, as the bundler RPC spells it (viem's
+                `authorization` on a UserOperation).
+              required: [address, chainId, nonce, r, s, yParity]
+              properties:
+                address: { $ref: "#/components/schemas/EvmAddress" }
+                chainId: { $ref: "#/components/schemas/Uint256String" }
+                nonce:
+                  type: string
+                  pattern: "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
+                  description: A uint64, decimal or `0x` hex; a larger value is `400 invalid_request`.
+                r: { type: string, pattern: "^0x[0-9a-fA-F]{64}$", description: "Exactly 32 bytes." }
+                s:
+                  type: string
+                  pattern: "^0x[0-9a-fA-F]{64}$"
+                  description: >-
+                    Exactly 32 bytes, low-s (at most half the curve order, as EIP-7702 requires); a
+                    high-s tuple is `invalid_signature`.
+                yParity:
+                  type: string
+                  pattern: "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
+                  description: "`0` or `1`, decimal or `0x` hex (`0x00` / `0x01` as viem sends it)."
+              additionalProperties: false
             signature: { type: string, pattern: "^0x[0-9a-fA-F]*$", minLength: 4 }
           additionalProperties: false
       additionalProperties: false
