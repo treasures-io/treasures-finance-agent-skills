@@ -2,6 +2,17 @@
 
 Load when reading `/stocks/*`, `/portfolio`, `/trades`, `/settlements` or `/payouts`. None of them takes an `ownership_proof`. All are unauthenticated public reads **except** `GET /stocks/{ticker}` and `GET /settlements`, which require your integrator key (`X-API-Key`), and the `/payouts` routes, which require a general `tik_` key.
 
+## `GET /stocks`
+
+The whole catalog, each item carrying the `/stocks/tickers` listing blocks plus a `tradfi` and an `onchain` price block, in ticker order. Four optional query parameters turn it into a search:
+
+- `q`: case-insensitive substring of the ticker, the name or any venue's `token_ticker` (`apple`, `TSLA`, `AAPLx`), 1 to 100 characters.
+- `sort`: `market_cap`, `volume_1d`, `change_24h`, `price`, `pe` or `ticker`. A stock missing the metric sorts last in both directions.
+- `order`: `asc` or `desc`; defaults to `asc` for `ticker` and `desc` otherwise. Without `sort` it orders by ticker. Ticker order, either way, is the same order the plain read returns.
+- `page`: 1-based, 25 rows a page, written as a plain integer (`2`, not `2.0` or `0x2`). Only `page` adds `page`, `next_page` (null on the last page) and `total` (rows matching `q`); without it every matching row comes back.
+
+Without any of them the response is unchanged: `{ stocks }`, the whole catalog.
+
 ## `GET /stocks/tickers`
 
 Catalog: every tradable ticker with chain availability, per-protocol token addresses, and share multipliers. Cached 5 min server-side; cheap to poll. Use it to populate pickers, validate symbols, decide `chain`/`protocol` options, and recover token addresses for `approve()`.
@@ -12,20 +23,25 @@ Catalog: every tradable ticker with chain availability, per-protocol token addre
     "ticker": "AAPL",
     "name": "Apple Inc.",
     "available_chains": ["sol", "eth", "robinhood", "base"],
-    "ondo":    { "sol_address": "...", "eth_address": "0x...", "share_multiplier": "0.4818", "token_ticker": "AAPLon" },
+    "ondo":    { "sol_address": "...", "eth_address": "0x...", "bnb_address": "0x...", "share_multiplier": "0.4818", "token_ticker": "AAPLon" },  // bnb_address: see below
     "xstocks": { "sol_address": null, "eth_address": null, "share_multiplier": null, "token_ticker": null },
     "robinhood": { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" },
     "coinbase":  { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" },
-    "backpack":  { "sol_address": "...", "eth_address": null, "share_multiplier": "1", "token_ticker": "AAPL" }  // optional, see below
+    "backpack":  { "sol_address": "...", "eth_address": null, "share_multiplier": "1", "token_ticker": "AAPL" },  // optional, see below
+    "bstocks":   { "address": "0x...", "share_multiplier": "1", "token_ticker": "AAPL" }  // optional, see below
   }]
 }
 ```
 
-A listing block with all its fields `null` means that protocol/venue doesn't list this ticker. `available_chains` is the union across every listing block (`sol` · `eth` · `robinhood` · `base` · `arbitrum`). **The `robinhood` and `coinbase` blocks have a different shape** — Robinhood Chain (4663) and Base (8453) are single-cell venues, so each carries one `address` (decimals stay internal) instead of the `sol_address`/`eth_address` pair. `token_ticker` is the symbol that appears on `/portfolio` + `/trades` rows — Ondo `<TICKER>on`, xStocks `<TICKER>x`, Robinhood, Coinbase and Backpack the **bare** `<TICKER>` — you never derive it yourself.
+A listing block with all its fields `null` means that protocol/venue doesn't list this ticker. `available_chains` is the union across every listing block (`sol` · `eth` · `robinhood` · `base` · `arbitrum` · `bnb`; `bnb` is always appended last, so the order of the others is unchanged). **The `robinhood` and `coinbase` blocks have a different shape** — Robinhood Chain (4663) and Base (8453) are single-cell venues, so each carries one `address` (decimals stay internal) instead of the `sol_address`/`eth_address` pair. `token_ticker` is the symbol that appears on `/portfolio` + `/trades` rows — Ondo `<TICKER>on`, xStocks `<TICKER>x`, bStocks `<TICKER>B` (a share class drops its dot: `BRK.B` is `BRKBB`), Robinhood, Coinbase and Backpack the **bare** `<TICKER>` — you never derive it yourself.
 
 **The `backpack` block is optional; model it as an optional key, not a nullable one.** Backpack Securities tokenized stocks (Solana) use the `ondo`/`xstocks` shape, but the venue is Solana-only, so `eth_address` is always `null` and the `eth_*` keys never appear. The key is **absent** from the item while the venue is switched off. When it is present, a cell is listed only once its token has real supply: until then `sol_address` and `token_ticker` are `null` and it adds nothing to `available_chains`. A ticker that only this venue carries is omitted from this endpoint, `/stocks` and `/stocks/prices` (and is a `404` on `/stocks/{ticker}`) while its cell is unlisted. Trading rules: [`trading.md`](trading.md#backpack).
 
-**This endpoint is the authority on where a ticker trades — especially for `base`.** The Coinbase B20 contracts were deployed unminted, and Treasures hides a cell until real supply exists: an unminted ticker shows `coinbase.address: null`, omits `base` from `available_chains`, and returns `422 no_routes` if you quote it anyway. The listed set therefore **grows over time** as Coinbase mints. Re-read this endpoint (5-min cache) instead of hardcoding a venue list.
+<a id="bnb-listing"></a>**BNB Smart Chain (56) keys are optional too, and ABSENT, not null, while that venue is switched off for you.** 56 carries up to three issuers: `ondo` and `xstocks` (their third deployment, as a flat `bnb_address` + `bnb_min_trade_size_usd` beside their sol/eth pair) and **`bstocks`**, which lists on 56 alone and so takes the single-address shape of `coinbase` (`address`, `share_multiplier`, and a `token_ticker` of `<TICKER>B`, e.g. `TSLAB`). While the venue is off, the `ondo` and `xstocks` blocks carry **no `bnb_address` key at all**, there is **no `bstocks` block**, `bnb` is missing from `available_chains`, and `/stocks/prices` carries no `onchain.bstocks`; with the venue on but bStocks off, only the bStocks-derived keys are absent. Write your parser so an absent key and a `null` key mean the same thing, "not listed", and **discover the venue at runtime rather than hardcoding it**. Because three protocols share 56, `chain` alone does not identify a cell there: read `protocol` on any bnb leg or position. Trading rules: [`trading.md`](trading.md#bnb).
+
+**This endpoint is the authority on where a ticker trades — especially for `base` and `bnb`.** The Coinbase B20 contracts were deployed unminted, and Treasures hides a cell until real supply exists: an unminted ticker shows `coinbase.address: null`, omits `base` from `available_chains`, and returns `422 no_routes` if you quote it anyway. The listed set therefore **grows over time** as Coinbase mints. The `bstocks` block carries the identical supply gate. Re-read this endpoint (5-min cache) instead of hardcoding a venue list.
+
+⚠ **On `bnb`, being listed here is a weaker signal than elsewhere.** Many bStocks tokens are minted and priced yet have **no price at the execution venue at all**, and refuse permanently with `422 no_routes` / `reason: "no_price_feed"`. Read `tradability` and `min_trade_size_usd` on this endpoint before quoting a bnb cell.
 
 <a id="mag7x"></a>
 ### `MAG7X` — a basket, not a stock
@@ -48,7 +64,7 @@ A background probe quotes a ladder of buy sizes against every listed venue — a
 
 | Field | Values | Meaning |
 | --- | --- | --- |
-| `min_trade_size_usd` | integer USD | The smallest size measured to actually fill. Advisory: a smaller order is still accepted and still sent to the venue. |
+| `min_trade_size_usd` | integer USD | The smallest size measured to actually fill. On a venue cell, the venue's own floor where it is known before measurement, when higher. Advisory: a smaller order is still accepted and still sent to the venue. |
 | `tradability` | `"thin"` \| `"untradable"` | `thin` = fills, but not at every size. `untradable` = a full measurement window passed with no fill at any size. **Neither is a block** — both are still quotable and submittable. |
 | `warn_reason` | `"settlement_failure"` \| `"no_price_feed"` \| `"no_fill_window"` \| `"no_settlements"` \| `"low_volume"` | Why the warning was raised. Per-reason action table: [`trading.md`](trading.md#tradability). Open vocabulary — see the note below. |
 | `thin_since` | ISO-8601 string | When the warning was first raised. Cell grain only, and present exactly when that cell's `tradability` is. |
@@ -59,7 +75,8 @@ Which keys appear where:
 | --- | --- | --- |
 | cell | `ondo`, `xstocks` blocks — each spans **two** cells (sol + eth) | chain-suffixed: `sol_min_trade_size_usd`, `sol_tradability`, `sol_warn_reason`, `sol_thin_since`, and the four `eth_*` twins |
 | cell | `backpack` block (when present): one Solana cell | the four `sol_*` keys only, published only while the cell is listed |
-| cell | `robinhood`, `coinbase` blocks — one cell each | bare: `min_trade_size_usd`, `tradability`, `warn_reason`, `thin_since` |
+| cell | `ondo`, `xstocks` blocks on BNB Smart Chain (when the venue is open) | `bnb_min_trade_size_usd` only: the warn trio is not published for the 56 cells of these two blocks |
+| cell | `robinhood`, `coinbase`, `bstocks` (when present) blocks — one cell each | bare: `min_trade_size_usd`, `tradability`, `warn_reason`, `thin_since` |
 | ticker | top level of the item, beside `ticker`/`name` | `min_trade_size_usd`, `tradability`, `warn_reason` — **no `thin_since`** (one stamp cannot date several cells' warnings) |
 
 - **The ticker-level roll-up is deliberately asymmetric.** `min_trade_size_usd` is the **cheapest floor across cells** (a buy routes to whichever cell can serve it), and the word follows that floor — `thin` beside a floor, `untradable` without one. `tradability` is emitted only when **every measured cell is warned**, never when just one is: a ticker with one unwarned cell is healthy somewhere, and labelling the whole ticker would hide a live listing. `warn_reason` at this grain is the **strongest** reason across the warned cells, not the cheapest cell's. So read the per-cell keys, not the ticker keys, to decide which venue to trade.
@@ -88,13 +105,14 @@ Live price snapshot for a targeted set. Comma-separated, up to **50 per call**. 
       "ondo":      { "share_price_usd": "88.8680", "premium_vs_anchor_pct": "-0.517", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.517", "volume_24h_usd": "4732002" },
       "xstocks":   { "share_price_usd": "88.3500", "premium_vs_anchor_pct": "-1.097", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-1.097", "volume_24h_usd": "2649" },
       "robinhood": { "share_price_usd": "88.5000", "premium_vs_anchor_pct": "-0.930", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.930", "volume_24h_usd": "1200" },
-      "coinbase":  { "share_price_usd": "88.6100", "premium_vs_anchor_pct": "-0.807", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.807", "volume_24h_usd": "9400" }
+      "coinbase":  { "share_price_usd": "88.6100", "premium_vs_anchor_pct": "-0.807", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-0.807", "volume_24h_usd": "9400" },
+      "bstocks":   { "share_price_usd": "88.4200", "premium_vs_anchor_pct": "-1.021", "anchor_source": "tradfi_live", "premium_vs_tradfi_pct": "-1.021", "volume_24h_usd": "3100" }  // optional, see below
     }
   }]
 }
 ```
 
-`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. There is no `onchain.backpack`: Backpack cells carry no on-chain price here, so compare them against `tradfi`. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. A venue whose on-chain price sits more than 1.5× from the tradfi price, in either direction, reads `share_price_usd: null` (with null premiums) while `volume_24h_usd` is still reported: a thin pool can price one venue's listing far off the underlying, and a missing price is safer to act on than a wrong one. Use for quote-time comparison, P&L marks, "current price" UX.
+`onchain.ondo`, `onchain.xstocks`, `onchain.robinhood` and `onchain.coinbase` are independent — pick any or all. There is no `onchain.backpack`: Backpack cells carry no on-chain price here, so compare them against `tradfi`. `onchain.coinbase` carries the same supply gate as the listing: an unminted B20 cell prices `null`. `onchain.bstocks` does the same for bStocks, and is **ABSENT (not null) while bStocks is switched off for you**, matching the listing blocks' rule; when present it is emitted last. ⚠ **A `bstocks` price is not a promise of a fill**: on 56 a price routinely exists for a cell the execution venue cannot quote at all, so use `tradability` / `min_trade_size_usd` on `/stocks/tickers` for that question. A venue whose on-chain price sits more than 1.5× from the tradfi price, in either direction, reads `share_price_usd: null` (with null premiums) while `volume_24h_usd` is still reported: a thin pool can price one venue's listing far off the underlying, and a missing price is safer to act on than a wrong one. Use for quote-time comparison, P&L marks, "current price" UX.
 
 - **`premium_vs_anchor_pct`** (negative = on-chain cheaper) — the premium against the reference named by `anchor_source`. `null`, with `anchor_source` absent, when no reference resolves at all.
 - **`anchor_source`** — `"tradfi_live"` (the regular-session print), `"tradfi_extended"` (the aftermarket print while it is still printing) or `"tradfi_frozen"` (the frozen regular-session close). Never the on-chain mark: the premium measures an on-chain price, so anchoring it there would measure that price against itself.
@@ -164,14 +182,14 @@ Live reconciled USDC + tokenized-stock holdings for a wallet pair. Cached 30s pe
     "avg_entry_price_per_share": "210.00", // null in source=all; weighted-avg cost basis per share
     "unrealized_pnl": "12.35"              // null in source=all or when usd_per_token null
   }],
-  "usdc": { "sol": "53.21", "eth": "0.00", "base": "12.50" },  // `base` is Base-native USDC on 8453 — NOT mainnet USDC
+  "usdc": { "sol": "53.21", "eth": "0.00", "base": "12.50", "arbitrum": "0.00", "bnb": "4.00" },  // five DIFFERENT tokens, see below
   "usdg": { "robinhood": "100.00" },
   "partial": false,                        // true → a balance read failed; `positions` is short (see below)
   "as_of": 1730000050, "is_cached": true
 }
 ```
 
-**`partial` — the row list itself may be short.** The nullable columns below cover a cell we *read* but couldn't *price*. `partial` covers the other case: a cell we couldn't read at all (an RPC blip on the sol/eth side, or on either single-cell venue — Robinhood Chain 4663 or Base 8453). Such a cell is **dropped** from `positions` rather than reported as a zero — an unreliable balance must never look like a real one — so on `partial: true` the list omits holdings the wallet may have and **any total you sum from `usd_value` undercounts**. It is otherwise a normal `200`: retry rather than treat it as authoritative, and don't overwrite a good cached view with a partial one. `partial` can be `true` with `is_cached: true` (the 30s snapshot captured the failure); a retry inside that window returns the same partial answer, so back off past it. Cash is **not** covered — `usdc`/`usdg` independently fall back to `"0"` on a failed read, which is why you should never treat their `"0"` as proof of an empty balance either.
+**`partial` — the row list itself may be short.** The nullable columns below cover a cell we *read* but couldn't *price*. `partial` covers the other case: a cell we couldn't read at all (an RPC blip on the sol/eth side, or on an EOA-read venue chain: Robinhood Chain 4663, Base 8453, Arbitrum 42161 or BNB Smart Chain 56). Such a cell is **dropped** from `positions` rather than reported as a zero — an unreliable balance must never look like a real one — so on `partial: true` the list omits holdings the wallet may have and **any total you sum from `usd_value` undercounts**. It is otherwise a normal `200`: retry rather than treat it as authoritative, and don't overwrite a good cached view with a partial one. `partial` can be `true` with `is_cached: true` (the 30s snapshot captured the failure); a retry inside that window returns the same partial answer, so back off past it. Cash is **not** covered — `usdc`/`usdg` independently fall back to `"0"` on a failed read, which is why you should never treat their `"0"` as proof of an empty balance either.
 
 `shares`, `usd_per_token`, `usd_per_share`, `usd_value` are each independently nullable — a position with a price-feed outage still surfaces with `tokens` populated so you can hold the row and re-render USD next poll. **Default any null to "unknown", never "0".** Tokens acquired outside Treasures reconcile in on the next read and emit a synthetic `external` row in `/trades`. **Exception — neither single-cell venue has an external-row reconciler:** you must **submit** each Robinhood-chain and Base trade via `/trade/submit` for it to appear in `/trades` at all — it enters as `broadcast` and reaches `completed` via the same status poll / backfill as `eth` (see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base)). An **unsubmitted** trade on either venue never appears in `/trades` and carries no cost basis; its balance still shows on `/portfolio` like any held cell — provided you send your integrator key, or Treasures already knows this wallet on some chain — snapshotted for 30 s (below).
 
@@ -181,14 +199,18 @@ The three `source=internal` columns are derived from **completed internal trades
 
 **Single-cell venue rows (Robinhood Chain 4663 · Base 8453).** Both venues report on `/portfolio`, and they behave identically — a wallet holding Robinhood Stock Tokens or Coinbase B20 tokens surfaces extra positions with a **bare** `token_ticker` (no `on`/`x` suffix): `chain: "robinhood"`, `protocol: "robinhood"` and `chain: "base"`, `protocol: "coinbase"` respectively. **Positions** read through their own 30s held-cells snapshot off the caller's own EOA on that chain (keyed off `eth_wallet`) — the 30s reconciler cache and the `is_cached` flag cover only the sol/eth cells, so this snapshot is independent of them — and that read happens for **any** `eth_wallet` when you send a valid `tik_` integrator key. **Send your integrator key on this call.** With a valid `tik_` key, positions are read for **any** `eth_wallet` you ask about. `X-API-Key` is OPTIONAL on `/portfolio`, so without it you are anonymous and only a wallet Treasures already knows returns positions — and your end-user wallets are not ones it knows until they have **traded** through us, so a wallet that merely holds (an airdrop, a transfer in) reads as empty. Send the key and that distinction disappears. For an ANONYMOUS caller the read only happens **for a wallet Treasures already knows on some chain**: an `eth_wallet` that is not in Treasures's own custody, is not a B2C wallet, and has no B2B ledger row anywhere gets an empty `positions` list for that venue with **no RPC and no snapshot access**, and is **not** flagged `partial`, since nothing was owed to an address with no record. **Idle cash is never gated this way** — it still reads live for an unknown wallet exactly as for a known one (below). For a known wallet, an RPC blip on either chain omits that venue's positions rather than failing the response — flagged `partial: true` (above), so an omitted row stays distinguishable from a wallet that holds none.
 
+**BNB Smart Chain rows (56).** 56 positions are read the same way, off the same EOA and under the same integrator-key rule, but up to **three** cells share the chain: `chain: "bnb"` with `protocol` **one of `ondo`, `xstocks`, `bstocks`**. Read `protocol` there rather than deriving it from `chain`; `token_ticker` carries each issuer's suffix: `on`, `x` and `B` respectively. 56 positions and `usdc.bnb` are reported **even while the bnb trading venue is switched off for you**: a portfolio reports what a wallet holds.
+
 Each venue's **idle cash** is read from the same EOA and reported alongside:
 
 | Venue | Cash field | Asset |
 |---|---|---|
 | Robinhood Chain (4663) | `usdg.robinhood` | USDG — the 4663 base currency |
 | Base (8453) | `usdc.base` | **Base-native USDC** (`0x8335…2913`) |
+| Arbitrum (42161) | `usdc.arbitrum` | **Arbitrum-native USDC** — read the same way, from the caller's own 42161 EOA |
+| BNB Smart Chain (56) | `usdc.bnb` | **Binance-Peg USDC** (`0x8AC7…d580d`): 18 decimals, and not a Circle deploy |
 
-> ⚠️ **`usdc.base` is a different contract from mainnet USDC.** `usdc` carries `sol`, `eth` **and `base`**; treat the three as separate balances on separate chains, never as one pooled figure.
+> ⚠️ **`usdc.base`, `usdc.arbitrum` and `usdc.bnb` are different contracts from mainnet USDC.** `usdc` carries `sol`, `eth`, `base`, `arbitrum` **and `bnb`**; treat the five as separate balances on separate chains, never as one pooled figure. `usdc.bnb` is 18-decimal Binance-Peg USDC (BNB Smart Chain has no Circle-issued USDC at all), so converting it is a swap that costs real basis points, not a transfer. The values here are human-decimal strings, so the 18-dp scale never leaks into this field.
 
 A wallet holding only cash (no stock tokens yet) still shows it — **cash reads live regardless of whether the wallet is otherwise known to Treasures**. Cash serves from a 30s snapshot that a settled trade invalidates, so a post-trade read reflects the new balance rather than waiting out the TTL; a failed read is never cached. `"0"` when there is no `eth_wallet`, the venue lists no cells, or the chain read fails — a failed cash read is **not** flagged `partial`, because `"0"` is indistinguishable from a real zero.
 
@@ -197,9 +219,9 @@ A wallet holding only cash (no stock tokens yet) still shows it — **cash reads
 Two caveats specific to the position cells:
 
 - **Cost basis is on-chain-observed.** `tokens`/`shares` are exact (live `balanceOf`), and the `source=internal` P&L columns (`avg_entry_price_per_share`, `unrealized_pnl`, and `realized_pnl` on `/trades`) are realized from the **mined fill** — the same fidelity as `eth`, not a quote-time estimate. Both venues' trades are recorded, so their basis replays like the sol/eth cells.
-- **Discoverable via `/stocks/tickers`.** Each venue's listing block (`address`, `share_multiplier`, bare `token_ticker`) and its entry in `available_chains` are surfaced by [`/stocks/tickers`](#get-stockstickers); `/stocks/prices` carries `onchain.robinhood` and `onchain.coinbase` price cells — so these stocks are discovered and valued the same way as sol/eth. (Funding the venue is still your own: USDG onto 4663, USDC onto 8453 — see [`trading.md`](trading.md#robinhood) and [`trading.md`](trading.md#base).) Note: listing does **not** imply tradeable — on Robinhood only the liquid marquee names fill, and on Base only minted-and-priceable tickers do (others → `no_routes`).
+- **Discoverable via `/stocks/tickers`.** Each venue's listing block (`address`, `share_multiplier`, `token_ticker`: bare on Robinhood and Coinbase, `<TICKER>B` on bStocks) and its entry in `available_chains` are surfaced by [`/stocks/tickers`](#get-stockstickers); `/stocks/prices` carries `onchain.robinhood` and `onchain.coinbase` price cells, plus `onchain.bstocks` where that venue is enabled for you — so these stocks are discovered and valued the same way as sol/eth. (Funding the venue is still your own: USDG onto 4663, USDC onto 8453, peg-USDC onto 56 — see [`trading.md`](trading.md#robinhood), [`trading.md`](trading.md#base) and [`trading.md`](trading.md#bnb).) Note: listing does **not** imply tradeable — on Robinhood many listed names have little or no settlement liquidity (read `tradability`), on Base only minted-and-priceable tickers do, and on 56 many bStocks cells have no price at the execution venue at all (others → `no_routes`).
 
-> **A held position is never hidden by the Base supply gate.** The Base supply gate can refuse to *open* a position, never to show or close one — so a B20 holding stays visible on `/portfolio` and sellable even if its listing stops quoting.
+> **A held position is never hidden by a supply gate or a venue switch.** The Base and bStocks supply gates, and the bnb venue switch, can refuse to *open* a position, never to show or close one — so a held B20 or 56 token stays visible on `/portfolio` and sellable even if its listing stops quoting.
 
 ## `GET /trades?sol_wallet=...&eth_wallet=...&limit=50&offset=0&source=all|internal`
 
@@ -231,6 +253,8 @@ History for the wallet pair: Treasures-executed (`source: "internal"`) + reconci
 Robinhood-Chain trades appear here too — `chain: "robinhood"`, `protocol: "robinhood"`, bare `token_ticker`, `tx_hash` = the settlement hash (in-flight rows carry `order_hash` instead) — but only once you submit them (`/trade/submit`); there is no reconciler to backfill an unsubmitted Robinhood trade (see the `/portfolio` note above).
 
 Base trades behave identically — `chain: "base"`, `protocol: "coinbase"`, bare `token_ticker`, amounts in Base-native USDC — and carry the same submit-or-it-never-exists rule, for the same reason (no external-row reconciler on a single-cell venue).
+
+BNB Smart Chain trades likewise: `chain: "bnb"`, `protocol` **one of `ondo` / `xstocks` / `bstocks`** (`token_ticker` carries the issuer's suffix: `on`, `x` or `B`), amounts in 18-decimal Binance-Peg USDC, same submit-or-it-never-exists rule. Because 56 carries three protocols, a row's cell is `(chain, protocol)`: grouping 56 rows by `chain` alone merges three different positions.
 
 Backpack rows are the exception to "bare `token_ticker` means a single-cell venue": `chain: "sol"`, `protocol: "backpack"`, bare `token_ticker`. They are ordinary Solana cells, so they reconcile like `ondo`/`xstocks` on `sol`, `external` rows included, on `/trades` and `/portfolio` alike.
 
@@ -322,7 +346,7 @@ tradfi reference — on the xStocks/Ethereum venue `price_usd` is a price per co
 and matches no market quote. It is `null` on the stablecoin leg.
 
 Each leg also carries `transfer_amount`: the raw figure the on-chain transfer moved, i.e. what a
-block explorer renders. It equals `amount` everywhere except xStocks/Ethereum, whose token rebases
+block explorer renders. It equals `amount` everywhere except xStocks on Ethereum and BNB Smart Chain, whose token rebases
 and emits *two* events — a standard `Transfer` (this field) and a shares-transfer event carrying
 `amount`, the conserved internal unit. Both are on-chain; only the first is what an explorer shows,
 so diffing `amount` against Etherscan reports a phantom mismatch of exactly the share multiplier.
@@ -351,9 +375,12 @@ GET /settlements?chain=sol,eth&ticker=AAPL,MSFT&side=buy&settled_from=1785412800
 
 reads as "AAPL or MSFT, bought on Solana or Ethereum, settled in that 24-hour window".
 
-`chain` accepts `sol` · `eth` · `robinhood` · `base` · `arbitrum`; `protocol` accepts `ondo` · `xstocks` ·
-`robinhood` · `coinbase` · `reality` · `backpack`. The two axes are ANDed, so an impossible pair (`?chain=base&protocol=ondo`)
-is a valid request that simply matches nothing — it is not a `400`.
+`chain` accepts `sol` · `eth` · `robinhood` · `base` · `arbitrum` · `bnb`; `protocol` accepts `ondo` · `xstocks` ·
+`robinhood` · `coinbase` · `reality` · `backpack` · `bstocks`. The two axes are ANDed, so an impossible pair (`?chain=base&protocol=ondo`)
+is a valid request that simply matches nothing — it is not a `400`. `?chain=bnb&protocol=ondo` is **not**
+impossible: 56 carries three protocols, so filtering it by `chain` alone spans three cells. These filters
+always accept `bnb` / `bstocks`, whether or not the trading venue is currently open, so a historical row
+stays queryable.
 
 - **Repeating a parameter is not additive.** `?chain=sol&chain=eth` is read as `sol` alone — always
   use the comma form. Repeats within one list are fine (`?chain=sol,sol` is just `sol`).
@@ -368,8 +395,9 @@ is a valid request that simply matches nothing — it is not a `400`.
 - **`token_out_address` is side-aware**, because the field it filters is. Pass a stock token's
   address to get *buys* of that token; pass a base currency's address to get *sells* on that chain.
   **A base currency's address selects one chain, not "all sells"** — each chain has its own USDC
-  contract (Solana `EPjF…Dt1v`, Ethereum `0xA0b8…eB48`, Base `0x8335…2913`) and Robinhood Chain uses
-  USDG, so filtering on mainnet USDC returns Ethereum sells only. An address we don't carry returns
+  contract (Solana `EPjF…Dt1v`, Ethereum `0xA0b8…eB48`, Base `0x8335…2913`, BNB Smart Chain
+  `0x8AC7…d580d`) and Robinhood Chain uses USDG, so filtering on mainnet USDC returns Ethereum sells
+  only. An address we don't carry returns
   an empty page, not an error.
 - **A cursor belongs to the filters that produced it.** Keep the filter parameters identical for
   every page of a loop. Changing any of them returns `400` with `cursor: filters_changed` — start

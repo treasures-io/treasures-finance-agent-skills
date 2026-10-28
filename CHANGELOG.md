@@ -16,6 +16,159 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## 2026-10-28: b2b `1.21.0`
+
+A wallet with no code on Robinhood Chain or Base can use `execution: "user_operation"` from its
+first trade there: the quote is served, and that first UserOperation carries the wallet's EIP-7702
+delegation. Additive: a `1.20.0` caller whose wallet is already delegated sees an unchanged API.
+
+### treasures-b2b-api `1.21.0`: first-op delegation on the user-operation route
+
+- **A wallet with no code is quoted.** Under `priority: "speed"` + `execution: "user_operation"`,
+  `/quote/buy` and `/quote/sell` now serve a wallet that has never delegated on that chain.
+  `400 wallet_not_delegated` (and the `speed_route_unavailable` reason of the same name) now means
+  only a wallet delegated to code other than Modular Account v2.
+- **`eip7702Auth` on that first op.** Send the wallet's signed EIP-7702 authorization beside the op
+  as `user_operation.eip7702Auth` `{ address, chainId, nonce, r, s, yParity }`, spelled as your SDK's
+  bundler call spells it (SDKs with a 7702 mode attach it on their own). It must name a Modular
+  Account v2 delegate, carry the leg's `chain_id` (never `0`), be a low-s signature and be signed by
+  `sender`; anything else is `invalid_signature`. It does not change the op hash. Omit it once the
+  wallet is delegated. An authorization the chain skips (a stale `nonce`) leaves the wallet without
+  code, and the op is refused as `swap_reverted`: re-quote and re-sign.
+- **Robinhood Chain on this route.** The skill's pre-flight list no longer says Robinhood Chain is not
+  served under `execution: "user_operation"`; it is, as the trading reference already said.
+
+## 2026-10-26: b2b `1.20.0`
+
+Catches the published b2b skill up with the live API: BNB Smart Chain (`1.18.0`), bridging between
+any two chains (`1.19.0`), and SOL fees paid by a wallet you fund (`1.20.0`). `1.18.0` and `1.19.0`
+never shipped on their own. The `openapi.yaml` published with the skill now also carries the
+Signals API and `POST /trade/submit/batch`.
+Additive on the request: a `1.17.0` caller that sends none of the new fields sees an unchanged API.
+Three **⚠ Action** items:
+
+- **Robinhood Chain approvals:** a gasless order there needs a one-time allowance to
+  `0x5A705DE8982235a7fa45bB83dCaCf03a211389C7` (Robinhood Chain's own settlement contract, not the
+  `0x1111…0a65` used elsewhere), sent with a little ETH on 4663. Earlier versions said none was needed.
+
+- **Strict response parsers:** `chain: "bnb"` and `protocol: "bstocks"` can appear on held or routed
+  rows, `/portfolio` `usdc` adds `arbitrum` and `bnb` keys, and every executable quote leg carries
+  its own `expires_at`. Parse `chain` and `protocol` as open vocabularies (as `1.17.0` already said).
+- **Echo `quotes[].quote_index`, never the array position.** A buy alternative that has already
+  expired when the quote is built is dropped, so `quote_index` can skip a value. This was always the
+  contract; a caller that indexed by position now gets the wrong leg.
+
+### treasures-b2b-api `1.18.0`: BNB Smart Chain (56)
+
+- **`chain: "bnb"`** on `/quote/buy`, `/quote/sell`, `/quote/preview` and the `/settlements`
+  filters. 56 carries up to three issuers: `ondo` and `xstocks` (their third
+  deployment) and **`protocol: "bstocks"`**, which lists on 56 alone. Read each leg's or position's
+  `protocol`: on 56, `chain` alone does not name a cell. Quote `chain` and `preferred_chain` arrays
+  now take up to six values, `protocol` arrays up to seven.
+- **Not open to every caller yet.** While the venue is off for you, nothing about it reaches the
+  wire: no `bnb_address` key, no `bstocks` block, no `bnb` in `available_chains`, and a `bnb` buy is
+  `422 no_routes`. Selling is never gated: a 56 position you hold stays on `/portfolio` and quotes on
+  `/quote/sell`.
+- **Two signing models.** `ondo` and `xstocks` legs on 56 use the same sign-only, gasless model as
+  `eth`, with one-time approvals paid in **BNB**, not ETH. A `bstocks` leg is a complete transaction
+  at every priority (an `approve` first when one is due), broadcast by Treasures and paid in BNB; it
+  is the one 56 cell served under `priority: "speed"`. `origin_chain` / `payout_chain` do not take 56.
+- **The base currency is 18-decimal Binance-Peg USDC**, reported as `base_asset: "usdc"`. It is not
+  Circle USDC and is not fungible with USDC on any other chain: never pool `usdc.bnb` with the rest.
+- **Short signing window.** A `bnb` `ondo` / `xstocks` leg expires about 14 seconds after the quote (a
+  `bstocks` leg about 40). Every executable
+  leg now carries its own `quotes[].expires_at`; the top-level `expires_at` is still the earliest
+  leg's, and `/trade/submit` enforces the deadline of the leg you signed (a sell signs every leg, so
+  it is bound by the earliest).
+- **Discovery.** `/stocks/tickers` and `/stocks` add `bnb_address` and `bnb_min_trade_size_usd` on the
+  `ondo` and `xstocks` blocks and a `bstocks` block (`address`, `share_multiplier`, `token_ticker`
+  `<TICKER>B`); `/stocks/prices` adds `onchain.bstocks`. Listing is a weak signal on 56: many bStocks
+  tokens have no price at the execution venue and refuse with `422 no_routes` /
+  `reason: "no_price_feed"`, so read `tradability` and `min_trade_size_usd` first.
+- **`/portfolio`** reports 56 positions and `usdc.bnb` (and documents `usdc.arbitrum`), even while the
+  trading venue is off for you.
+
+### treasures-b2b-api `1.19.0`: bridge between any two chains
+
+- **`/bridge/quote` takes any two distinct chains** among `sol`, `eth`, `robinhood`, `base`,
+  `arbitrum` and `bnb`. Each side settles in that chain's base currency (USDG on `robinhood`,
+  Binance-Peg USDC on `bnb`). `bnb` answers `400 unsupported_route` where BNB Smart Chain is not
+  supported.
+- **`sol_wallet` and `sol_signature` are optional** when neither side is `sol`: an eth-only
+  ownership proof covers an EVM-to-EVM bridge.
+- **`delivery: "submit"`** (optional; default `"self_broadcast"`, the response you already parse)
+  quotes for the new **`POST /bridge/{bridge_quote_id}/submit`**. From `eth`, `base` or `arbitrum` you
+  sign one `evm_permit_typed_data` payload (each of its one or two `signatures[]` items, in order): no
+  approval, no ETH and no nonce. From `sol` you sign the
+  transaction and Treasures broadcasts it. Other origins answer `400 unsupported_route` for now.
+  Resubmitting the same body is safe for an hour.
+- New refusals on `/submit`: `400 quote_not_submittable`, `400 signed_tx_mismatch`,
+  `409 bridge_already_submitted`, `410 bridge_quote_expired`, `422 broadcast_rejected` and
+  `502 broadcast_unavailable` (resubmit the same body; never sign a second deposit).
+- **Funding a venue chain.** The Robinhood Chain, Base and BNB Smart Chain sections no longer call
+  getting USDC there out-of-band: `/bridge/quote` reaches all three.
+
+### treasures-b2b-api `1.20.0`: SOL fees paid by a wallet you fund (`sol_fee_payer`)
+
+- **`sol_fee_payer`** on `/quote/buy` and `/quote/sell`: one fixed sol wallet you fund. A wallet
+  holding almost no SOL (under about 0.003) is refused on `sol` with `422 no_routes`; with
+  `sol_fee_payer`, each same-chain `sol` leg comes back either carrying `sol_fee_payer` (your wallet
+  pays the fees and the rent of any token account the trade opens; the leg reads `gasless: false`
+  with `estimated_gas_usd`) or as a market-maker fill without it (the maker pays the fee). Every
+  `ondo` leg is a market-maker fill, so the field never pays for one: a first buy of an `ondo` token
+  still needs about 0.01 SOL in the user's wallet for the new token account.
+- **Sign a leg carrying `sol_fee_payer` as issued, with both keys**: the `sol_fee_payer` and the
+  user's `sol_wallet`. Never recompile it.
+- **Send it on sells as well as buys.** It covers only the quote it rides on: a wallet still under
+  about 0.003 SOL is refused on the sell unless the sell carries it too. Once sent, a pool-filled leg
+  is only ever the sponsored one, so keep the sponsor funded.
+- Requires `sol_wallet` and must differ from it; refused (`400 invalid_request`) beside
+  `quote_only: true` and on `/quote/preview`; screened like your wallets. Cross-chain `sol` legs are
+  unchanged.
+
+### Corrections and additions in `1.20.0`
+
+- **⚠ Action, Robinhood Chain approvals.** A gasless order on Robinhood Chain needs a one-time
+  ERC-20 allowance like every other EVM chain (USDG to buy, the stock token to sell), sent with a
+  little ETH on 4663. Its spender is `0x5A705DE8982235a7fa45bB83dCaCf03a211389C7`, Robinhood
+  Chain's own settlement contract, not the `0x1111…0a65` used elsewhere. Earlier versions said the
+  venue needed no native float at all.
+- **Arbitrum (Reality) section.** The live `chain: "arbitrum"` venue is now documented: Arbitrum-native
+  USDC, approvals to `0x1111…0a65` on 42161, buys gated on the market week, no speed route, cross-chain leg,
+  `origin_chain` or `payout_chain`.
+- **Robinhood Chain liquidity.** No longer named as four fillable tickers: read `tradability` and
+  `min_trade_size_usd` on the `robinhood` listing block.
+- **bStocks on BNB Smart Chain** (not open yet). Earlier text called every 56 leg gasless and said 56
+  had no speed route. A `bstocks` leg is a complete transaction paid in BNB at every priority, with a
+  signing window of about 40 seconds.
+
+### Spec: Signals API and batch submit
+
+- `openapi.yaml` now carries the `Signals` tag (`/signals/strategies*` and `/signals-orders/*`,
+  general integrator key required) and `POST /trade/submit/batch` (up to 25 submits in one request,
+  integrator key required). Both were already live; neither changes the skill's own flows.
+
+---
+
+## 2026-10-26: b2b `1.17.0` (content update, version unchanged)
+
+A documentation-only refresh of the `1.17.0` skill: the parameters below are already live on the
+API, and the skill text now says so. No `metadata.version` bump, so no gate signal fires: read this
+entry.
+
+### treasures-b2b-api: search, sort and paging on `GET /stocks`
+
+- Four optional query parameters: `q` (case-insensitive substring of the ticker, the name or any
+  venue's `token_ticker`, 1 to 100 characters), `sort` (`market_cap`, `volume_1d`, `change_24h`,
+  `price`, `pe` or `ticker`; a stock missing the metric sorts last), `order` (`asc` or `desc`) and
+  `page` (1-based, 25 rows a page). New `StockSortKey` schema.
+- Only `page` changes the response shape: it adds `page`, `next_page` (`null` on the last page) and
+  `total`. Without any of the four, the response is the whole catalog, as before.
+- These four are the only query parameters `/stocks` takes; any other is still
+  `400 invalid_request`.
+
+---
+
 ## 2026-10-06: b2b `1.17.0`, wallet `1.4.0`
 
 Adds Backpack Securities tokenized stocks as a third stock protocol on Solana, in both skills, and
