@@ -16,6 +16,28 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## 2026-10-28: b2b `1.21.0`
+
+A wallet with no code on Robinhood Chain or Base can use `execution: "user_operation"` from its
+first trade there: the quote is served, and that first UserOperation carries the wallet's EIP-7702
+delegation. Additive: a `1.20.0` caller whose wallet is already delegated sees an unchanged API.
+
+### treasures-b2b-api `1.21.0`: first-op delegation on the user-operation route
+
+- **A wallet with no code is quoted.** Under `priority: "speed"` + `execution: "user_operation"`,
+  `/quote/buy` and `/quote/sell` now serve a wallet that has never delegated on that chain.
+  `400 wallet_not_delegated` (and the `speed_route_unavailable` reason of the same name) now means
+  only a wallet delegated to code other than Modular Account v2.
+- **`eip7702Auth` on that first op.** Send the wallet's signed EIP-7702 authorization beside the op
+  as `user_operation.eip7702Auth` `{ address, chainId, nonce, r, s, yParity }`, spelled as your SDK's
+  bundler call spells it (SDKs with a 7702 mode attach it on their own). It must name a Modular
+  Account v2 delegate, carry the leg's `chain_id` (never `0`), be a low-s signature and be signed by
+  `sender`; anything else is `invalid_signature`. It does not change the op hash. Omit it once the
+  wallet is delegated. An authorization the chain skips (a stale `nonce`) leaves the wallet without
+  code, and the op is refused as `swap_reverted`: re-quote and re-sign.
+- **Robinhood Chain on this route.** The skill's pre-flight list no longer says Robinhood Chain is not
+  served under `execution: "user_operation"`; it is, as the trading reference already said.
+
 ## 2026-10-26: b2b `1.20.0`
 
 Catches the published b2b skill up with the live API: BNB Smart Chain (`1.18.0`), bridging between
