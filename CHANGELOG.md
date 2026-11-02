@@ -16,6 +16,46 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## 2026-11-02: b2b `1.22.0`
+
+A `422 no_routes` that used to come back bare now says why and names a minimum size where one is
+known. A `priority: "speed"` refusal lists the listings it skipped, so you know a quote without
+`priority` may succeed. Solana minimums are now measured with a quote bound to a wallet. Additive on
+the request: a `1.21.0` caller keeps working, but see **⚠ Action** if you match `reason` or
+`error_code` against a fixed list.
+
+### treasures-b2b-api `1.22.0`: specific refusals and firm Solana minimums
+
+- **⚠ Action: new `reason` values on `422 no_routes`.** If your client checks `reason` against a
+  closed list, add them:
+  - `no_market_maker_fill`: market makers declined the order at that size.
+  - `insufficient_gas`: the wallet held too little SOL for fees, under 0.002 SOL (0.01 SOL when the
+    trade opens a token account). Never on `quote_only`, `/quote/preview` or a request carrying
+    `sol_fee_payer`.
+  - `cross_chain_route_unavailable`: the cross-chain route a `priority: "speed"` buy needed could
+    not be used.
+- **A minimum from your own wallet.** A Solana refusal under a market maker's size may carry
+  `min_notional_usdc` with the size a market maker quoted your wallet at refusal time. On
+  `/quote/sell` it is a USDC value, never a share count.
+- **Speed refusals name what they skipped.** A `priority: "speed"` buy or preview that ends in
+  `422 no_routes` lists each listing speed never quotes (an `eth` or `bnb` gasless order, or Reality
+  on `arbitrum`) in `warnings[]` as `speed_route_unavailable` with `reason: "no_speed_venue"`,
+  `chain` and `protocol`. Re-quote without `priority` to reach them.
+- **Speed never quotes a Solana leg your wallet cannot fund.** Under `priority: "speed"` a buy's
+  `sol` leg is dropped when your `sol_wallet` reads short; when that leaves nothing and no other
+  chain's wallet covers the amount, the refusal reads `insufficient_balance`. There is still no
+  general USDC balance check on `/quote/buy`, and nothing is checked at `/trade/submit`.
+- **⚠ Action: new Solana execution codes.** A failed same-chain `sol` leg now reports
+  `market_maker_rejected` (the market maker refused the fill when the transaction was sent) or
+  `not_landed` (the transaction was reported as not landing; a leg short of the token it spends also
+  ends here), and keeps the reported signature on `tx_hash`. On `not_landed` with a `tx_hash`, check
+  that transaction on chain before trading the same size again.
+- **Firm Solana minimums.** `sol_min_trade_size_usd` on the `ondo`, `xstocks` and `backpack` blocks
+  now comes, where a market maker fills the listing, from a quote bound to a wallet rather than a
+  price-only preview. Expect higher minimums on many Solana xStocks listings, and none published
+  where nothing filled. A Solana position worth less than its minimum may not be sellable there
+  until topped up, so avoid partial sells that leave less than the minimum behind.
+
 ## 2026-10-28: b2b `1.21.0`
 
 A wallet with no code on Robinhood Chain or Base can use `execution: "user_operation"` from its
