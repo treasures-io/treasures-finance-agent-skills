@@ -685,6 +685,8 @@ paths:
             for the requested share amount. With `payout_chain`, holdings that
             cover the amount but cannot pay out there are `no_routes` with
             `reason: payout_route_unavailable`, never `holdings_insufficient`.
+            A sell refused for its size may carry `min_notional_usdc`, in USDC
+            of the shares it could not place (see `NoRoutesError`).
           content:
             application/json:
               schema:
@@ -693,6 +695,13 @@ paths:
                   - $ref: "#/components/schemas/SimpleError"
               examples:
                 no_routes: { value: { error: no_routes } }
+                below_minimum:
+                  value:
+                    {
+                      error: no_routes,
+                      reason: no_market_maker_fill,
+                      min_notional_usdc: "11.00",
+                    }
                 payout_route_unavailable:
                   { value: { error: no_routes, reason: payout_route_unavailable } }
                 holdings_insufficient:
@@ -2675,8 +2684,16 @@ components:
             listing: the actionable answer to a refusal that would otherwise
             carry no reason at all. Retry at or above this size. The number is
             the venue's own floor when it states one or it is known in advance
-            (then `reason` is `amount_too_small`), otherwise a minimum we measured
-            for the ticker.
+            (then `reason` is `amount_too_small`), a size a market maker quoted
+            your own wallet when asked again at refusal time, or otherwise a
+            minimum we measured for the listing.
+
+            On `/quote/sell` it is a USDC value, not a share count: the shares
+            the quote could not place (the whole order, unless other legs could
+            take part of it), valued at the reference price, fell short of it.
+            Re-quote a share amount worth at least this much at the current
+            price. A position worth less may not be sellable on that chain until
+            it is topped up.
 
             Read AFTER the venue refused, never before: this never causes a
             refusal, it only explains one.
@@ -2694,6 +2711,9 @@ components:
               insufficient_balance,
               cross_chain_wallet_missing,
               payout_route_unavailable,
+              no_market_maker_fill,
+              insufficient_gas,
+              cross_chain_route_unavailable,
             ]
           description: |
             Present only when a strict majority of dropped cells share the same
@@ -2744,15 +2764,37 @@ components:
             client that models it does not break, but do not build a flow around
             receiving it.
 
-            `insufficient_balance` describes **your own wallet**, not the venue,
-            and is only reachable on a `chain`-pinned `priority: "speed"` request,
-            the one shape where the speed route is the only candidate, so its
-            refusal becomes the whole answer. The wallet is short the spent token
-            on that chain: fund it and re-quote. Unpinned, the same condition
-            drops that leg from the response (never a relayed fallback) and the
-            response carries a `speed_route_unavailable` warning. (A missing
-            router allowance is never a refusal on either shape; the quote
-            bundles the approve.)
+            `insufficient_balance` describes **your own wallet**, not the venue:
+            it is short the spent token on that chain, so fund it and re-quote.
+            On a Solana leg, the venue refused your wallet for the spent token
+            (a buy whose wallet is short of USDC or has no USDC account, or a
+            sell short of the shares it asks to sell; a Solana leg the venue
+            still quotes is not checked against your balance again at submit,
+            so a wallet short at submit fails that leg as `not_landed`).
+            Under `priority: "speed"` a buy's Solana leg is
+            refused before any venue is asked when your `sol_wallet` reads short
+            the amount and none of your other wallets covers it either (when one
+            does, see `cross_chain_route_unavailable`). A speed leg on any other
+            chain refuses on the same condition: `chain`-pinned, the one shape
+            where that leg is the only candidate, its refusal becomes the whole
+            answer; unpinned, it drops that leg from the response (never a
+            relayed fallback) and the response carries a
+            `speed_route_unavailable` warning. (A missing router allowance is
+            never a refusal on either shape; the quote bundles the approve.)
+
+            `no_market_maker_fill`: no market maker or route answered for this
+            size at this moment. Not slippage-tunable. A larger order may clear
+            it (see `min_notional_usdc` when present), or a re-quote later.
+
+            `insufficient_gas`: a Solana leg was refused and your `sol_wallet`
+            holds under 0.002 SOL, or under 0.01 SOL when the trade must create
+            its output token account. Fund the wallet with SOL and re-quote; a
+            larger order will not clear it. Never returned for `quote_only` or
+            for `/quote/preview`, which spend none of your SOL, nor on a request
+            carrying `sol_fee_payer`, which skips the SOL check. That request
+            still sends a market-maker order bound to your `sol_wallet`, which
+            can be refused when the wallet cannot cover the rent of a token
+            account the trade opens; that refusal reads `no_market_maker_fill`.
 
             `cross_chain_wallet_missing`: under `priority: "speed"`, a buy
             could only be served cross-chain from a chain whose wallet the
@@ -2765,6 +2807,36 @@ components:
             was refused or could not land. Not a holdings problem: pay out on
             another chain, send no `payout_chain` to sell each position on its
             own chain, or re-quote later.
+
+            `cross_chain_route_unavailable`: a `priority: "speed"` buy only.
+            Another of your wallets holds enough to fund the order (on
+            `/quote/preview`, which reads no balance, the whole amount is assumed
+            to sit on `origin_chain`, `sol` when absent), but no cross-chain
+            route reached the leg: the route was refused or could
+            not be completed, or the listing has none on that chain (on Solana,
+            a leg your `sol_wallet` cannot fund is never served on its own chain
+            instead; an `eth` leg never is under `"speed"`). `warnings[]` names
+            each such leg with its own `reason`. Fund the named leg's own chain
+            and re-quote; a refused route may also clear on a later re-quote.
+        warnings:
+          type: array
+          description: |
+            Present only on a `priority: "speed"` buy or preview refusal that
+            dropped legs it would otherwise have disclosed, or left out listings
+            it never quotes. Two codes appear today, each once per
+            `chain`/`protocol`: `cross_chain_route_unavailable` (the same entry
+            a served quote's `warnings[]` carries for that leg), and
+            `speed_route_unavailable` with `reason: no_speed_venue`, naming a
+            listing whose own-chain venue `"speed"` never tries (an `eth` or
+            `bnb` gasless order, or Reality on `arbitrum`). An `eth` listing
+            can carry both codes: its cross-chain route was tried and failed,
+            and its own-chain venue was not tried. A `no_speed_venue` entry
+            means the same request without `priority` would ask that venue:
+            retry without it if a fill that can take minutes is acceptable. A
+            listing whose session is closed is not named. Handle an unrecognised `code` as described
+            under `TradeWarning`. A refusal carries no `warnings_ack_token`:
+            there is nothing to submit.
+          items: { $ref: "#/components/schemas/TradeWarning" }
       additionalProperties: false
 
     BasketPriceUnavailableError:
@@ -2869,15 +2941,28 @@ components:
             Same semantics as the ticker-level `min_trade_size_usd`: **absent means
             no minimum is known**, never zero, and it is advisory rather than a gate.
             Present only when the probe has measured this specific cell recently.
+            **Firm, taker-bound:** on a cell a market maker fills, each size is
+            asked as a quote bound to a funded wallet, so the minimum is a size a
+            market maker quoted to fill for a funded taker, not a price-only
+            preview (a pool-priced cell's quote is binding already). Until a cell
+            has been measured this way it may keep its earlier figure for a
+            transition period. Market makers' own minimums move by day, so a
+            smaller order may still be refused; the refusal then names a size in
+            `min_notional_usdc`. A
+            position worth less than this may not be sellable on Solana until it
+            is topped up, so avoid partial sells that leave less than it behind.
         eth_min_trade_size_usd:
           type: integer
-          description: Per-cell measured minimum for this protocol on Ethereum. See `sol_min_trade_size_usd`.
+          description: >
+            Per-cell measured minimum for this protocol on Ethereum. Same presence and
+            advisory semantics as `sol_min_trade_size_usd`, but measured from price quotes
+            for an unfunded wallet, so it is an estimate rather than a firm one.
         bnb_min_trade_size_usd:
           type: integer
           description: >
             Per-cell minimum for this protocol on BNB Smart Chain (56): measured, or the
-            venue's own floor where it is known before measurement, whichever is higher. See
-            `sol_min_trade_size_usd`. Rides the same conditional as
+            venue's own floor where it is known before measurement, whichever is higher.
+            Measured like `eth_min_trade_size_usd`. Rides the same conditional as
             `bnb_address`: always absent while the bnb venue is closed, and while this
             protocol has no 56 deployment for the ticker.
         sol_tradability:
@@ -4208,7 +4293,8 @@ components:
             on a buy leg, but published only when `warn_reason` is side-neutral (see below), so a
             sell leg carries all three keys or none. **Advisory, never a block**: nothing here
             refuses an exit. No `min_trade_size_usd` accompanies a sell anywhere on the API: it is a
-            USD buy floor while a sell is denominated in shares.
+            USD buy floor while a sell is denominated in shares. A sell refused for its size names
+            its own minimum instead, as `min_notional_usdc` on the `no_routes` refusal.
         warn_reason:
           $ref: '#/components/schemas/SideNeutralWarnReason'
           description: >
@@ -4556,6 +4642,12 @@ components:
             code other than Modular Account v2 on the named chain), where `disabled` then
             also carries `chain` when it means "no bundler serves this chain yet". A missing router
             allowance is not a reason: the quote bundles the approve instead (`SignableEvmTx`).
+            One more reason rides only a `no_routes` refusal (`NoRoutesError.warnings[]`), never a
+            served quote: `no_speed_venue`, which also carries `protocol` and names a chain the
+            speed route does not serve that listing on (`eth`, `bnb` or `arbitrum`). The named
+            listing exists for this ticker but its own-chain venue is one `"speed"` never quotes
+            (a gasless order that can take minutes to fill), so that venue was not tried. Re-quote
+            without `priority` to reach it.
             The list is **open**: this object does not restrict its properties, and a future release
             may add a value. Branch on the ones you handle and treat anything else as
             "speed route unavailable, reason unknown" rather than an error.
@@ -4568,8 +4660,12 @@ components:
             and that can be reached cross-chain (`eth/ondo`, `sol/xstocks`, `sol/backpack`,
             `base/coinbase`, `bnb/bstocks`),
             could not be served cross-chain and **fell back** to today's plan for that cell instead
-            (a dropped same-chain speed leg, a sol leg you could not fund, or (on eth) no leg at
-            all, since eth is never served on its gasless route under `"speed"`). Carries `chain`, `protocol` and
+            (a dropped same-chain speed leg on base or bnb, or no leg at all on sol and eth: a sol
+            leg your `sol_wallet` cannot fund is never served, and eth is never served on its
+            gasless route under `"speed"`). It also names a sol cell with no cross-chain route
+            (such as `sol/ondo`) that your `sol_wallet` cannot fund while another of your wallets
+            could: `reason: no_routes`, and no leg. When nothing is left to serve, the same entries
+            ride the refusal's `NoRoutesError.warnings[]`. Carries `chain`, `protocol` and
             `reason`, a closed set today: `no_routes`, `over_max` (above the cross-chain ceiling),
             `fee_unavailable`, `disabled`, `provider_error`, `wallet_not_delegated`, and
             `wallet_missing`, which this API has never yet emitted on this code (a missing origin
@@ -4596,8 +4692,9 @@ components:
             A balance that could not be read is not warned. Also sent on `quote_only`; never sent by
             `POST /quote/preview`, which quotes no wallet of yours.
             `cross_chain_route_unavailable` and `exit_gas_unfunded` appear once
-            per affected `chain`/`protocol` pair; every other code appears at most once per
-            response.
+            per affected `chain`/`protocol` pair, `speed_route_unavailable` once per `chain` (once
+            per `chain`/`protocol` pair for `no_speed_venue`), and `speed_route_unpriced_gas` once
+            per `chain`; every other code appears at most once per response.
             Every other `code` value is the routed cell's own `WarnReason`.
       additionalProperties: true
 
@@ -4726,7 +4823,11 @@ components:
         chain: { $ref: "#/components/schemas/Chain" }
         protocol: { $ref: "#/components/schemas/Protocol" }
         side: { type: string, enum: [buy, sell] }
-        tx_hash: { type: [string, "null"] }
+        tx_hash:
+          type: [string, "null"]
+          description: >-
+            The leg's transaction hash or signature. On a `failed` same-chain `sol` leg it is the
+            signature the execution venue reported, which may not exist on chain.
         order_hash: { type: [string, "null"] }
         user_op_hash:
           type: [string, "null"]
@@ -5008,7 +5109,11 @@ components:
           type: string
           enum:
             [broadcast, broadcast_unknown, completed, failed, broadcast_failed]
-        tx_hash: { type: [string, "null"] }
+        tx_hash:
+          type: [string, "null"]
+          description: >-
+            The leg's transaction hash or signature. On a `failed` same-chain `sol` leg it is the
+            signature the execution venue reported, which may not exist on chain.
         order_hash: { type: [string, "null"] }
         user_op_hash:
           type: [string, "null"]
@@ -5021,15 +5126,25 @@ components:
           description: >-
             Per-leg failure reason: its own open vocabulary, never an HTTP `error` code:
             `invalid_signature`, `quote_expired`, `not_enough_balance_or_allowance`,
-            `provider_error`, `status_check_exhausted`, one that only a `user_operation` leg can
+            `provider_error`, `status_check_exhausted`, two that only a same-chain `sol` leg can
+            carry, namely `market_maker_rejected` (the market maker refused the fill: re-quote,
+            possibly at another size) and `not_landed` (the transaction was reported as failing to
+            land; whether it can still land later is not established, so when the leg carries a
+            `tx_hash`, check it before trading the same size again; a wallet short of the token the
+            leg spends also ends here, since its balance is not checked before sending), one that
+            only a
+            `user_operation` leg can
             carry, namely `sponsorship_rejected` (your paymaster refused to sponsor the op: deposit,
             stake, rate limit, policy signature or a paymaster revert; nothing was submitted;
-            re-sponsor and re-sign), and four that only a speed-route leg can
-            carry, namely `nonce_conflict` (another transaction from this wallet took the nonce: wait for
-            the earlier trade to go terminal, then re-quote), `insufficient_native_gas` (the signed
+            re-sponsor and re-sign), and five that a speed-route leg can carry, all but
+            `swap_reverted` only there, namely `nonce_conflict` (another transaction from this
+            wallet took the nonce: wait for the earlier trade to go terminal, then re-quote), `insufficient_native_gas` (the signed
             `gas × fee` exceeds the wallet's native balance: fund it, then re-quote), `swap_reverted`
             (the swap reverted in simulation or on chain; nothing was spent on a simulation revert;
-            re-quote), `tx_dropped` (accepted by the node, then evicted without mining: re-quote and
+            re-quote; a same-chain `sol` leg carries it too, when the transaction was reported as
+            failed by the execution venue with an on-chain program error; its signature is on
+            `tx_hash`),
+            `tx_dropped` (accepted by the node, then evicted without mining: re-quote and
             re-sign), and `approve_failed` (a bundled `approve` reverted, or did not land within 10
             minutes, so the swap was never sent: re-quote; if the approve did mine, the new quote
             is single-payload). On any pair whose swap was never sent (`approve_failed`, and a
