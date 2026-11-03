@@ -2753,6 +2753,13 @@ components:
             your own wallet when asked again at refusal time, or otherwise a
             minimum we measured for the listing.
 
+            Whenever `reason` is `amount_too_small`, it is present if any venue
+            that refused for size has a known floor above your order, even when
+            other venues refused for another reason. It then describes only the
+            venues that refused for size: a venue refused for another reason
+            (for example `insufficient_gas` on a Solana leg) still needs its own
+            remedy.
+
             On `/quote/sell` it is a USDC value, not a share count: the shares
             the quote could not place (the whole order, unless other legs could
             take part of it), valued at the reference price, fell short of it.

@@ -16,6 +16,22 @@ working unchanged. Entries that need action from you are marked **⚠ Action**.
 
 ---
 
+## 2026-11-04: b2b `1.22.1`
+
+A size refusal now names its minimum even when some venues refused for another reason. Additive: a
+`1.22.0` caller keeps working unchanged.
+
+### treasures-b2b-api `1.22.1`: minimums on mixed refusals
+
+- **`min_notional_usdc` on more `amount_too_small` refusals.** Whenever a `422 no_routes` has
+  `reason: "amount_too_small"`, it now carries `min_notional_usdc` if any venue that refused for
+  size has a known minimum above your order, even when other venues refused for another reason.
+  Before, such a refusal could come back with the reason and no number. Applies to `/quote/buy`,
+  `/quote/preview` and `/quote/sell`; on a sell it is a USDC value, never a share count.
+- **The number covers only the venues that refused for size.** A venue refused for another reason,
+  for example `insufficient_gas` on a Solana leg, still needs its own fix: an order at or above the
+  minimum can reach the venues that refused for size, not that one.
+
 ## 2026-11-02: b2b `1.22.0`
 
 A `422 no_routes` that used to come back bare now says why and names a minimum size where one is
