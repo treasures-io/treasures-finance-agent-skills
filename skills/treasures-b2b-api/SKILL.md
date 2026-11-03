@@ -2,7 +2,7 @@
 name: treasures-b2b-api
 description: Use to build an AI agent on the Treasures public B2B API — discover tokenized stocks, quote/execute trades on Solana, Ethereum, Robinhood Chain, Base and BNB Smart Chain, bridge USDC between any two of those chains (plus Arbitrum), and read portfolio + trade history for a single end-user wallet pair. Covers endpoint selection, ownership-proof signing (incl. embedded wallets), trade/bridge execution, and error handling.
 metadata:
-  version: "1.22.0"
+  version: "1.22.1"
 tags:
   - treasures
   - b2b-api
@@ -23,7 +23,7 @@ Guide for AI agents (and any non-human caller) using the Treasures public B2B AP
 
 - **Base URL:** `https://api.treasures.io/public/v1`
 - **Network:** trades execute against **Ethereum mainnet + Solana mainnet-beta — real funds, not a testnet**, plus three more venues: **Robinhood Chain (4663)** — now co-ranked in unpinned quotes, not just pinned — **Base (8453)**, and **BNB Smart Chain (56)**, which carries more than one issuer (trap 11). Point your own RPCs at mainnet; the token/contract addresses in this skill are mainnet.
-- **Required headers:** set `Content-Type: application/json` on every request carrying a body: a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.22.0` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions, plus `Deprecation`/`Sunset` warning headers during the grace window, instead of a silent break. Omitting the version header opts out of that early warning.
+- **Required headers:** set `Content-Type: application/json` on every request carrying a body: a body sent with a **non-JSON** content-type (e.g. `text/plain`, which some HTTP clients default to when you don't set headers) fails `415` before any schema check. Also send `X-Treasures-Skill: treasures-b2b-api` and `X-Treasures-Skill-Version: 1.22.1` (this skill's `metadata.version`): today they're informational (the fund-moving endpoints echo `X-Treasures-Api-Revision` + `X-Min-Skill-Version` back), but once the API floor rises, an enrolled caller below it gets a clean `426 skill_version_unsupported` with upgrade instructions, plus `Deprecation`/`Sunset` warning headers during the grace window, instead of a silent break. Omitting the version header opts out of that early warning.
 - **Wire format:** all token amounts, USDC, shares, prices, and bps-derived decimals are **strings** (avoid JS float drift). Integer fields (`expires_at`, `*_bps`, `quote_index`) are JSON numbers. Never round-trip a money value through JS `number`.
 
 This entry doc is the map + the footguns. **It is not enough on its own to execute a trade** — full schemas, signing code, and error tables live in the references below. **Load the reference for the task before you act; you don't need to read them all.**
@@ -164,7 +164,7 @@ ages, then a hard stop once stale. Route **every** call through one helper that 
 
 ```ts
 const SKILL_NAME = 'treasures-b2b-api';
-const SKILL_VERSION = '1.22.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.22.1'; // = SKILL.md metadata.version
 
 // Route EVERY Treasures API call through this — don't call fetch() directly. It attaches the
 // skill version and applies the gate to every response: 426 hard-stops, deprecation warns.
