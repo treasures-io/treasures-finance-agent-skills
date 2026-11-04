@@ -11,10 +11,99 @@ A skill's `metadata.version` is what the API's version gate reads. The **plugin*
 **To update:** `npx skills add treasures-io/treasures-finance-agent-skills`, or in Claude Code
 `/plugin marketplace update`. See the [README](README.md) for all install options.
 
-Every release so far has been **additive on the request** — a caller on an older version keeps
-working unchanged. Entries that need action from you are marked **⚠ Action**.
+Most releases are **additive on the request**: a caller on an older version keeps working unchanged.
+Entries that need action from you are marked **⚠ Action**. Wallet `1.7.0` and `1.10.0` are the first
+releases that can break an existing caller (a trade-only API key, an SMA wallet).
 
 ---
+
+## 2026-11-04: wallet `1.10.0`
+
+Catches the published `treasures-wallet` skill up from `1.4.0` to `1.10.0`. Versions `1.5.0` to
+`1.10.0` went live on the API between 2026-10-14 and 2026-10-26 without a release here, so the API's
+`X-Treasures-Skill-Latest` header named versions you could not install. Each version is listed below
+so you can see what changed. Two **⚠ Action** items:
+
+- **Trade-only API keys** can no longer poll their trades (`1.7.0`).
+- **SMA wallets** are no longer an agent surface (`1.10.0`).
+
+### treasures-wallet `1.5.0`: BNB Smart Chain and bStocks (2026-10-14)
+
+- **`protocol: "bstocks"`** on `GET /wallets/:id/quotes` and `POST /wallets/:id/trades`. bStocks lists
+  on BNB Smart Chain (56) only.
+- **BNB Smart Chain has no `chain` value on this plane.** Its three cells (`ondo`, `xstocks` and
+  `bstocks`) are reached by auto-routing: omit `chain`, and pin `protocol: "bstocks"` to force the
+  bStocks cell (with `chain` set it is `400 invalid_request`).
+- **A 56-routed quote echoes `chain: "ethereum"`**, so read `protocol` there. The job view and
+  `/balances` report the real chain code `bnb`.
+- **18-decimal base currency.** On BNB Smart Chain the base currency is 18-decimal Binance-Peg USDC.
+  Read decimals per chain, never from the asset name, and never sum it with USDC on another chain.
+- **Gas is BNB on 56**, not ETH. `/balances` `native` carries a `bnb` row.
+- `/balances` can report `bnb` and `bstocks` values whether or not the venue is open, and a 56
+  position you hold keeps reporting and still sells.
+
+### treasures-wallet `1.6.0`: SMA wallets (2026-10-20)
+
+- `GET /wallets/me` gains `sma_wallets[]`. Its main-wallet fields are `null` for an identity that
+  holds only SMA wallets.
+- This release also added an SMA mint option to onboarding sessions. `1.10.0` removed it again
+  (below).
+
+### treasures-wallet `1.7.0`: list a wallet's trades (2026-10-22)
+
+- **New `GET /wallets/:id/trades`**: the wallet's trade jobs, keyset-paged (`limit`, `cursor`,
+  `state`), returning `{data, next_cursor, has_more}`. Scope `quote`.
+- **⚠ Action: the trade poll moved to scope `quote`.** `GET /wallets/:id/trades/:job_id` needs scope
+  `quote` instead of `trade`. A default key holds both scopes and sees no change. A key created with
+  `trade` only now gets `403 insufficient_scope` on the poll: create a key that holds both.
+
+### treasures-wallet `1.8.0`: withdraw pins (2026-10-20)
+
+- **Owner plane** (the agent's API key cannot call these): `PUT` and `GET /wallets/:id/withdraw-pins`
+  set and read up to 4 EVM and 4 Solana destinations per wallet, plus optional per-transaction caps.
+  A pin write must be owner-signed before it applies.
+- **New withdrawal refusal codes** an agent may relay:
+  - `destination_not_pinned` (422);
+  - `withdraw_cap_exceeded` with `{cap: "per_tx"}` (422);
+  - `pins_required` (400, `PUT` only);
+  - `policies_stale` (409);
+  - `withdraw_pins_unavailable` (503).
+
+### treasures-wallet `1.9.0`: client dashboard reads (2026-10-22)
+
+- Documents the existing reads a client dashboard needs, with no dedicated endpoint:
+  - signer state, `GET /wallets/:id/delegation` (public);
+  - keys, `GET /wallets/:id/api-keys` (owner);
+  - policy state, `GET /wallets/:id/policy-migration/spec` (owner).
+- This release also listed an SMA NAV read. `1.10.0` removed it from the skill.
+
+### treasures-wallet `1.10.0`: SMA wallets leave the agent surface (2026-10-26)
+
+- **⚠ Action, only if you used SMA wallets:**
+  - an API key on an SMA wallet answers `404 wallet_not_found`;
+  - the onboarding-session SMA mint option is gone: a mint body carrying `wallet` answers
+    `410 sma_onboarding_retired`;
+  - `sma_wallet_limit` leaves the error table, and `GET /wallets/:id/nav` is no longer part of the
+    skill.
+- A caller that never used an SMA wallet sees no change.
+
+---
+
+## 2026-11-04: b2b `1.22.1`
+
+A size refusal now names its minimum even when some venues refused for another reason. Additive: a
+`1.22.0` caller keeps working unchanged.
+
+### treasures-b2b-api `1.22.1`: minimums on mixed refusals
+
+- **`min_notional_usdc` on more `amount_too_small` refusals.** Whenever a `422 no_routes` has
+  `reason: "amount_too_small"`, it now carries `min_notional_usdc` if any venue that refused for
+  size has a known minimum above your order, even when other venues refused for another reason.
+  Before, such a refusal could come back with the reason and no number. Applies to `/quote/buy`,
+  `/quote/preview` and `/quote/sell`; on a sell it is a USDC value, never a share count.
+- **The number covers only the venues that refused for size.** A venue refused for another reason,
+  for example `insufficient_gas` on a Solana leg, still needs its own fix: an order at or above the
+  minimum can reach the venues that refused for size, not that one.
 
 ## 2026-11-02: b2b `1.22.0`
 
@@ -615,9 +704,5 @@ shipped standalone.
 
 ## Known limitations
 
-- **The `treasures-wallet` skill does not participate in the version gate.** It sends no
-  `X-Treasures-Skill-Version` and does not act on `Deprecation`/`Sunset`/`426`. It is therefore
-  treated as a generic client — never gated, but never warned either. Until that lands, this
-  changelog is the only place a wallet-skill update is announced. Tracked upstream.
-- **No `X-Min-Skill-Version` floor has ever been raised.** It sits at `1.0.0` and every release to
-  date has been additive, so no version of either skill has been blocked or deprecated.
+- **No `X-Min-Skill-Version` floor has ever been raised.** It sits at `1.0.0`, so no version of
+  either skill has been blocked or deprecated.

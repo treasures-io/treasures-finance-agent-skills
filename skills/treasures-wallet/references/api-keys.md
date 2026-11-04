@@ -6,9 +6,10 @@ never persisted/logged — only `sha256(secret)` is stored. A lost key cannot be
 
 ## Scopes
 `['trade', 'quote']` (default: both). Enforced at auth:
-- `quote` → `GET /wallets/:id/quotes`. Missing → **403** `insufficient_scope`.
-- `trade` → `POST /wallets/:id/trades` **and** `GET /wallets/:id/trades/:job_id` (the status poll is
-  gated like its create sibling — the poller is the trade's creator). Missing → **403** `insufficient_scope`.
+- `quote` → `GET /wallets/:id/quotes`, `GET /wallets/:id/trades` (the trades list) **and**
+  `GET /wallets/:id/trades/:job_id` (the status poll). Missing → **403** `insufficient_scope`.
+- `trade` → `POST /wallets/:id/trades`. Missing → **403** `insufficient_scope`.
+- Scopes are flat — `trade` does not imply `quote`, so a trade-only key cannot poll or list its own jobs.
 
 ## Caps (per-key spend limits) — all optional
 ```json
