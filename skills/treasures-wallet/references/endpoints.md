@@ -14,18 +14,24 @@ policies:[{chain,scope,owner_quorum_id}], created_at }`. Use once to resolve + c
 `wallet_not_found`.
 
 ### `GET API/wallets/:id/balances` — auth `none`
-→ `{ native:{sol,eth,robinhood,base,arbitrum}, stablecoins:[{chain,asset,amount}],
+→ `{ native:{sol,eth,robinhood,base,arbitrum,bnb}, stablecoins:[{chain,asset,amount}],
 positions:[{issuer,asset,chain,token_address,raw_token,shares,usd_per_token,usd_per_share,notional_usd}],
-needs_funding, as_of }`. `chain` ∈ `sol|eth|robinhood|base|arbitrum`, `issuer` ∈
-`ondo|xstocks|backpack|robinhood|coinbase|reality`. Only `sol`/`eth` positions with issuer
-`ondo`/`xstocks`/`backpack` are tradeable on this plane (`backpack` on `sol` only); the rest are
-reported for completeness. A `backpack` position carries the bare ticker as its token symbol on the
+needs_funding, as_of }`. `chain` ∈ `sol|eth|robinhood|base|arbitrum|bnb`, `issuer` ∈
+`ondo|xstocks|backpack|robinhood|coinbase|reality|bstocks`. Only `sol`/`eth`/`bnb` positions with issuer
+`ondo`/`xstocks`/`backpack`/`bstocks` are tradeable on this plane (`backpack` on `sol` only, `bstocks`
+on `bnb` only); the rest are reported for completeness. ⚠ `bnb` carries up to three issuers (`ondo`,
+`xstocks`, `bstocks`), so a 56 position's cell is `(chain, issuer)`: grouping bnb positions by `chain`
+alone merges three of them. A `bnb` `stablecoins` entry is 18-decimal **Binance-Peg USDC**: still
+`asset: "USDC"` on the wire, a different token from USDC on every other chain, never to be summed with
+them. A `backpack` position carries the bare ticker as its token symbol on the
 `READS` routes (no `on`/`x` suffix), so branch on `issuer`, never on the symbol's shape.
 Both unions, and the `native` keys, are open: each new chain or issuer adds a value, so never fail a
 parse on one you don't recognise.
 `native.robinhood` (4663 Orbit L2), `native.base` (8453 OP-Stack L2) and `native.arbitrum` (42161
-Arbitrum One) are native ETH held by the same EOA as `native.eth` — raw amounts only, no USD (for gas
-valued in USD see the B2C portfolio reads, D-NativeInPortfolio).
+Arbitrum One) are native ETH held by the same EOA as `native.eth`; **`native.bnb` (BNB Smart Chain 56)
+is BNB, not ETH**, the only chain here whose gas token is not ether. Raw amounts only, no USD (for gas
+valued in USD see the B2C portfolio reads, D-NativeInPortfolio). 56 rows are reported whether or not the
+bnb venue is open for new trades.
 `needs_funding` is true only when **every** `native` entry is zero, so a 4663-only funded wallet is not
 "needs funding" — the flag is coarse by design; per-chain readiness is derivable from `native`.
 
@@ -40,8 +46,9 @@ staleness cannot un-gas a wallet.)
 → `{ app_enabled, signers:[{role,app_enabled}] }`. Is delegated trading enabled.
 
 ### `GET API/wallets/:id/quotes` — auth `key:quote` (or `owner`)
-Query (`.strict`): `chain?` (`solana|ethereum`), `protocol?` (`ondo|xstocks|backpack`; `backpack` is
-Solana-only, so pair it with `solana` or omit `chain`; with `ethereum` it is `400 invalid_request`),
+Query (`.strict`): `chain?` (`solana|ethereum`), `protocol?` (`ondo|xstocks|backpack|bstocks`; `backpack` is
+Solana-only, so pair it with `solana` or omit `chain`; with `ethereum` it is `400 invalid_request`;
+`bstocks` lists only on BNB Smart Chain, which has no `chain` value here, so omit `chain` with it),
 `side` (`buy|sell`),
 `asset`, **exactly one of** `notional_usdc` (buy) / `shares` (sell), `slippage_bps` (int, ≤ 500).
 Omit `chain`/`protocol` → auto-route (single best cell). **Buy** →
@@ -50,6 +57,14 @@ atomic strings; `chain`/`protocol` are the **resolved** cell. **Sell** →
 `{ side, asset, route_type:"dex_aggregator", legs:[{ chain, protocol, shares_consumed, max_amount_in,
 min_amount_out }] }` — one entry per cell the sell draws from. Errors: 400, 403 cap, 422
 `quote_unavailable`/`asset_not_whitelisted`, 503 `routing_unavailable`.
+
+⚠ **BNB Smart Chain (56) is reachable only by auto-routing, and the echoed `chain` is lossy.** 56
+contributes up to three candidate cells (`ondo`, `xstocks`, `bstocks`) while the venue is open for you,
+but it has no `chain` pin here, and every EVM chain echoes `chain: "ethereum"` on this response: a
+56-routed quote returns `{ chain: "ethereum", protocol: "bstocks" | "ondo" | "xstocks" }`. **Read
+`protocol`** (and, for `ondo`/`xstocks`, the job view or `/balances`, which report the real chain code
+`bnb`). A 56 leg settles in 18-decimal Binance-Peg USDC, so its atomic `max_amount_in` /
+`min_amount_out` are 18-dp on the stablecoin side.
 
 A 422 `quote_unavailable` may carry an optional `reason` naming the finer cause. `price_implausible`
 means the quote sits so far from the market price that we do not trust our own arithmetic and will not
@@ -152,8 +167,15 @@ Body also accepts an **optional** `acknowledged_warnings` (the preview's `warnin
 The execute-time re-quote runs the same price-check as `GET /quotes`, so a 422 here carries the same
 optional `reason`.
 
-### `GET API/wallets/:id/trades/:job_id` — auth `key:trade` (or `owner`)
-Same credential as `POST /trades` — the poller is the trade's creator. → job. State machine
+### `GET API/wallets/:id/trades` — auth `key:quote` (or `owner`)
+The wallet's jobs, newest first, each in the **job shape** below. Query: `limit` (1–100, default 20),
+`cursor` (echo `next_cursor` verbatim), optional `state`. → `{ data: [job…], next_cursor, has_more }`;
+a page can be short while `next_cursor` is set — keep paging until it is null. Rate limit: its own
+120/min per-IP bucket (separate from the by-id poll's 30/min). Errors: 400 (unknown
+param / malformed cursor), 401, 403 `insufficient_scope`.
+
+### `GET API/wallets/:id/trades/:job_id` — auth `key:quote` (or `owner`)
+Same read scope as the list (a trade-only key is refused). → job. State machine
 `routing → simulating → signing → broadcast → {confirmed|failed|rejected}`. Errors: 401, 403
 `insufficient_scope`, 404 `job_not_found` (also if the job belongs to another wallet).
 
@@ -161,6 +183,14 @@ Same credential as `POST /trades` — the poller is the trade's creator. → job
 attempts, result, created_at, updated_at }`. At `confirmed`: `result = { amount_in, amount_out, tx_sig }`
 (atomic). EVM: `tx_sig` at `broadcast` = the order hash; `result.tx_sig` at `confirmed` = on-chain
 fill. `failed`/`rejected` ⇒ no funds moved.
+
+⚠ **The job's `chain` is the INTERNAL code** (`sol|eth|bnb`), not the `solana|ethereum` the request and
+quote response speak, and `protocol` ∈ `ondo|xstocks|backpack|bstocks`. It is the one trade surface on
+this plane that tells you a trade settled on BNB Smart Chain by its `chain` field.
+
+**Dashboard reads (no dedicated endpoint):** `GET /:id/delegation` (signer granted: `app_enabled`,
+`signers[]`; public) · `GET /:id/api-keys` (owner) · `GET /:id/policy-migration/spec` (`migrated`,
+`specs`; owner).
 
 ## Reads plane — `READS/...` (auth `none`)
 
@@ -177,21 +207,44 @@ status}], next_offset }`. `internal` = Treasures-executed; `external` = on-chain
 
 ## Onboarding plane — `API/onboarding-sessions/...`
 See [`onboarding.md`](onboarding.md). Mint (`none`) · consent `GET /:requestId` (`none`) · complete
-`POST /:requestId/complete` (`owner`) · poll `POST /poll` (`device`).
+`POST /:requestId/complete` (`owner`) · poll `POST /poll` (`device`). A mint body carrying a `wallet`
+key → 410 `sma_onboarding_retired` (SMA wallets are not minted here).
 
 ## Owner plane — `API/wallets/...` (auth `owner`; the agent's API key CANNOT call these)
 
 | Method + path | Purpose | Returns |
 |---|---|---|
-| `POST API/wallets` | provision wallet (body `{}`) | 201/200 `{…walletSummary, email, needs_funding}` |
-| `GET API/wallets/me` | own wallet by identity | 200 `{…, email}` / 404 |
+| `POST API/wallets` | provision wallet (body `{}`); **main only** | 201/200 `{…walletSummary, email, needs_funding}` |
+| `GET API/wallets/me` | own wallet(s) by identity | 200 `{…main fields (null if SMA-only), email, sma_wallets:[{id,strategy_ref,status,sol_address,evm_address,policies_migrated}]}` / 404 if neither exists |
 | `POST API/wallets/:id/api-keys` | create key | 201 `{api_key, key_id, scopes, caps}` (plaintext once) |
 | `GET API/wallets/:id/api-keys` | list keys | `{api_keys:[{key_id,scopes,caps,last_used_at,revoked_at}]}` |
 | `DELETE API/wallets/:id/api-keys/:key_id` | revoke (idempotent) | `{revoked:true}` |
 | `GET API/wallets/:id/delegation/grant-spec` | per-chain inputs for client-side Privy grant | `{specs:[{chain,address,signerId,policyIds}]}` |
 | `POST API/wallets/:id/delegation/enable` | enable delegated trading (409 if not granted) | `{app_enabled,signers}` |
 | `POST API/wallets/:id/delegation/disable` | disable | `{app_enabled,signers}` |
-| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); no size cap — unsupported asset/chain pairing → `422 unsupported_withdrawal` | unsigned tx |
+| `POST API/wallets/:id/withdrawals` | build UNSIGNED withdrawal tx (owner signs client-side); gated by withdraw pins if any are set (below) | unsigned tx |
+| `PUT API/wallets/:id/withdraw-pins` | main or SMA wallet: set/replace/clear (`{}`) destination pins + per-tx caps; every write that changes the pins (a `{}` clear included; an identical re-PUT changes nothing) must be signed via the existing policy-migration spec/apply flow before it takes effect | 200 `{pins, policies_migrated, next?}` (`next: "policy-migration"` while a signature is owed) |
+| `GET API/wallets/:id/withdraw-pins` | read the stored pins and whether the bases have signed them | 200 `{pins, policies_migrated}` |
+
+**Withdraw pins (W3a).** An owner may pin ≤ 4 EVM addresses and ≤ 4 Solana **owner** addresses (a wallet, or a PDA such as a Squads vault)
+per wallet, plus an optional `per_tx_cap_usdc` and per-chain `per_tx_cap_native`. Until the pin write is
+owner-signed, withdrawals answer `409 policies_stale`. Pre-check error codes an agent or client may see on
+`POST .../withdrawals` (and its `/apply`, and the owner plane's copy-fund equivalent):
+
+| Code | Meaning |
+|---|---|
+| `destination_not_pinned` (422) | the recipient is not one of the signed pins for that chain family |
+| `withdraw_cap_exceeded` (422, `{cap:'per_tx'}`) | the amount exceeds the signed per-tx cap |
+| `pins_required` (400, PUT only) | a cap was set with no destination pinned for that family |
+| `policies_stale` (409) | the pin write exists but has not been owner-signed yet |
+| `withdraw_pins_unavailable` (503) | the pins store could not be read — fails closed, never treated as unpinned |
+| `withdraw_tx_invariant` (500, outside the refusal vocabulary) | the backend's own built transaction broke a pin the intent already passed — a backend fault, not a caller error |
+
+⚠ **Solana pins are the destination's associated token account per stable mint, never the owner
+address** (`TransferChecked.destination` is compared literally; an owner address in the pin list does
+NOT match that owner's ATA). ⚠ **The per-tx cap is enforced per instruction in Privy's policy, not per
+transaction** — the backend separately bounds the sum of transfer instructions in one transaction before
+building it, but a client that signs its own bytes is bounded only by the per-instruction TEE rule.
 
 Source of truth: `src/api/routes/api/v1/wallets.ts`, `src/api/routes/api/v1/onboarding-sessions.ts`,
 `src/api/routes/public/v1/{trades,portfolio}.ts`; mounts in `src/api/index.ts`.

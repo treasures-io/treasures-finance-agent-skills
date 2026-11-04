@@ -4,11 +4,11 @@ description: >
   Operate a Treasures delegated wallet over the HTTP API: onboard (provision a wallet + mint a
   scoped API key), get quotes, execute buys/sells (async, server-signed — the agent NEVER signs),
   read balances/portfolio/trade-history, and manage API keys. Trigger whenever an agent needs to
-  trade tokenized equities (xStocks / Ondo / Backpack) vs USDC on a Treasures wallet, check a Treasures wallet
+  trade tokenized equities (xStocks / Ondo / Backpack / bStocks) vs USDC on a Treasures wallet, check a Treasures wallet
   balance or P&L, or set up Treasures wallet access. The agent needs only HTTPS + an API key — no
   web3 libraries, no private keys, no RPC.
 metadata:
-  version: "1.4.0"
+  version: "1.10.0"
 tags:
   - treasures
   - delegated-wallet
@@ -18,6 +18,8 @@ tags:
   - xstocks
   - ondo
   - backpack
+  - bstocks
+  - bnb-smart-chain
   - tokenized-equities
   - api-key
 ---
@@ -52,29 +54,41 @@ agent to hold a private key — the whole point of this design is that it doesn'
     once from `GET API/wallets/:id` (`addresses.{solana,evm}`) and cache.
 - **Auth is split:**
   - **Writes + quotes + trade-status poll** require `X-API-Key: twk_…` (scopes `quote` / `trade`,
-    optional caps). The poll (`GET /wallets/:id/trades/:job_id`) takes the **same `trade` key** as the
-    `POST` that created the job — it exposes the trade intent + outcome, so it is not keyless.
+    optional caps). The poll (`GET /wallets/:id/trades/:job_id`) and the trades list
+    (`GET /wallets/:id/trades`) need scope **`quote`** — they expose the trade intent + outcome, so
+    they are not keyless. A default key holds both scopes; a trade-only key cannot poll or list its jobs.
   - **Reads** (balances, history, portfolio, `GET /wallets/:id`, delegation state) need **no key** —
     public + IP-rate-limited, scoped by the address/id in the request.
-- **Chain/protocol naming maps between layers:** a tradeable position reports `chain: "sol"|"eth"` and
-  `issuer: "ondo"|"xstocks"|"backpack"`; quote/trade params take `chain: "solana"|"ethereum"` and
-  `protocol: "ondo"|"xstocks"|"backpack"`. **Map `sol→solana`, `eth→ethereum`** when feeding a held
+- **Chain/protocol naming maps between layers:** a tradeable position reports `chain: "sol"|"eth"|"bnb"` and
+  `issuer: "ondo"|"xstocks"|"backpack"|"bstocks"`; quote/trade params take `chain: "solana"|"ethereum"` and
+  `protocol: "ondo"|"xstocks"|"backpack"|"bstocks"`. **Map `sol→solana`, `eth→ethereum`** when feeding a held
   position back into a quote/trade. (Responses echo `solana`/`ethereum`.) `backpack` exists on Solana
   only: pair it with `chain: "solana"` or omit `chain`; with `ethereum` it is `400 invalid_request`.
+- **BNB Smart Chain (56) has no `chain` value on this plane.** It carries three cells (`ondo`, `xstocks`
+  and `bstocks`, which lists on 56 alone), reached only by auto-routing: omit `chain`, and pin
+  `protocol: "bstocks"` to force the bStocks cell (with `chain` set it is `400 invalid_request`). ⚠ A
+  56-routed quote **echoes `chain: "ethereum"`** (every EVM chain maps to `ethereum` on the quote
+  response), so read `protocol` there; the **job view** and **`/balances`** report the real chain code
+  `bnb`. 56 buys can be switched off server-side (the venue, or bStocks alone): those cells then simply
+  never appear in the buy candidate set, with nothing to feature-detect. A 56 position you already hold
+  keeps reporting on `/balances` and still sells.
   `/balances` can also list positions on other chains (`robinhood`, `base`, `arbitrum`) that this
   plane reads but does not trade; full unions in [`references/endpoints.md`](references/endpoints.md).
 - **`chain`, `issuer` and `protocol` are open vocabularies.** New values are added whenever Treasures
   supports a new chain, issuer or protocol, and they can reach `/balances` and trade reads before you
   upgrade this skill. Never fail a parse on an unlisted value: report the position as-is, and don't
   trade it until this skill documents it.
-- **Amounts are atomic integer strings — never JS `number`.** USDC = 6 dp. Stock tokens vary
+- **Amounts are atomic integer strings — never JS `number`.** USDC = 6 dp, **except on BNB Smart
+  Chain, whose base currency is 18-decimal Binance-Peg USDC**: read decimals per chain, never from the
+  asset name. Stock tokens vary
   (reads expose both `shares` (human) and `raw_token` (on-chain)). Parse with a big-decimal lib.
 - **Trading is async + route-first.** `POST /trades` → **202 + job**, then **poll** to terminal.
   Routing runs *before* the 202, so no-route / cap breach / unwhitelisted come back **synchronously**
   as 4xx (no job row).
 - **Auto-routing is single-cell for a BUY, multi-leg for a SELL.** Omit `chain`/`protocol` and a buy
   resolves to the *one* best cell by net deliverable across `{solana,ethereum} × {ondo,xstocks}` plus
-  `solana × backpack` (when that venue is listed for the asset) — it never splits. A sell fans out
+  `solana × backpack` and BNB Smart Chain's `ondo` / `xstocks` / `bstocks` cells (each when listed for
+  the asset) — it never splits. A sell fans out
   across every venue the wallet holds and returns N legs in one response (see the **Sell playbook**).
   Pinning `chain`+`protocol` narrows either side to one cell.
 
@@ -167,6 +181,10 @@ Before any quote/trade, **resolve credentials via the Credential store above** (
 | Trade history / P&L | History / Portfolio | `GET READS/trades`, `GET READS/portfolio` (no key) |
 | Manage keys (owner) | [API keys](references/api-keys.md) | owner Privy session — agent key can't |
 
+**Client dashboard reads** need no dedicated endpoint: signer state is `GET API/wallets/:id/delegation`
+(public), keys are `GET API/wallets/:id/api-keys` (owner), and policy state is `GET
+API/wallets/:id/policy-migration/spec` (owner).
+
 Full per-endpoint contracts: [`references/endpoints.md`](references/endpoints.md). Validated curl
 examples: [`references/examples.md`](references/examples.md).
 
@@ -199,7 +217,7 @@ Auth `X-API-Key` (scope `trade`). **Headers:** `Idempotency-Key: <uuid>` (**requ
 `chain`/`protocol` optional (auto-route). A **buy** → **202 + one flat job** (`job_id` at the top
 level); a **sell** → **202 + `{order_status, legs[]}`** (see the sell playbook — `job_id` is per leg).
 Branch on the `side` you sent, never on inspecting the body. Then poll `GET API/wallets/:id/trades/:job_id`
-(**same `X-API-Key`, scope `trade`** — the poll is gated like the create). State machine:
+(**same `X-API-Key`, scope `quote`** — a default key holds both scopes). State machine:
 `routing → simulating → signing → broadcast → {confirmed | failed | rejected}`.
 - `confirmed` → `result = { amount_in, amount_out, tx_sig }` (atomic in/out). **EVM:** the `tx_sig`
   shown at `broadcast` is the **order hash**; `result.tx_sig` at `confirmed` is the real
@@ -254,6 +272,10 @@ reported `shares` value (or document a small tolerance).
 
 - **Balances** — `GET API/wallets/:id/balances` → `{native,stablecoins,positions,needs_funding,as_of}`.
   On-chain truth; positions carry `shares` (human) + `raw_token` (atomic) + `notional_usd`.
+  `native` carries one row per chain, and `bnb`'s is **BNB, not ETH** (56 is the only chain here whose
+  gas token is not ether). A `bnb` `stablecoins` entry is 18-decimal Binance-Peg USDC: still
+  `asset: "USDC"`, but a different token from USDC on any other chain, so never sum them. These rows
+  are reported whether or not the bnb venue is open: this endpoint says what the wallet **holds**.
 - **Trade history** — `GET READS/trades?sol_wallet=&eth_wallet=&source=&limit=&offset=` (≥1 address).
   `source=all` (default) vs `internal` does **not filter** — it only toggles whether P&L columns
   (`usd_per_share`, `avg_entry_price_per_share`, `realized_pnl`) are populated. `internal` rows are the
@@ -271,6 +293,8 @@ reported `shares` value (or document a small tolerance).
   in via Privy + grant delegation in-browser); agent polls `POST API/onboarding-sessions/poll` (Bearer
   `device_secret`) until `{status:"approved", wallet, owner_email, api_key}` — **the key is delivered
   once**. See [`references/onboarding.md`](references/onboarding.md).
+- **SMA wallets are not an agent surface.** API keys do not work on SMA wallets (404 `wallet_not_found`),
+  and SMA wallets are no longer minted through onboarding sessions (410 `sma_onboarding_retired`).
 - **API-key management is owner-only** (Privy access+identity session — the agent's key **cannot** mint
   keys). `POST/GET/DELETE API/wallets/:id/api-keys`; scopes `['trade','quote']`; caps
   `{max_trade_notional_usd, daily_notional_usd, asset_allowlist, max_slippage_bps}`. See
@@ -296,8 +320,10 @@ reported `shares` value (or document a small tolerance).
 5. **Big-decimals + decimals.** Quote/job amounts are atomic; convert with the asset's decimals (USDC 6;
    reads expose `shares` vs `raw_token`). Never use floats.
 6. **Gas / funding:** Solana needs SOL (fees + one-time Token-2022 ATA rent per new asset); the first
-   Ethereum trade of a token needs a little ETH for a one-time ERC-20 approve (the fill itself is
-   gasless). Surface `needs_funding` from `/balances`.
+   EVM trade of a token needs a little **native gas on that chain** for a one-time ERC-20 approve (the
+   fill itself is gasless). ⚠ On **BNB Smart Chain (56)** that native token is **BNB, not ETH**: an ETH
+   float there buys nothing. Surface `needs_funding` from `/balances`, and read the per-chain `native`
+   rows to know which chain is short.
 7. **Read the preview's `tradability`/`warn_reason` before every trade.** They are advisory — a warned
    cell still quotes and still executes — so the agent decides: pin another `chain`+`protocol` on
    `settlement_failure`/`no_fill_window`/`no_settlements`, skip the asset on `no_price_feed`, keep sizes
@@ -316,7 +342,7 @@ const host = process.env.TREASURES_HOST ?? 'https://api.treasures.io';
 const API = `${host}/api/v1`, READS = `${host}/public/v1`;
 
 const SKILL_NAME = 'treasures-wallet';
-const SKILL_VERSION = '1.4.0'; // = SKILL.md metadata.version
+const SKILL_VERSION = '1.10.0'; // = SKILL.md metadata.version
 
 async function tFetch(url: string, init: RequestInit = {}): Promise<any> {
   const res = await fetch(url, {
@@ -418,8 +444,10 @@ async function sell(asset: string, shares: string, slippageBps: number) {
 | 400 | `invalid_request_body` / `missing_idempotency_key` / `invalid_idempotency_key` | malformed — fix, don't retry |
 | 401 | `invalid_api_key` / `invalid_session` | missing/bad key (or onboarding secret) |
 | 403 | `{error:"key_cap_exceeded", cap, reason}` | cap breach — surface, don't retry. Also `policy_denied` = delegation off |
-| 404 | `wallet_not_found` / `job_not_found` / `session_not_found` | bad id |
+| 403 | `not_wallet_owner` | non-owner reading/managing someone else's wallet (incl. an SMA) |
+| 404 | `wallet_not_found` / `job_not_found` / `session_not_found` | bad id, **or** an owner session on an SMA calling `POST /trades`/`GET /quotes`, **or** any API key on an SMA wallet (keys serve main wallets only) |
 | 410 | `already_claimed` | onboarding key already claimed (single-use) |
+| 410 | `sma_onboarding_retired` | an onboarding session asked for an SMA wallet — not available |
 | 422 | `asset_not_whitelisted` | ticker not in catalog / not routable on the pinned cell |
 | 422 | `quote_unavailable` / `quote_failed` | genuine no-route, thin-liquidity no-fill, **or a PINNED sell bigger than that one cell holds** (drop the pin and let it fan out) → bounded retry |
 | **503** | `routing_unavailable` / `grant_check_unavailable` | **transient → retry w/ backoff (fresh key)** |
