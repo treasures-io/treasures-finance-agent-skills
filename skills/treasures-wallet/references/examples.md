@@ -36,14 +36,14 @@ curl -s "$API/wallets/$WID/quotes?chain=solana&protocol=backpack&side=buy&asset=
 #   the token not yet listed); omit `protocol` to let the route pick among the listed cells
 ```
 
-## Buy + poll (X-API-Key, scope trade)
+## Buy + poll (X-API-Key, scopes trade + quote)
 ```bash
 IDK=$(uuidgen)
 curl -s -X POST "$API/wallets/$WID/trades" -H "x-api-key: $KEY" \
   -H "Idempotency-Key: $IDK" -H 'content-type: application/json' \
   -d '{"side":"buy","asset":"NVDA","size":{"notional_usdc":"10"},"slippage_bps":100}'
 # → 202 {"job_id":"job_…","state":"routing","chain":"sol","protocol":"ondo",...}
-curl -s "$API/wallets/$WID/trades/job_…" -H "x-api-key: $KEY"  # same trade key — poll until confirmed|failed|rejected
+curl -s "$API/wallets/$WID/trades/job_…" -H "x-api-key: $KEY"  # needs scope quote — poll until confirmed|failed|rejected
 # confirmed → {"state":"confirmed","result":{"amount_in":"…","amount_out":"…","tx_sig":"…"}}
 ```
 
