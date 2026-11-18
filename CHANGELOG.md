@@ -21,7 +21,7 @@ releases that can break an existing caller (a trade-only API key, an SMA wallet)
 
 A `priority: "speed"` sell can now come back on the gasless route instead of being refused, and the
 stocks reads no longer serve a ticker that has no listing. The API has advertised `1.23.0` in
-`X-Treasures-Skill-Latest` since 2026-11-10. One **⚠ Action** item, for callers that send
+`X-Treasures-Skill-Latest` since 2026-11-17. One **⚠ Action** item, for callers that send
 `priority: "speed"` on `/quote/sell`.
 
 ### treasures-b2b-api `1.23.0`: speed sells that fall back to the gasless route
