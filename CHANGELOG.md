@@ -17,6 +17,39 @@ releases that can break an existing caller (a trade-only API key, an SMA wallet)
 
 ---
 
+## 2026-11-18: b2b `1.23.0`
+
+A `priority: "speed"` sell can now come back on the gasless route instead of being refused, and the
+stocks reads no longer serve a ticker that has no listing. The API has advertised `1.23.0` in
+`X-Treasures-Skill-Latest` since 2026-11-17. One **⚠ Action** item, for callers that send
+`priority: "speed"` on `/quote/sell`.
+
+### treasures-b2b-api `1.23.0`: speed sells that fall back to the gasless route
+
+- **⚠ Action: a speed sell can return a gasless leg.** When the speed route answers `no_routes` for
+  a `robinhood` or `base` position on `/quote/sell`, that leg is now in `quotes[]` on its gasless
+  route, with a new `speed_route_fallback` warning. Before, the position was absent from the quote
+  or the whole quote was `422 no_routes`. The leg has `gasless: true` and one
+  `evm_eip712_typed_data` payload (also when you sent `execution: "user_operation"`), and it settles
+  in minutes, not one block. If your code assumes every leg of a speed quote is an `evm_signed_tx`,
+  branch on `gasless` per leg.
+- **`approval_needed` on that warning.** The warning carries `chain`, `protocol`,
+  `reason: "no_routes"`, `approval_needed` and `approval_spender`. `true` means the order cannot
+  fill until the wallet approves the stock token to `approval_spender`: the gasless route never
+  bundles an approval, so send it yourself before `/trade/submit`, or the order is refused as
+  `not_enough_balance_or_allowance` or expires unfilled. `false` means the allowance covers the
+  sale, and `null` that it could not be read.
+- **Buys are unchanged.** A `robinhood` or `base` buy the speed route cannot serve is still absent,
+  with `speed_route_unavailable`.
+- **`speed_route_unavailable` repeats less.** It is now sent once per `chain` and `reason` (once per
+  `chain`/`protocol` pair for `no_speed_venue`, once in all for `disabled`).
+- **A ticker with no listing is not served.** A ticker that no venue lists a token for (every token
+  unminted, say) is left out of `/stocks`, `/stocks/tickers` and every other stocks read.
+- **`extension` in the spec.** The typed-data payload schema documents an `extension` field. This
+  API never sends it, so there is nothing to handle.
+
+---
+
 ## 2026-11-04: wallet `1.10.0`
 
 Catches the published `treasures-wallet` skill up from `1.4.0` to `1.10.0`. Versions `1.5.0` to
