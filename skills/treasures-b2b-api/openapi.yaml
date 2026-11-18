@@ -2668,9 +2668,11 @@ components:
           so `"speed"` changes nothing for it; `bnb` + `ondo` and `bnb` + `xstocks` have no speed
           route and are absent under `"speed"`).
 
-        A `robinhood`/`base` leg the speed route cannot serve is **absent** from the response (never
-        returned on its relayed route), with a `speed_route_unavailable` warning naming the chain
-        and the reason.
+        A `robinhood`/`base` leg the speed route cannot serve is **absent** from the response, with
+        a `speed_route_unavailable` warning naming the chain and the reason.
+
+        The one exception, a `/quote/sell` leg returned on its relayed route, is disclosed by the
+        `speed_route_fallback` warning.
 
         `eth` is never quoted on its own route under `"speed"`. On `/quote/buy` and `/quote/preview`
         it can still come back as a cross-chain leg (`origin_chain` present) when you are not funded
@@ -3263,6 +3265,9 @@ components:
         ticker: { $ref: "#/components/schemas/Ticker" }
         name: { type: string }
         available_chains:
+          description: >-
+            Chains with at least one listed cell. A ticker no venue lists a cell for (every token
+            unminted, say) is not served at all, by this endpoint or any other stocks read.
           type: array
           items: { $ref: "#/components/schemas/Chain" }
         min_trade_size_usd:
@@ -3698,6 +3703,9 @@ components:
             Absolute `https` URL of the company logo, served from Treasures' own object store rather
             than the upstream source. Null when no logo has been mirrored for this ticker.
         available_chains:
+          description: >-
+            Chains with at least one listed cell. A ticker no venue lists a cell for (every token
+            unminted, say) is not served at all, by this endpoint or any other stocks read.
           type: array
           items: { $ref: "#/components/schemas/Chain" }
         exchange:
@@ -3915,6 +3923,15 @@ components:
           type: object
           description: EIP-712 typed-data object for the gasless EVM order; sign with `eth_signTypedData_v4`.
           additionalProperties: true
+        extension:
+          type: string
+          description: |
+            Never sent on `/public/v1`; on `/api/v1/swap` only. The order's extension bytes
+            (hex; `0x` when the order has none), relayed with your signature from the server's stored
+            copy, never from you. Read it before signing: when non-empty, the lowest 160 bits of
+            `keccak256(extension)` equal the lowest 160 bits of the order's `salt`, and a decoded
+            `customReceiver`, if present, is your own wallet.
+          example: "0x"
       additionalProperties: false
 
     SignableEvmTx:
@@ -4765,8 +4782,9 @@ components:
               outright instead (`no_routes` / `price_implausible`) and no acknowledgement can
               clear it.
             - `speed_route_unavailable`: you sent `priority: "speed"` and the speed route could not
-              serve the named chain, so **that chain's leg is absent** from this response (it is
-              never returned on its relayed route instead). It carries `reason` and `chain` (the
+              serve the named chain, so **that chain's leg is absent** from this response (the one
+              case returned on its relayed route instead is `speed_route_fallback`, below). It
+              carries `reason` and `chain` (the
               dropped leg's chain; absent only when the whole speed route is off, which is a
               response-level fact, not a per-leg one). Advisory: every leg that IS returned is
               fully executable; re-quote without `priority` to get the relayed route on that chain.
@@ -4801,6 +4819,24 @@ components:
               price was available, so its `estimated_gas_usd` is `null` and the route ranking
               ignored gas for it. Carries `chain`, and no `reason`. Advisory: price the gas yourself
               before choosing this leg over a gasless one.
+            - `speed_route_fallback`: you sent `priority: "speed"` on `/quote/sell` and the speed
+              route answered `no_routes` for the named `chain`/`protocol`, so that leg **is** in
+              this response but on its **relayed route**, not the fast path you asked for:
+              `gasless: true`, one `evm_eip712_typed_data` payload, and a fill that can take
+              minutes. Carries `chain`, `protocol`, `reason` (`no_routes`), `approval_needed` and
+              `approval_spender`.
+
+              `approval_needed` is `true` when the wallet's allowance of the stock token to
+              `approval_spender` does not cover the sale. A relayed order from that wallet
+              **cannot fill** until you approve, and this API does not send that approval for you:
+              `POST /trade/submit` may refuse it as `not_enough_balance_or_allowance`, or it stays
+              pending and expires unfilled. `false` means the allowance covers it, and `null` that
+              it could not be read. Once the wallet has approved, a later speed quote for the same
+              position is normally served on the speed route again.
+
+              Sent only for a leg this response carries. A position the relayed route priced but
+              that another leg outranked reads `speed_route_unavailable` with `reason: "no_routes"`
+              instead.
             - `cross_chain_route_unavailable`: a `priority:"speed"` cell you were not funded on, and
               that can be reached cross-chain (`eth/ondo`, `sol/xstocks`, `sol/backpack`,
               `base/coinbase`, `bnb/bstocks`), could not be served cross-chain and **fell back** to
@@ -4851,9 +4887,10 @@ components:
               by `POST /quote/preview`, which quotes no wallet of yours.
 
             `cross_chain_route_unavailable` and `exit_gas_unfunded` appear once per affected
-            `chain`/`protocol` pair, `speed_route_unavailable` once per `chain` (once per
-            `chain`/`protocol` pair for `no_speed_venue`), and `speed_route_unpriced_gas` once per
-            `chain`; every other code appears at most once per response.
+            `chain`/`protocol` pair, `speed_route_unavailable` once per `chain` and `reason` (once
+            per `chain`/`protocol` pair for `no_speed_venue`, and once in all for `disabled`),
+            `speed_route_unpriced_gas` once per `chain`, and `speed_route_fallback` once per
+            `chain`/`protocol` pair; every other code appears at most once per response.
 
             Every other `code` value is the routed cell's own `WarnReason`.
       additionalProperties: true
