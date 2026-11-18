@@ -1869,35 +1869,44 @@ paths:
       security:
         - IntegratorApiKey: []
       description: |
-        Returns one full-share sell per name your Solana wallet holds in the strategy's current
-        book (plus any `tickers` you add). Nothing is quoted and nothing expires, so this is the
-        default flow: show the orders, then call `POST /quote/sell` per order when the signer is
-        ready, and submit each quote through `POST /trade/submit` unchanged. Human and
-        hardware-wallet flows should use this route; `POST /signals-orders/exit` is for
-        programmatic signers.
+        Returns one full-share sell per name your wallet holds in the strategy's current book (the
+        Solana wallet, or `eth_wallet` on BNB Smart Chain with `chain: "bnb"`), plus any `tickers`
+        you add. Nothing is quoted and nothing expires, so this is the default flow: show the
+        orders, then call `POST /quote/sell` per order when the signer is ready, and submit each
+        quote through `POST /trade/submit` unchanged. Human and hardware-wallet flows should use
+        this route; `POST /signals-orders/exit` is for programmatic signers.
 
-        Solana only for now: a body carrying `eth_wallet` is refused with `400 invalid_request`.
+        With `chain: "bnb"` the plan reads `eth_wallet` on BNB Smart Chain; quote each order with
+        `"chain": "bnb"`, `"protocol"` (see **Quoting each order**), `eth_wallet` and a fresh
+        `eth_signature`, and submit each on its own `POST /trade/submit`, never as a batch. Without `chain: "bnb"`, a body carrying `eth_wallet`
+        is refused with `400 invalid_request`.
         `strategy_id` accepts the id or the slug; the response always carries the canonical id.
         `as_of` is when Treasures ingested the book (unix seconds), not the filing date.
 
-        `nav_usdc` counts the priced names you hold in scope only; an unpriced holding is still
-        an order, with `notional_usdc: null`, ranked after the priced ones. Shares are floored to
-        18 decimal places, never rounded up. A holding worth under $0.01 reads as not held. A
-        holding that could not be read is skipped as `holdings_unknown`, never assumed absent,
-        with one exception: a token account found but not decodable into a balance reads as zero,
-        so that name is `not_held`.
+        `nav_usdc` counts the priced names you hold in scope only. On Solana an unpriced holding is
+        still an order, with `notional_usdc: null`, ranked after the priced ones; with
+        `chain: "bnb"` it is skipped as `price_unavailable`, since its venue floor cannot be
+        checked. Shares are floored to 18 decimal places, never rounded up. A holding worth under
+        $0.01 reads as not held. A holding that could not be read is skipped as
+        `holdings_unknown`, never assumed absent, with one exception on Solana: a token account
+        found but not decodable into a balance reads as zero, so that name is `not_held`.
 
-        At most 25 orders are returned and their upstream quote calls are capped at 30 (see
-        `POST /signals-orders/exit`); the overflow (the smallest by notional, unpriced first) is
-        skipped as `leg_cap`, so `POST /signals-orders/exit` answers the same split. With
-        `protocol` sent, only the pinned venues are read and sold: a name also held on another
-        venue gets no `skipped` entry, so repeat the call per venue.
+        At most 25 orders are returned and, on Solana, their upstream quote calls are capped at 30
+        (see `POST /signals-orders/exit`; `chain: "bnb"` has no quote-call cap). The overflow (the
+        smallest by notional, unpriced first) is skipped as `leg_cap`, so
+        `POST /signals-orders/exit` answers the same split. With `protocol` sent, only the pinned
+        venues are read and sold: a name also held on another venue gets no `skipped` entry, so
+        repeat the call per venue.
 
         **Quoting each order.** Send one `POST /quote/sell` per order, with the same wallet and a
         fresh proof:
         `{ "ticker": <ticker>, "amount_shares": <shares>, "chain": "sol", "protocol": <the protocol you sent here, if any>, "sol_wallet": <sol_wallet>, "ownership_proof": <proof>, "max_slippage_bps": <bps> }`.
-        To submit several quotes in one request, send them together through
+        To submit several Solana quotes in one request, send them together through
         `POST /trade/submit/batch`.
+
+        With `chain: "bnb"`, send `"chain": "bnb"` and `eth_wallet` instead, and always a
+        `"protocol"`: the pin you sent here, or `["ondo","xstocks"]` when you sent none. An unpinned
+        bnb quote can route to bStocks, which the plan never read.
 
         **One wallet per strategy.** Your holdings are not tracked per strategy: every name of the
         book you hold in this wallet counts, whichever strategy (or none) you bought it for. Two
@@ -2046,8 +2055,9 @@ paths:
       security:
         - IntegratorApiKey: []
       description: |
-        Returns the orders that move your Solana wallet's positions in the strategy's names to the
-        strategy's current book. Nothing is quoted and nothing expires, so this is the default
+        Returns the orders that move your wallet's positions in the strategy's names to the
+        strategy's current book: the Solana wallet, or `eth_wallet` on BNB Smart Chain with
+        `chain: "bnb"`. Nothing is quoted and nothing expires, so this is the default
         flow: show the orders, then call `POST /quote/sell` (send `shares` as `amount_shares`) or
         `POST /quote/buy` (send `notional_usdc` as `amount_usdc`) per order when the signer is
         ready, and submit each quote through `POST /trade/submit` unchanged.
@@ -2059,8 +2069,14 @@ paths:
         - a buy is `POST /quote/buy` with
           `{ "ticker": <ticker>, "amount_usdc": <notional_usdc>, "chain": "sol", "sol_wallet": <sol_wallet>, "ownership_proof": <proof>, "max_slippage_bps": <bps> }`.
 
-        Send no `protocol`: the plan reads every Solana venue. To submit several quotes in one
-        request, send them together through `POST /trade/submit/batch`.
+        Send no `protocol`: the plan reads every Solana venue. To submit several Solana quotes in
+        one request, send them together through `POST /trade/submit/batch`.
+
+        **With `chain: "bnb"`.** Quote each order with `"chain": "bnb"`,
+        `"protocol": ["ondo","xstocks"]`, `eth_wallet` in place of `sol_wallet`, and a fresh proof
+        carrying its `eth_signature`; the plan reads ondo and xStocks only, and an unpinned bnb quote
+        can route to bStocks. Submit each quote on its own `POST /trade/submit`, never as a batch. One call
+        orders at most 25 names, with no quote-call cap.
 
         **Without `amount_usdc` the book's cash weight is sold on every call.** nav is then only
         what you hold in scope, and the targets sum to the book's deployed weight of it, so a book
@@ -2069,8 +2085,8 @@ paths:
 
         **Buy-in.** To buy into a strategy from cash, call with `amount_usdc` on a wallet that
         holds none of its names: every order is a buy, sized by its book weight of `amount_usdc`.
-        One call orders at most 25 names and 30 upstream quote calls (a buy costs one per Solana
-        venue it can buy on), so a book of 20 names on two venues each takes more than one round:
+        One call orders at most 25 names and, on Solana, 30 upstream quote calls (a buy costs one
+        per Solana venue it can buy on), so a book of 20 names on two venues each takes more than one round:
         submit the buys, wait for them to settle, and call again with `funding.next_amount_usdc`.
 
         **Scoped nav.** The plan sizes every name against `nav_usdc`: the value of what you hold in
@@ -6370,17 +6386,48 @@ components:
     SignalOrdersRequest:
       type: object
       additionalProperties: false
-      required: [strategy_id, sol_wallet, ownership_proof]
+      required: [strategy_id, ownership_proof]
       properties:
         strategy_id:
           type: string
           minLength: 1
           maxLength: 64
           description: The strategy's `strategy_id` (stable) or its `slug` (may be renamed).
-        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
+        chain:
+          oneOf:
+            - { $ref: "#/components/schemas/SignalOrderChain" }
+            - { type: "null" }
+          description: |
+            The order venue. null/omitted plans `sol_wallet`'s orders on Solana. `bnb` plans
+            `eth_wallet`'s ondo and xStocks positions on BNB Smart Chain (bStocks is never read or
+            planned), on `/exit/plan` and `/rebalance/plan` only: `/exit` and `/rebalance` refuse it
+            with `400 invalid_request` at `chain`.
+
+            Quote each planned `bnb` order with `POST /quote/buy` or `POST /quote/sell` pinned to
+            `chain: "bnb"` and the protocols the plan read (`protocol: ["ondo", "xstocks"]`, or
+            your own `protocol` pin), and submit each with its own `POST /trade/submit`. An
+            unpinned `bnb` quote can route to a cell the plan never read (bStocks).
+
+            A `bnb` body needs `eth_wallet` and its `eth_signature`, refuses `sol_wallet`, and a
+            `protocol` pin must include `ondo` or `xstocks`; each is a `400 invalid_request` at
+            that field.
+
+            Off-hours, xStocks quotes on BNB Smart Chain were measured at a median of about 130 bps
+            of price impact and up to about 600 bps, so an xStocks order there may need a
+            `max_slippage_bps` near 300 on its quote; ondo measured under 100 bps.
+        sol_wallet:
+          $ref: "#/components/schemas/SolAddress"
+          description: Required unless `chain` is `bnb`, where it is refused.
+        eth_wallet:
+          $ref: "#/components/schemas/EvmAddress"
+          description: >-
+            Required when `chain` is `bnb`, and accepted only then: any other body carrying it is
+            refused with `400 invalid_request`.
         ownership_proof:
           $ref: "#/components/schemas/OwnershipProof"
-          description: The `sol_signature` over the canonical challenge is required.
+          description: >-
+            The `sol_signature` over the canonical challenge is required, or with `chain: "bnb"`
+            the `eth_signature`.
         tickers:
           type: array
           items: { $ref: "#/components/schemas/Ticker" }
@@ -6410,28 +6457,66 @@ components:
             - { type: "null" }
           description: >-
             Narrows which holdings are read and sold, as on `POST /quote/sell`. null/omitted = every
-            protocol. Must include a Solana protocol (`ondo`, `xstocks` or `backpack`), or the
-            request is refused with `400 invalid_request`. A pinned exit covers the pinned venues
+            protocol. Must include a protocol the venue reads (on Solana `ondo`, `xstocks` or
+            `backpack`; with `chain: "bnb"` `ondo` or `xstocks`), or the request is refused with
+            `400 invalid_request`. A pinned exit covers the pinned venues
             only: a name also held on another venue is sold from the pinned one alone, with no
             `skipped` entry for the rest, so repeat the call per venue to exit fully.
 
     SignalOrderSkipReason:
       type: string
-      enum: [leg_cap, not_held, holdings_unknown, below_min_notional, awaiting_sell_proceeds, not_tradable, insufficient_balance]
+      enum: [leg_cap, not_held, holdings_unknown, below_min_notional, awaiting_sell_proceeds, not_tradable, insufficient_balance, price_unavailable]
       description: |
-        - `leg_cap`: more orders than fit: past 25 orders or 30 upstream quote calls. On `/exit` the
-          smallest by notional, unpriced first, are skipped; on `/rebalance` sells are admitted
-          first.
-        - `not_held`: no Solana position, or one worth under $0.01, or one that floors to zero
-          shares, or a token account that cannot be decoded into a balance (read as zero).
+        - `leg_cap`: more orders than fit: past 25 orders or, on Solana, 30 upstream quote calls
+          (`chain: "bnb"` has no quote-call cap). On `/exit` the smallest by notional, unpriced
+          first, are skipped; on `/rebalance` sells are admitted first.
+        - `not_held`: no position on the venue (Solana, or with `chain: "bnb"` BNB Smart Chain), or
+          one worth under $0.01, or one that floors to zero shares, or a Solana token account that
+          cannot be decoded into a balance (read as zero).
         - `holdings_unknown`: the holding could not be read, so it is never assumed absent (`/exit`
           only; a rebalance refuses the whole request instead).
-        - `below_min_notional`: a rebalance gap under $1.
+        - `below_min_notional`: a rebalance gap under $1. With `chain: "bnb"` the floor is the
+          venue's per name: $10 for a name buyable or held on xStocks alone, else $1; it also
+          applies on `/exit/plan`, where a held name worth under its floor is skipped.
         - `awaiting_sell_proceeds`: a rebalance buy `amount_usdc` cannot fund while the plan also
           sells; call again with the proceeds once the sells settle.
-        - `not_tradable`: a book name Treasures cannot buy on Solana; its weight stays in USDC.
+        - `not_tradable`: a book name Treasures cannot buy on the venue (Solana, or with
+          `chain: "bnb"` ondo or xStocks on BNB Smart Chain); its weight stays in USDC.
         - `insufficient_balance`: a rebalance buy `amount_usdc` cannot fund, with no sell to wait
           on.
+        - `price_unavailable`: `chain: "bnb"` on `/exit/plan` only: a held name with no price, so
+          its venue floor cannot be checked.
+
+    SignalOrderChain:
+      type: string
+      enum: [bnb]
+      description: >-
+        An order venue other than Solana, on the plan routes only. `bnb` is BNB Smart Chain, read
+        from `eth_wallet`. Only the wallet's `ondo` and `xstocks` tokens are read there: a name held
+        as bStocks reads as `not_held`, so a rebalance buys its full target again, an exit leaves
+        it, and its value is not in `nav_usdc`.
+
+    SignalOrderApproval:
+      type: object
+      additionalProperties: false
+      required: [token, spender, approval_required]
+      properties:
+        token:
+          type: string
+          description: >-
+            The token's address on BNB Smart Chain: the Binance-Peg USDC contract on the USDC row,
+            else the held cell's token as the catalog lists it.
+        spender:
+          type: string
+          description: The router contract a gasless order on BNB Smart Chain pulls the token through.
+        approval_required:
+          type: [boolean, "null"]
+          description: >-
+            Whether `eth_wallet`'s allowance to `spender` falls short: for USDC, of `amount_usdc`;
+            for a held token, of the wallet's balance read in the same call. `null` when it could not
+            be read, including a read past its deadline: unknown, never approved, so read the
+            allowance on-chain or approve before signing. Advisory only: no approval is built, and
+            the plan is served either way.
 
     SignalOrderSide:
       type: string
@@ -6505,7 +6590,9 @@ components:
           description: The USD value of the priced names you hold in scope. Unpriced names are excluded.
         usdc_available:
           type: string
-          description: The wallet's Solana USDC, as a decimal string.
+          description: >-
+            The wallet's Solana USDC, as a decimal string. With `chain: "bnb"`, `eth_wallet`'s
+            Binance-Peg USDC on BNB Smart Chain, floored to 6 decimal places.
         orders:
           type: array
           maxItems: 25
@@ -6514,6 +6601,14 @@ components:
         skipped:
           type: array
           items: { $ref: "#/components/schemas/SignalOrderSkip" }
+        approvals:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderApproval" }
+          description: >-
+            `chain: "bnb"` only, absent otherwise. One row for USDC when the plan buys, then one per
+            token a planned sell spends. Approve any row that is `true` before submitting its
+            orders, or the order cannot fill. A `null` row is unknown, never approved: read the
+            allowance on-chain, or approve, before signing.
 
     SignalOrdersResponse:
       type: object
@@ -6549,17 +6644,47 @@ components:
     SignalRebalanceRequest:
       type: object
       additionalProperties: false
-      required: [strategy_id, sol_wallet, ownership_proof]
+      required: [strategy_id, ownership_proof]
       properties:
         strategy_id:
           type: string
           minLength: 1
           maxLength: 64
           description: The strategy's `strategy_id` (stable) or its `slug` (may be renamed).
-        sol_wallet: { $ref: "#/components/schemas/SolAddress" }
+        chain:
+          oneOf:
+            - { $ref: "#/components/schemas/SignalOrderChain" }
+            - { type: "null" }
+          description: |
+            The order venue. null/omitted plans `sol_wallet`'s orders on Solana. `bnb` plans
+            `eth_wallet`'s ondo and xStocks positions on BNB Smart Chain (bStocks is never read or
+            planned), on `/exit/plan` and `/rebalance/plan` only: `/exit` and `/rebalance` refuse it
+            with `400 invalid_request` at `chain`.
+
+            Quote each planned `bnb` order with `POST /quote/buy` or `POST /quote/sell` pinned to
+            `chain: "bnb"` and `protocol: ["ondo", "xstocks"]`, the protocols the plan read (this
+            request takes no `protocol`), and submit each with its own `POST /trade/submit`. An
+            unpinned `bnb` quote can route to a cell the plan never read (bStocks).
+
+            A `bnb` body needs `eth_wallet` and its `eth_signature` and refuses `sol_wallet`; each
+            is a `400 invalid_request` at that field.
+
+            Off-hours, xStocks quotes on BNB Smart Chain were measured at a median of about 130 bps
+            of price impact and up to about 600 bps, so an xStocks order there may need a
+            `max_slippage_bps` near 300 on its quote; ondo measured under 100 bps.
+        sol_wallet:
+          $ref: "#/components/schemas/SolAddress"
+          description: Required unless `chain` is `bnb`, where it is refused.
+        eth_wallet:
+          $ref: "#/components/schemas/EvmAddress"
+          description: >-
+            Required when `chain` is `bnb`, and accepted only then: any other body carrying it is
+            refused with `400 invalid_request`.
         ownership_proof:
           $ref: "#/components/schemas/OwnershipProof"
-          description: The `sol_signature` over the canonical challenge is required.
+          description: >-
+            The `sol_signature` over the canonical challenge is required, or with `chain: "bnb"`
+            the `eth_signature`.
         tickers:
           type: array
           items: { $ref: "#/components/schemas/Ticker" }
@@ -6633,7 +6758,11 @@ components:
       description: >-
         How `amount_usdc` funds the buys. Buys are scaled pro rata and a scaled buy under $1 is
         skipped, so a small pool spread over many buys can deploy nothing this round; the whole
-        shortfall then stays in `buys_deferred_usdc`.
+        shortfall then stays in `buys_deferred_usdc`. With `chain: "bnb"` a scaled buy is held to its
+        venue floor instead ($10 on a name buyable on xStocks alone), and the pool a skipped buy
+        frees is not spread over the others, so a small account on an xStocks-only book, or a
+        funded rebalance whose floors bind, can plan zero buys with no error; the pool then stays in
+        `buys_deferred_usdc`.
       additionalProperties: false
       required:
         [usdc_spendable, buys_required_usdc, buys_scaled, buys_deferred_usdc, buys_deferred_until_sells_settle, next_amount_usdc]
@@ -6642,7 +6771,8 @@ components:
           type: string
           description: >-
             `amount_usdc`, or `"0"` when omitted: the only USDC this plan's buys spend. Differs
-            from `usdc_available`, the wallet's whole Solana USDC.
+            from `usdc_available`, the wallet's whole USDC on the venue (Solana, or with
+            `chain: "bnb"` the Binance-Peg USDC on BNB Smart Chain).
         buys_required_usdc:
           type: string
           description: >-
@@ -6697,7 +6827,9 @@ components:
           description: The USD value of what you hold in scope, plus `amount_usdc`.
         usdc_available:
           type: string
-          description: The wallet's Solana USDC, as a decimal string.
+          description: >-
+            The wallet's Solana USDC, as a decimal string. With `chain: "bnb"`, `eth_wallet`'s
+            Binance-Peg USDC on BNB Smart Chain, floored to 6 decimal places.
         funding: { $ref: "#/components/schemas/SignalOrderFunding" }
         orders:
           type: array
@@ -6707,6 +6839,14 @@ components:
         skipped:
           type: array
           items: { $ref: "#/components/schemas/SignalOrderSkip" }
+        approvals:
+          type: array
+          items: { $ref: "#/components/schemas/SignalOrderApproval" }
+          description: >-
+            `chain: "bnb"` only, absent otherwise. One row for USDC when the plan buys, then one per
+            token a planned sell spends. Approve any row that is `true` before submitting its
+            orders, or the order cannot fill. A `null` row is unknown, never approved: read the
+            allowance on-chain, or approve, before signing.
 
     SignalRebalanceResponse:
       type: object
