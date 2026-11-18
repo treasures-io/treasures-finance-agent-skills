@@ -17,6 +17,42 @@ releases that can break an existing caller (a trade-only API key, an SMA wallet)
 
 ---
 
+## 2026-11-18: b2b `1.23.0` (content update, version unchanged)
+
+A spec-only refresh of the `1.23.0` skill: `openapi.yaml` now documents `chain: "bnb"` on the two
+signals plan routes. The skill text does not cover those routes, so there is no `metadata.version`
+bump and no gate signal fires: read this entry. Nothing changes for a caller that does not send
+`chain: "bnb"`.
+
+### treasures-b2b-api: BNB Smart Chain on the signals plan routes
+
+- **`chain: "bnb"` on `POST /signals-orders/exit/plan` and `POST /signals-orders/rebalance/plan`.**
+  The plan reads `eth_wallet`'s `ondo` and `xstocks` positions on BNB Smart Chain and its
+  Binance-Peg USDC. The body takes `eth_wallet` and a proof carrying `eth_signature`, and refuses
+  `sol_wallet`. New `SignalOrderChain` schema.
+- **The inline routes stay Solana only.** `POST /signals-orders/exit` and
+  `POST /signals-orders/rebalance` refuse `chain: "bnb"` with `400 invalid_request`. Quote each
+  planned order yourself with `chain: "bnb"` and `protocol: ["ondo", "xstocks"]` (or your own
+  `protocol` pin on an exit), and submit each on its own `POST /trade/submit`, never as a batch.
+- **Always pin `protocol` on those quotes.** An unpinned `bnb` quote can route to bStocks, which the
+  plan never reads: a name held as bStocks reads as `not_held` and is outside `nav_usdc`.
+- **`approvals` on a bnb plan.** One row for USDC when the plan buys, then one per token a planned
+  sell spends, each `{token, spender, approval_required}`. `true` means approve before submitting,
+  `null` that the allowance could not be read. Advisory only: no approval is built. New
+  `SignalOrderApproval` schema.
+- **Venue floors on bnb.** `below_min_notional` uses the venue's floor per name ($10 for a name on
+  xStocks alone, else $1) and also applies on `/exit/plan`. A scaled buy is held to its floor, so a
+  small `amount_usdc` over many names can plan no buys, with no error.
+- **New skip reason `price_unavailable`.** `SignalOrderSkipReason` gains it, on a bnb `/exit/plan`
+  only: a held name with no price. If you model the skip reasons as a closed set and plan to send
+  `chain: "bnb"`, add it.
+- **No quote-call cap on bnb.** The 25-order cap applies; the 30 upstream quote calls do not.
+- **`sol_wallet` is no longer listed as required** on the two plan request schemas, since a bnb body
+  omits it. A Solana body still needs it; a body with neither `chain` nor `sol_wallet` is still
+  `400 invalid_request`, with a different message.
+
+---
+
 ## 2026-11-18: b2b `1.23.0`
 
 A `priority: "speed"` sell can now come back on the gasless route instead of being refused, and the
