@@ -215,7 +215,7 @@ Each venue's **idle cash** is read from the same EOA and reported alongside:
 
 A wallet holding only cash (no stock tokens yet) still shows it — **cash reads live regardless of whether the wallet is otherwise known to Treasures**. Cash serves from a 30s snapshot that a settled trade invalidates, so a post-trade read reflects the new balance rather than waiting out the TTL; a failed read is never cached. `"0"` when there is no `eth_wallet`, the venue lists no cells, or the chain read fails — a failed cash read is **not** flagged `partial`, because `"0"` is indistinguishable from a real zero.
 
-> Positions on both venues are read for **any** wallet when you send your integrator key, and otherwise for every wallet Treasures knows on any chain (snapshotted for 30 s and invalidated when a trade settles) — a token transferred into your wallet from outside shows exactly like one bought here. To an ANONYMOUS caller, an `eth_wallet` Treasures has never seen gets an empty `positions` list here and is not flagged `partial`, so it is indistinguishable from a wallet holding nothing — **send `X-API-Key` and that case disappears.** Idle cash on these venues always reads live, unaffected by either check.
+> Positions on both venues are read for **any** wallet when you send your integrator key, and otherwise for every wallet Treasures knows on any chain (snapshotted for 30 s and invalidated when a trade settles) — a token transferred into your wallet from outside shows exactly like one bought here (one timing difference: on a chain where the wallet held no stock tokens, a token transferred in can take up to 10 minutes to appear; a trade through this API still appears as soon as it settles). To an ANONYMOUS caller, an `eth_wallet` Treasures has never seen gets an empty `positions` list here and is not flagged `partial`, so it is indistinguishable from a wallet holding nothing — **send `X-API-Key` and that case disappears.** Idle cash on these venues always reads live, unaffected by either check.
 
 Two caveats specific to the position cells:
 
@@ -409,6 +409,11 @@ stays queryable.
   sums to its `amount_usd`); `?payout_status=unpaid` lists what you're owed now, summing exactly to
   `GET /payouts/accrued`; `processing` / `paid` follow the payout's own status. Only trades that
   carried an integrator fee match.
+- **`channel` separates your API trades from your swap-widget trades.** `?channel=api` lists the
+  trades made with your API key; `?channel=widget` the trades made through the Treasures swap widget
+  embedded with your integrator ID. Without it you get both, as before. Your integrator ID is public
+  once it is in a page, so a widget trade can come from a site you don't run: it still pays your
+  widget fee to you and appears here with its wallet and transaction, like any other trade.
 
 ```jsonc
 // paging a filtered query
