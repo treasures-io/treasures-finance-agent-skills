@@ -1462,6 +1462,16 @@ paths:
           schema:
             type: string
             enum: [unpaid, processing, paid]
+        - name: channel
+          in: query
+          description: >-
+            How each trade reached us. `api`: your API key. `widget`: the Treasures swap widget
+            embedded with your integrator ID. Absent, both are listed, as before. A widget trade
+            is credited to whoever's ID the embedding page named, so it can come from a site you
+            do not run.
+          schema:
+            type: string
+            enum: [api, widget]
       responses:
         "200":
           description: OK
@@ -5805,6 +5815,9 @@ components:
             flagged `partial`. For a KNOWN wallet there is no trade-history gate on top of that: a
             token transferred into your own EOA from outside shows exactly like one bought through
             this API.
+            One timing difference: when the wallet held nothing on that chain, a token transferred
+            in from outside can take up to 10 minutes to appear (a trade through this API still
+            appears as soon as it settles).
 
             **Idle cash on these two venues (`usdc.base`, `usdg.robinhood`) is never gated**; it
             still reads live even for an unknown wallet, so a wallet holding only cash still reports
