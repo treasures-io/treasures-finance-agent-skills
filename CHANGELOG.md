@@ -17,6 +17,28 @@ releases that can break an existing caller (a trade-only API key, an SMA wallet)
 
 ---
 
+## 2026-11-25: b2b `1.23.1`
+
+One timing change on `GET /portfolio`, and one new filter on `GET /settlements`. No field is removed
+or renamed, so a `1.23.0` caller keeps working unchanged.
+
+### treasures-b2b-api `1.23.1`: transferred-in tokens on an empty chain, and a settlements channel filter
+
+- **A token transferred into an empty chain can take up to 10 minutes to appear on `/portfolio`.**
+  `GET /portfolio` now re-reads a chain where a wallet holds no stock tokens every 10 minutes, where
+  it re-read every 30 seconds. This covers Robinhood Chain, Base, Arbitrum and BNB Smart Chain.
+  Solana and Ethereum are unchanged.
+- **Trades through the API are not affected.** A buy appears as soon as it settles, on any chain. A
+  wallet that already holds a stock token on a chain sees a transfer in within 30 seconds, as before.
+- **Cash is unchanged.** `usdc` and `usdg` balances still refresh every 30 seconds.
+- **If you show airdrops or transfers in**, expect up to 10 minutes before the first token appears on
+  a chain where the wallet held nothing.
+- **`channel` on `GET /settlements`.** `?channel=api` lists the trades made with your API key, and
+  `?channel=widget` the trades made through the Treasures swap widget embedded with your integrator
+  ID. Without it you get both, as before.
+
+---
+
 ## 2026-11-18: b2b `1.23.0` (content update, version unchanged)
 
 A spec-only refresh of the `1.23.0` skill: `openapi.yaml` now documents `chain: "bnb"` on the two
